@@ -52,8 +52,8 @@ jobs:
           pip install selenium
           pip install flask
 
-          # Async browser
-          pip install zendriver websockets
+          # Async browser + deps
+          pip install zendriver websockets emoji grapheme mss asyncio-atexit deprecated
 
           # Build Tools
           pip install nuitka ordered-set zstandard
@@ -74,7 +74,7 @@ jobs:
               'playwright', 'playwright.sync_api',
               'selenium', 'selenium.webdriver',
               'flask', 'dotenv',
-              'zendriver', 'websockets',
+              'zendriver', 'websockets', 'emoji', 'grapheme',
               'sqlite3', 'ctypes', 'asyncio', 'hashlib', 'uuid', 'json',
           ]
           for mod in modules:
@@ -167,6 +167,8 @@ jobs:
             --include-package=dotenv `
             --include-package=zendriver `
             --include-package=websockets `
+            --include-package=emoji `
+            --include-package=grapheme `
             --include-package=setuptools `
             --include-package-data=PySide6 `
             --include-package-data=PIL `
@@ -184,6 +186,8 @@ jobs:
             --include-package-data=flask `
             --include-package-data=dotenv `
             --include-package-data=zendriver `
+            --include-package-data=emoji `
+            --include-package-data=grapheme `
             --include-package-data=selenium `
             --include-package-data=setuptools `
             --nofollow-import-to=tkinter `
