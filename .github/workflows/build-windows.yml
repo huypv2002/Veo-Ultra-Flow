@@ -1,0 +1,197 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\pip\Cache
+          key: pip-win-py313-${{ hashFiles('requirements.txt') }}
+          restore-keys: pip-win-py313-
+
+      - name: Cache Nuitka compilation
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\Nuitka\Nuitka\Cache
+          key: nuitka-win-py313-${{ hashFiles('main.py', 'src/**/*.py', 'requirements.txt') }}
+          restore-keys: nuitka-win-py313-
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip wheel setuptools
+          pip install -r requirements.txt
+          pip install nuitka ordered-set zstandard
+
+      - name: Prepare package data paths
+        id: pkg_paths
+        run: |
+          $curl_raw = (python -c "import curl_cffi, os; print(os.path.dirname(curl_cffi.__file__))").Trim()
+          $curl_dir = $curl_raw -replace '\\', '/'
+          echo "CURL_CFFI_DIR=$curl_dir" >> $env:GITHUB_OUTPUT
+          $cpu = $env:NUMBER_OF_PROCESSORS
+          if (-not $cpu) { $cpu = "4" }
+          echo "CPU_COUNT=$cpu" >> $env:GITHUB_OUTPUT
+
+      - name: Build with Nuitka (standalone)
+        run: |
+          $curl_cffi_dir = "${{ steps.pkg_paths.outputs.CURL_CFFI_DIR }}"
+          $cpu = "${{ steps.pkg_paths.outputs.CPU_COUNT }}"
+          echo "Building standalone with $cpu jobs..."
+          python -m nuitka `
+            --standalone `
+            --windows-console-mode=disable `
+            --output-filename=Veo3-Ultra.exe `
+            --enable-plugin=pyside6 `
+            --jobs=$cpu `
+            --lto=no `
+            --include-package=src `
+            --include-package=httpx `
+            --include-package=httpcore `
+            --include-package=anyio `
+            --include-package=requests `
+            --include-package=urllib3 `
+            --include-package=charset_normalizer `
+            --include-package=curl_cffi `
+            --include-package=pydantic `
+            --include-package=cryptography `
+            --include-package=selenium `
+            --include-package=undetected_chromedriver `
+            --include-package=chromedriver_autoinstaller `
+            --include-package=setuptools `
+            --include-package=zendriver `
+            --include-package=websockets `
+            --include-package=emoji `
+            --include-package=grapheme `
+            --include-package=latest_user_agents `
+            --include-package=user_agents `
+            --include-module=_cffi_backend `
+            --include-module=PySide6.QtMultimedia `
+            --include-module=PySide6.QtMultimediaWidgets `
+            --include-package-data=PySide6 `
+            --include-package-data=certifi `
+            --include-package-data=cryptography `
+            --include-package-data=pydantic `
+            --include-package-data=zendriver `
+            --include-package-data=emoji `
+            --include-package-data=grapheme `
+            --include-package-data=curl_cffi `
+            --include-package-data=selenium `
+            --include-package-data=undetected_chromedriver `
+            --include-package-data=setuptools `
+            --include-package-data=latest_user_agents `
+            --include-package-data=user_agents `
+            --include-package-data=chromedriver_autoinstaller `
+            --include-data-dir="$curl_cffi_dir=curl_cffi" `
+            --nofollow-import-to=tkinter `
+            --nofollow-import-to=_tkinter `
+            --nofollow-import-to=PyQt6 `
+            --nofollow-import-to=PyQt5 `
+            --nofollow-import-to=PySide2 `
+            --nofollow-import-to=matplotlib `
+            --nofollow-import-to=numpy `
+            --nofollow-import-to=pandas `
+            --nofollow-import-to=scipy `
+            --nofollow-import-to=IPython `
+            --nofollow-import-to=jupyter `
+            --nofollow-import-to=wx `
+            --nofollow-import-to=kivy `
+            --nofollow-import-to=test `
+            --nofollow-import-to=unittest `
+            --nofollow-import-to=doctest `
+            --nofollow-import-to=giaima `
+            --no-pyi-file `
+            --assume-yes-for-downloads `
+            main.py
+
+      - name: Create data folders and default JSON files
+        run: |
+          $dist = "main.dist"
+          echo "=== Creating pre-built data structure in $dist ==="
+          New-Item -ItemType Directory -Force -Path "$dist\data"
+          New-Item -ItemType Directory -Force -Path "$dist\data\profiles"
+          New-Item -ItemType Directory -Force -Path "$dist\output"
+          '{"accounts": []}' | Out-File -Encoding utf8 "$dist\data\accounts.json"
+          '{}' | Out-File -Encoding utf8 "$dist\data\login_temp.json"
+          '{}' | Out-File -Encoding utf8 "$dist\data\settings.json"
+          '{}' | Out-File -Encoding utf8 "$dist\data\cf_clearance_cache.json"
+          echo "=== Files created ==="
+          Get-ChildItem -Recurse "$dist\data" | ForEach-Object { echo " $($_.FullName)" }
+
+      - name: Verify build output
+        run: |
+          $exe = "main.dist\Veo3-Ultra.exe"
+          if (Test-Path $exe) {
+            $size = (Get-Item $exe).Length
+            $sizeMB = [math]::Round($size / 1MB, 2)
+            echo "Build OK! EXE size: ${sizeMB} MB"
+            $totalFiles = (Get-ChildItem -Recurse "main.dist" | Measure-Object).Count
+            echo "Total files in dist: $totalFiles"
+          } else {
+            echo "ERROR: Veo3-Ultra.exe not found in main.dist!"
+            Get-ChildItem -Recurse "main.dist" -Filter "*.exe" | ForEach-Object { echo $_.FullName }
+            exit 1
+          }
+
+      - name: Smoke test
+        run: |
+          echo "=== Smoke test ==="
+          $proc = Start-Process -FilePath "main.dist\Veo3-Ultra.exe" -WorkingDirectory "main.dist" -PassThru -NoNewWindow
+          Start-Sleep -Seconds 8
+          $crashLog = "$env:TEMP\Veo3Ultra_crash.log"
+          if (Test-Path $crashLog) {
+            echo "=== Crash log ==="
+            Get-Content $crashLog
+          }
+          if (Test-Path "main.dist\data\accounts.json") {
+            echo "=== data/accounts.json OK ==="
+          }
+          if ($proc.HasExited) {
+            echo "Process exited: code $($proc.ExitCode)"
+          } else {
+            echo "OK: Process running (PID $($proc.Id))"
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Package as ZIP
+        run: |
+          Rename-Item "main.dist" "Veo3-Ultra"
+          Compress-Archive -Path "Veo3-Ultra" -DestinationPath "Veo3-Ultra-windows.zip" -Force
+          $size = (Get-Item "Veo3-Ultra-windows.zip").Length
+          $sizeMB = [math]::Round($size / 1MB, 2)
+          echo "ZIP size: ${sizeMB} MB"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Veo3-Ultra-windows
+          path: Veo3-Ultra-windows.zip
+          retention-days: 30
+
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: Veo3-Ultra-windows.zip
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

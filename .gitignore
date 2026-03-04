@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+*.egg-info/
+dist/
+build/
+_update_tmp/
+_updater.bat
+_updater.sh
+.env
+*.log
+downloaded_videos/
+cookies_dialog.json
+.login_temp

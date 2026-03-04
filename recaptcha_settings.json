@@ -1,0 +1,56 @@
+{
+  "headless": true,
+  "proxy_pool": [
+    {
+      "server": "http://pr.lunaproxy.com:32233",
+      "username": "user-proxycanadaluna_Q8emI-sessid-alldijg89zk5qd50rtd-sesstime-90",
+      "password": "Huymrvn123"
+    },
+    {
+      "server": "http://pr.lunaproxy.com:32233",
+      "username": "user-proxycanadaluna_Q8emI-sessid-all78k36ahwqaz6jpit-sesstime-90",
+      "password": "Huymrvn123"
+    },
+    {
+      "server": "http://pr.lunaproxy.com:32233",
+      "username": "user-proxycanadaluna_Q8emI-sessid-alluf49ppxib89cmq6k-sesstime-90",
+      "password": "Huymrvn123"
+    },
+    {
+      "server": "http://pr.lunaproxy.com:32233",
+      "username": "user-proxycanadaluna_Q8emI-sessid-all87cur9pgrvclxr9t-sesstime-90",
+      "password": "Huymrvn123"
+    },
+    {
+      "server": "http://pr.lunaproxy.com:32233",
+      "username": "user-proxycanadaluna_Q8emI-sessid-all5uxw1xnb60aj3b7g-sesstime-90",
+      "password": "Huymrvn123"
+    },
+    {
+      "server": "http://pr.lunaproxy.com:32233",
+      "username": "user-proxycanadaluna_Q8emI-sessid-allcimfw7y70yjlt2qh-sesstime-90",
+      "password": "Huymrvn123"
+    },
+    {
+      "server": "http://pr.lunaproxy.com:32233",
+      "username": "user-proxycanadaluna_Q8emI-sessid-alldeu2g66cw4jf5ki3-sesstime-90",
+      "password": "Huymrvn123"
+    },
+    {
+      "server": "http://pr.lunaproxy.com:32233",
+      "username": "user-proxycanadaluna_Q8emI-sessid-allasf4rr00uoqgpn87-sesstime-90",
+      "password": "Huymrvn123"
+    },
+    {
+      "server": "http://pr.lunaproxy.com:32233",
+      "username": "user-proxycanadaluna_Q8emI-sessid-allbqodt7fmfvstqcd7-sesstime-90",
+      "password": "Huymrvn123"
+    },
+    {
+      "server": "http://pr.lunaproxy.com:32233",
+      "username": "user-proxycanadaluna_Q8emI-sessid-allrzmm6oz1qdc2hmgx-sesstime-90",
+      "password": "Huymrvn123"
+    }
+  ],
+  "use_proxy_pool": true
+}
