@@ -47316,7 +47316,7 @@ Requirements:
     def _check_for_update(self):
         """Kiểm tra cập nhật từ GitHub Releases (QThread)."""
         self._update_checker = UpdateChecker()
-        self._update_checker.check_finished.connect(self._on_update_check_finished)
+        self._update_checker.result.connect(self._on_update_check_finished)
         self._update_checker.start()
 
     def _on_update_check_finished(self, has_update, tag, download_url, release_notes, error):
@@ -47350,22 +47350,38 @@ Requirements:
             return
         dlg.set_downloading(True)
         self._update_downloader = UpdateDownloader(self._update_download_url)
-        self._update_downloader.progress_updated.connect(dlg.set_progress)
-        self._update_downloader.download_finished.connect(
-            lambda ok, path, err: self._on_download_finished(ok, path, err, dlg)
+        self._update_downloader.progress.connect(dlg.set_progress)
+        self._update_downloader.finished.connect(
+            lambda ok, path: self._on_download_finished(ok, path, dlg)
         )
         self._update_downloader.start()
 
-    def _on_download_finished(self, ok, path, error, dlg: UpdateDialog):
+    def _on_download_finished(self, ok, path, dlg: UpdateDialog):
         """Callback khi tải xong."""
         if not ok:
-            dlg.set_error(error or "Tải thất bại")
-            self.log(f"❌ Tải cập nhật thất bại: {error}")
+            error_msg = path if isinstance(path, str) else "Tải thất bại"
+            dlg.set_error(error_msg)
+            self.log(f"❌ Tải cập nhật thất bại: {error_msg}")
             return
         dlg.set_ready_to_install()
         self.log("✅ Tải xong! Đang áp dụng cập nhật...")
-        # Tự động apply sau 1s
-        QTimer.singleShot(1000, lambda: apply_update(path))
+        self.log(f"📁 Path bản mới: {path}")
+        
+        # Apply update với error handling
+        def _do_apply():
+            try:
+                self.log(f"🔧 Gọi apply_update({path})...")
+                apply_update(path)
+                # Nếu tới đây nghĩa là apply_update KHÔNG gọi os._exit (lỗi)
+                self.log("⚠️ apply_update returned (did not exit)")
+                dlg.set_error("Không thể áp dụng cập nhật. Vui lòng tải thủ công.")
+            except Exception as e:
+                self.log(f"❌ Lỗi apply_update: {e}")
+                import traceback
+                self.log(traceback.format_exc())
+                dlg.set_error(f"Lỗi: {e}")
+        
+        QTimer.singleShot(1000, _do_apply)
 
 
 def load_saved_credentials():

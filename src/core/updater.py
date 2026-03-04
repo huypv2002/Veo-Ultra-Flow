@@ -1,6 +1,6 @@
 """
 Auto-Update System - Kiểm tra và cập nhật ứng dụng từ GitHub Releases
-Dùng httpx cho cả check API và download (streaming, timeout, follow_redirects)
+Theo documentation: CREATE_NEW_CONSOLE only, KHÔNG dùng DETACHED_PROCESS
 """
 
 import os
@@ -8,6 +8,7 @@ import sys
 import subprocess
 import zipfile
 import shutil
+import traceback
 from pathlib import Path
 from typing import Optional
 
@@ -20,341 +21,296 @@ from PySide6.QtCore import QThread, Signal
 
 from src.core.version import APP_VERSION
 
-# ============================================
-# Cấu hình GitHub
-# ============================================
+
+# ============================================================
+# CẤU HÌNH — SỬA CHO PHÙ HỢP PROJECT CỦA BẠN
+# ============================================================
 GITHUB_OWNER = "huypv2002"
 GITHUB_REPO = "Veo-Ultra-Flow"
 ASSET_NAME = "Veo3-Ultra-windows.zip"
+EXE_NAME = "Veo3-Ultra.exe"
+# ============================================================
+
+RELEASES_API = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
+
+
+def _log(msg: str):
+    """Log ra console VÀ file để debug."""
+    print(msg)
+    try:
+        app_dir = _get_app_dir()
+        log_file = os.path.join(app_dir, "updater.log")
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(f"{msg}\n")
+    except Exception:
+        pass
+
+
+def _get_app_dir() -> str:
+    """Lấy thư mục chứa exe hiện tại."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def _parse_version(tag: str) -> tuple:
-    """Parse version string thành tuple để so sánh."""
-    tag = tag.lstrip("v")
-    parts = tag.split(".")
-    try:
-        return tuple(int(p) for p in parts)
-    except ValueError:
-        return (0, 0, 0)
+    """Parse 'v1.2.3' → (1, 2, 3) để so sánh."""
+    tag = tag.lstrip("vV").strip()
+    parts = []
+    for p in tag.split("."):
+        try:
+            parts.append(int(p))
+        except ValueError:
+            parts.append(0)
+    return tuple(parts)
+
+
+def _is_newer(remote_tag: str) -> bool:
+    return _parse_version(remote_tag) > _parse_version(APP_VERSION)
 
 
 class UpdateChecker(QThread):
-    """Thread kiểm tra phiên bản mới từ GitHub Releases API."""
-
-    check_finished = Signal(bool, str, str, str, str)
+    """Check GitHub Releases API cho bản mới (chạy background thread)."""
+    # Signal: (has_update, tag, download_url, release_notes, error)
+    result = Signal(bool, str, str, str, str)
 
     def run(self):
         if httpx is None:
-            self.check_finished.emit(False, "", "", "", "httpx not installed")
+            self.result.emit(False, "", "", "", "httpx not installed")
             return
         try:
-            url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
-            headers = {
-                "Accept": "application/vnd.github+json",
-                "X-GitHub-Api-Version": "2022-11-28",
-            }
+            r = httpx.get(RELEASES_API, timeout=15, follow_redirects=True)
+            if r.status_code != 200:
+                self.result.emit(False, "", "", "", f"HTTP {r.status_code}")
+                return
 
-            response = httpx.get(url, headers=headers, timeout=30, follow_redirects=True)
-            response.raise_for_status()
-            data = response.json()
-
+            data = r.json()
             tag = data.get("tag_name", "")
-            if not tag:
-                self.check_finished.emit(False, "", "", "", "No tag found in release")
+            body = data.get("body", "") or ""
+
+            if not tag or not _is_newer(tag):
+                self.result.emit(False, tag, "", "", "")
                 return
 
-            remote = _parse_version(tag)
-            local = _parse_version(APP_VERSION)
-            if remote <= local:
-                self.check_finished.emit(False, tag, "", "", "")
-                return
-
-            download_url = ""
+            # Tìm asset ZIP trong release
+            dl_url = ""
             for asset in data.get("assets", []):
-                if asset.get("name") == ASSET_NAME:
-                    download_url = asset.get("browser_download_url", "")
+                if asset.get("name", "") == ASSET_NAME:
+                    dl_url = asset.get("browser_download_url", "")
                     break
 
-            if not download_url:
-                self.check_finished.emit(False, tag, "", "", f"Asset '{ASSET_NAME}' not found")
+            if not dl_url:
+                self.result.emit(False, tag, "", body, f"Không tìm thấy {ASSET_NAME} trong release")
                 return
 
-            release_notes = data.get("body", "") or ""
-            self.check_finished.emit(True, tag, download_url, release_notes, "")
-
+            self.result.emit(True, tag, dl_url, body, "")
         except Exception as e:
-            self.check_finished.emit(False, "", "", "", f"Error: {e}")
+            self.result.emit(False, "", "", "", str(e))
 
 
 class UpdateDownloader(QThread):
-    """Thread tải bản cập nhật ZIP và extract."""
-
-    download_finished = Signal(bool, str, str)
-    progress_updated = Signal(int, float, float)
+    """Download ZIP + extract vào thư mục tạm."""
+    progress = Signal(int)           # percent 0-100
+    finished = Signal(bool, str)     # (ok, new_app_dir hoặc error)
 
     def __init__(self, download_url: str):
         super().__init__()
         self.download_url = download_url
+        self._stopped = False
+
+    def stop(self):
+        self._stopped = True
 
     def run(self):
         if httpx is None:
-            self.download_finished.emit(False, "", "httpx not installed")
+            self.finished.emit(False, "httpx not installed")
             return
         try:
-            if getattr(sys, "frozen", False):
-                app_dir = Path(sys.executable).parent
-            else:
-                app_dir = Path(__file__).parent.parent.parent
+            app_dir = _get_app_dir()
+            update_dir = os.path.join(app_dir, "_update_tmp")
 
-            update_tmp = app_dir / "_update_tmp"
-            if update_tmp.exists():
-                shutil.rmtree(update_tmp, ignore_errors=True)
-            update_tmp.mkdir(exist_ok=True)
+            # Dọn thư mục tạm cũ nếu có
+            if os.path.exists(update_dir):
+                shutil.rmtree(update_dir, ignore_errors=True)
+            os.makedirs(update_dir, exist_ok=True)
 
-            zip_path = update_tmp / ASSET_NAME
+            zip_path = os.path.join(update_dir, ASSET_NAME)
 
-            with httpx.stream("GET", self.download_url, timeout=300, follow_redirects=True) as resp:
-                resp.raise_for_status()
-                total_size = int(resp.headers.get("content-length", 0))
-                total_mb = total_size / (1024 * 1024) if total_size > 0 else 0
+            # Download với progress (stream 64KB chunks)
+            with httpx.stream("GET", self.download_url, timeout=300, follow_redirects=True) as r:
+                total = int(r.headers.get("content-length", 0))
                 downloaded = 0
-                last_pct = -1
-
                 with open(zip_path, "wb") as f:
-                    for chunk in resp.iter_bytes(chunk_size=65536):
-                        if chunk:
-                            f.write(chunk)
-                            downloaded += len(chunk)
-                            if total_size > 0:
-                                pct = int((downloaded / total_size) * 100)
-                                if pct != last_pct:
-                                    last_pct = pct
-                                    self.progress_updated.emit(pct, downloaded / (1024 * 1024), total_mb)
+                    for chunk in r.iter_bytes(chunk_size=65536):
+                        if self._stopped:
+                            self.finished.emit(False, "Đã hủy")
+                            return
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if total > 0:
+                            self.progress.emit(int(downloaded * 100 / total))
 
-            extracted_dir = update_tmp / "extracted"
-            extracted_dir.mkdir(exist_ok=True)
+            self.progress.emit(100)
 
+            # Extract ZIP
+            extract_dir = os.path.join(update_dir, "extracted")
             with zipfile.ZipFile(zip_path, "r") as zf:
-                zf.extractall(extracted_dir)
+                zf.extractall(extract_dir)
 
+            # Tìm thư mục chứa EXE trong ZIP
             new_app_dir = None
-            for item in extracted_dir.iterdir():
-                if item.is_dir():
-                    exe_files = list(item.glob("*.exe"))
-                    if exe_files:
-                        new_app_dir = item
+            for item in os.listdir(extract_dir):
+                candidate = os.path.join(extract_dir, item)
+                if os.path.isdir(candidate):
+                    if os.path.exists(os.path.join(candidate, EXE_NAME)):
+                        new_app_dir = candidate
                         break
 
+            # Fallback: exe nằm trực tiếp trong extract_dir
             if not new_app_dir:
-                for item in extracted_dir.rglob("*.exe"):
-                    new_app_dir = item.parent
-                    break
+                if os.path.exists(os.path.join(extract_dir, EXE_NAME)):
+                    new_app_dir = extract_dir
+                else:
+                    # Thử tìm bất kỳ .exe nào
+                    for root, dirs, files in os.walk(extract_dir):
+                        for f in files:
+                            if f.endswith(".exe"):
+                                new_app_dir = root
+                                break
+                        if new_app_dir:
+                            break
 
-            if new_app_dir:
-                self.download_finished.emit(True, str(new_app_dir), "")
-            else:
-                self.download_finished.emit(False, "", "Không tìm thấy .exe trong ZIP")
+            if not new_app_dir:
+                self.finished.emit(False, f"Không tìm thấy {EXE_NAME} trong ZIP")
+                return
 
+            self.finished.emit(True, new_app_dir)
         except Exception as e:
-            self.download_finished.emit(False, "", f"Error: {e}")
+            self.finished.emit(False, str(e))
 
 
-def apply_update(new_app_dir: str) -> bool:
-    """Áp dụng bản cập nhật: tạo _updater.bat, thoát app.
-
-    Batch script logic:
-      1. Chờ process cũ tắt (poll PID, timeout 30s -> force kill)
-      2. Xóa files/folders CŨ, NGOẠI TRỪ: data/, output/, _update_tmp/, _updater.bat
-      3. Copy bản mới vào (NGOẠI TRỪ data/ và output/)
-      4. Start exe mới
-      5. Xóa _update_tmp/ và tự xóa _updater.bat
+def apply_update(new_app_dir: str):
     """
-    try:
-        # Xác định app_dir và exe_name
-        if getattr(sys, "frozen", False):
-            current_exe = Path(sys.executable)
-            app_dir = current_exe.parent
-            exe_name = current_exe.name
-        else:
-            # Dev mode - vẫn cho chạy để test
-            app_dir = Path(__file__).parent.parent.parent
-            exe_name = "Veo3-Ultra.exe"
+    Tạo _updater.bat rồi launch nó, sau đó app thoát.
+    Theo docs: CHỈ dùng CREATE_NEW_CONSOLE, KHÔNG kết hợp DETACHED_PROCESS
+    """
+    app_dir = _get_app_dir()
+    current_pid = os.getpid()
+    bat_path = os.path.join(app_dir, "_updater.bat")
 
-        new_app_path = Path(new_app_dir).resolve()
-        pid = os.getpid()
+    _log(f"[updater] app_dir: {app_dir}")
+    _log(f"[updater] new_app_dir: {new_app_dir}")
+    _log(f"[updater] PID: {current_pid}")
 
-        # Tìm exe trong thư mục mới
-        new_exe_candidates = list(new_app_path.glob("*.exe"))
-        if new_exe_candidates:
-            # Ưu tiên exe có tên Veo3-Ultra
-            target_exe = None
-            for candidate in new_exe_candidates:
-                if "veo3" in candidate.name.lower() or "ultra" in candidate.name.lower():
-                    target_exe = candidate.name
-                    break
-            if not target_exe:
-                target_exe = new_exe_candidates[0].name
-            exe_name = target_exe
-
-        print(f"[updater] app_dir: {app_dir}")
-        print(f"[updater] new_app_path: {new_app_path}")
-        print(f"[updater] exe_name: {exe_name}")
-        print(f"[updater] PID: {pid}")
-
-        # Escape paths cho batch (dùng short path nếu có spaces)
-        app_dir_str = str(app_dir)
-        new_app_str = str(new_app_path)
-
-        batch_content = f'''@echo off
-setlocal enabledelayedexpansion
+    # ============================================================
+    # NỘI DUNG BATCH SCRIPT (theo documentation)
+    # ============================================================
+    bat_content = f'''@echo off
 chcp 65001 >nul
-title Veo3 Ultra - Updating...
-color 0A
-
-echo.
-echo ========================================
-echo   Veo3 Ultra - Dang cap nhat...
-echo ========================================
+title Updating {EXE_NAME}...
+echo ============================================
+echo   Dang cap nhat...
+echo ============================================
 echo.
 
-echo [1/5] Dang doi ung dung dong...
-
-:: Wait for old process (PID {pid}) to exit, timeout 30s
-set /a WAIT=0
+:: ========== BUOC 1: Cho process cu tat ==========
+echo Cho ung dung cu dong lai...
+set /a count=0
 :wait_loop
-tasklist /FI "PID eq {pid}" 2>NUL | findstr /I "{pid}" >NUL
-if %ERRORLEVEL%==0 (
-    set /a WAIT+=2
-    if !WAIT! GEQ 30 (
-        echo    Timeout - force kill PID {pid}
-        taskkill /F /PID {pid} >NUL 2>&1
+tasklist /FI "PID eq {current_pid}" 2>nul | find /I "{current_pid}" >nul
+if not errorlevel 1 (
+    set /a count+=1
+    if %count% GEQ 30 (
+        echo Timeout! Force kill...
+        taskkill /PID {current_pid} /F >nul 2>&1
         timeout /t 2 /nobreak >nul
-        goto done_wait
+        goto :do_update
     )
-    echo    Ung dung van chay, doi them... (!WAIT!s)
-    timeout /t 2 /nobreak >nul
-    goto wait_loop
+    timeout /t 1 /nobreak >nul
+    goto :wait_loop
 )
-:done_wait
-echo    OK - Ung dung da dong.
-timeout /t 2 /nobreak >nul
 
-echo [2/5] Dang xoa file cu...
-:: Xoa tat ca files/folders CU, NGOAI TRU: data, output, _update_tmp, _updater.bat
-for /d %%D in ("{app_dir_str}\\*") do (
-    set "FNAME=%%~nxD"
-    if /i not "!FNAME!"=="data" (
-        if /i not "!FNAME!"=="output" (
-            if /i not "!FNAME!"=="_update_tmp" (
-                echo    Xoa folder: %%~nxD
-                rd /s /q "%%D" 2>nul
+:do_update
+echo Dang cap nhat files...
+timeout /t 1 /nobreak >nul
+
+:: ========== BUOC 2: Xoa files/folders cu ==========
+:: Xoa TAT CA files trong app_dir, NGOAI TRU _updater.bat va _update_tmp
+for %%F in ("{app_dir}\\*") do (
+    if /I not "%%~nxF"=="_updater.bat" (
+        if /I not "%%~nxF"=="_update_tmp" (
+            del /F /Q "%%F" >nul 2>&1
+        )
+    )
+)
+:: Xoa TAT CA folders, NGOAI TRU data/, output/, _update_tmp/
+for /D %%D in ("{app_dir}\\*") do (
+    if /I not "%%~nxD"=="data" (
+        if /I not "%%~nxD"=="output" (
+            if /I not "%%~nxD"=="_update_tmp" (
+                rmdir /S /Q "%%D" >nul 2>&1
             )
         )
     )
 )
-for %%F in ("{app_dir_str}\\*") do (
-    set "FNAME=%%~nxF"
-    if /i not "!FNAME!"=="_updater.bat" (
-        echo    Xoa file: %%~nxF
-        del /f /q "%%F" 2>nul
-    )
-)
 
-echo [3/5] Dang copy file moi...
-:: Copy ban moi vao app_dir (NGOAI TRU data/ va output/)
-for /d %%D in ("{new_app_str}\\*") do (
-    set "FNAME=%%~nxD"
-    if /i not "!FNAME!"=="data" (
-        if /i not "!FNAME!"=="output" (
-            echo    Copy folder: %%~nxD
-            xcopy /e /y /q "%%D" "{app_dir_str}\\%%~nxD\\" >nul 2>&1
+:: ========== BUOC 3: Copy ban moi vao ==========
+:: Copy files (KHONG ghi de data/ va output/ — giu data cua user)
+echo Copy ban moi...
+for %%F in ("{new_app_dir}\\*") do (
+    copy /Y "%%F" "{app_dir}\\" >nul 2>&1
+)
+for /D %%D in ("{new_app_dir}\\*") do (
+    if /I not "%%~nxD"=="data" (
+        if /I not "%%~nxD"=="output" (
+            xcopy /E /I /Y "%%D" "{app_dir}\\%%~nxD" >nul 2>&1
         )
     )
 )
-for %%F in ("{new_app_str}\\*") do (
-    echo    Copy file: %%~nxF
-    copy /y "%%F" "{app_dir_str}\\" >nul 2>&1
-)
 
-echo [4/5] Dang khoi dong ung dung moi...
+:: ========== BUOC 4: Don dep ==========
+echo Don dep...
+rmdir /S /Q "{app_dir}\\_update_tmp" >nul 2>&1
+
+:: ========== BUOC 5: Start ban moi ==========
+echo Khoi dong ban moi...
+start "" "{app_dir}\\{EXE_NAME}"
+
+:: ========== BUOC 6: Tu xoa batch file ==========
+echo Cap nhat thanh cong!
 timeout /t 2 /nobreak >nul
-if exist "{app_dir_str}\\{exe_name}" (
-    echo    Khoi dong: {exe_name}
-    start "" "{app_dir_str}\\{exe_name}"
-) else (
-    echo    CANH BAO: Khong tim thay {exe_name}
-    echo    Thu tim exe khac...
-    for %%E in ("{app_dir_str}\\*.exe") do (
-        echo    Tim thay: %%~nxE
-        start "" "%%E"
-        goto cleanup
-    )
-)
-
-:cleanup
-echo [5/5] Don dep...
-timeout /t 3 /nobreak >nul
-rd /s /q "{app_dir_str}\\_update_tmp" 2>nul
-
-echo.
-echo ========================================
-echo   Cap nhat hoan tat!
-echo ========================================
-timeout /t 3 /nobreak >nul
-
-:: Self delete
-del "%~f0"
+del /F /Q "%~f0" >nul 2>&1
+exit
 '''
 
-        batch_path = app_dir / "_updater.bat"
-        print(f"[updater] Writing batch to: {batch_path}")
+    # Ghi batch file
+    _log(f"[updater] Writing batch to: {bat_path}")
+    with open(bat_path, "w", encoding="utf-8") as f:
+        f.write(bat_content)
 
-        with open(batch_path, "w", encoding="utf-8") as f:
-            f.write(batch_content)
-
-        print(f"[updater] Launching updater batch...")
-
-        # Launch batch - dùng nhiều cách để đảm bảo chạy được
-        try:
-            if sys.platform == "win32":
-                # Cách 1: CREATE_NEW_CONSOLE
-                subprocess.Popen(
-                    ["cmd.exe", "/c", str(batch_path)],
-                    creationflags=subprocess.CREATE_NEW_CONSOLE | subprocess.DETACHED_PROCESS,
-                    cwd=str(app_dir),
-                    close_fds=True,
-                )
-            else:
-                # macOS/Linux fallback
-                subprocess.Popen(
-                    ["bash", "-c", f'sleep 2 && echo "Update not supported on this OS"'],
-                    start_new_session=True,
-                )
-        except Exception as launch_err:
-            print(f"[updater] Launch method 1 failed: {launch_err}")
-            try:
-                # Cách 2: os.startfile
-                os.startfile(str(batch_path))
-            except Exception as launch_err2:
-                print(f"[updater] Launch method 2 failed: {launch_err2}")
-                try:
-                    # Cách 3: start command
-                    subprocess.Popen(
-                        f'start "" "{batch_path}"',
-                        shell=True,
-                        cwd=str(app_dir),
-                    )
-                except Exception as launch_err3:
-                    print(f"[updater] All launch methods failed: {launch_err3}")
-                    return False
-
-        print(f"[updater] Batch launched, exiting app...")
-
-        # Thoát app ngay
-        os._exit(0)
-
+    # Launch batch script trong console riêng
+    # THEO DOCS: CHI dung CREATE_NEW_CONSOLE, KHONG ket hop DETACHED_PROCESS
+    _log(f"[updater] Launching batch with CREATE_NEW_CONSOLE...")
+    try:
+        subprocess.Popen(
+            ["cmd", "/c", bat_path],
+            creationflags=subprocess.CREATE_NEW_CONSOLE,
+        )
+        _log(f"[updater] Batch launched, exiting app...")
     except Exception as e:
-        print(f"[updater] Error applying update: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
+        _log(f"[updater] Failed to launch batch: {e}")
+        # Fallback: thu cach khac
+        try:
+            subprocess.Popen(
+                ["cmd.exe", "/c", bat_path],
+                creationflags=subprocess.CREATE_NEW_CONSOLE,
+                cwd=app_dir,
+            )
+            _log(f"[updater] Batch launched via cmd.exe fallback")
+        except Exception as e2:
+            _log(f"[updater] Fallback also failed: {e2}")
+            raise
+
+    # App thoat ngay de batch script co the xoa/ghi de files
+    # Dung os._exit() thay vi sys.exit() de force kill tat ca threads
+    os._exit(0)
