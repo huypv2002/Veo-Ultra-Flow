@@ -2,7 +2,6 @@ name: Build Windows EXE
 
 on:
   push:
-    branches: [main]
     tags: ['v*']
   workflow_dispatch:
 
@@ -41,19 +40,15 @@ jobs:
           pip install -r requirements.txt
           pip install nuitka ordered-set zstandard
 
-      - name: Prepare package data paths
+      - name: Get CPU count
         id: pkg_paths
         run: |
-          $curl_raw = (python -c "import curl_cffi, os; print(os.path.dirname(curl_cffi.__file__))").Trim()
-          $curl_dir = $curl_raw -replace '\\', '/'
-          echo "CURL_CFFI_DIR=$curl_dir" >> $env:GITHUB_OUTPUT
           $cpu = $env:NUMBER_OF_PROCESSORS
           if (-not $cpu) { $cpu = "4" }
           echo "CPU_COUNT=$cpu" >> $env:GITHUB_OUTPUT
 
       - name: Build with Nuitka (standalone)
         run: |
-          $curl_cffi_dir = "${{ steps.pkg_paths.outputs.CURL_CFFI_DIR }}"
           $cpu = "${{ steps.pkg_paths.outputs.CPU_COUNT }}"
           echo "Building standalone with $cpu jobs..."
           python -m nuitka `
@@ -70,37 +65,18 @@ jobs:
             --include-package=requests `
             --include-package=urllib3 `
             --include-package=charset_normalizer `
-            --include-package=curl_cffi `
-            --include-package=pydantic `
-            --include-package=cryptography `
-            --include-package=selenium `
-            --include-package=undetected_chromedriver `
-            --include-package=chromedriver_autoinstaller `
             --include-package=setuptools `
             --include-package=zendriver `
             --include-package=websockets `
-            --include-package=emoji `
-            --include-package=grapheme `
-            --include-package=latest_user_agents `
-            --include-package=user_agents `
-            --include-module=_cffi_backend `
+            --include-package=flask `
+            --include-package=bcrypt `
+            --include-package=jwt `
             --include-module=PySide6.QtMultimedia `
             --include-module=PySide6.QtMultimediaWidgets `
             --include-package-data=PySide6 `
             --include-package-data=certifi `
-            --include-package-data=cryptography `
-            --include-package-data=pydantic `
             --include-package-data=zendriver `
-            --include-package-data=emoji `
-            --include-package-data=grapheme `
-            --include-package-data=curl_cffi `
-            --include-package-data=selenium `
-            --include-package-data=undetected_chromedriver `
             --include-package-data=setuptools `
-            --include-package-data=latest_user_agents `
-            --include-package-data=user_agents `
-            --include-package-data=chromedriver_autoinstaller `
-            --include-data-dir="$curl_cffi_dir=curl_cffi" `
             --nofollow-import-to=tkinter `
             --nofollow-import-to=_tkinter `
             --nofollow-import-to=PyQt6 `
@@ -117,7 +93,6 @@ jobs:
             --nofollow-import-to=test `
             --nofollow-import-to=unittest `
             --nofollow-import-to=doctest `
-            --nofollow-import-to=giaima `
             --no-pyi-file `
             --assume-yes-for-downloads `
             main.py
@@ -149,26 +124,6 @@ jobs:
             echo "ERROR: Veo3-Ultra.exe not found in main.dist!"
             Get-ChildItem -Recurse "main.dist" -Filter "*.exe" | ForEach-Object { echo $_.FullName }
             exit 1
-          }
-
-      - name: Smoke test
-        run: |
-          echo "=== Smoke test ==="
-          $proc = Start-Process -FilePath "main.dist\Veo3-Ultra.exe" -WorkingDirectory "main.dist" -PassThru -NoNewWindow
-          Start-Sleep -Seconds 8
-          $crashLog = "$env:TEMP\Veo3Ultra_crash.log"
-          if (Test-Path $crashLog) {
-            echo "=== Crash log ==="
-            Get-Content $crashLog
-          }
-          if (Test-Path "main.dist\data\accounts.json") {
-            echo "=== data/accounts.json OK ==="
-          }
-          if ($proc.HasExited) {
-            echo "Process exited: code $($proc.ExitCode)"
-          } else {
-            echo "OK: Process running (PID $($proc.Id))"
-            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
           }
 
       - name: Package as ZIP
