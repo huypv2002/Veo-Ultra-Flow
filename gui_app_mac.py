@@ -19616,21 +19616,21 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                 if is_portrait:
                     model = "veo_3_1_i2v_s_fast_portrait_ultra_relaxed"  # I2V Low Fast Portrait
                 else:
-                    model = "veo_3_1_i2v_s_fast_ultra_fl_relaxed"  # I2V Low Fast Landscape
+                    model = "veo_3_1_i2v_s_fast_ultra_relaxed"  # I2V Low Fast Landscape (KHÔNG có _fl)
             elif model == "veo_3_1_t2v_fast_ultra":  # Fast (10 credits)
                 if is_portrait:
-                    model = "veo_3_1_i2v_s_fast_portrait_ultra_fl"  # I2V Fast Portrait
+                    model = "veo_3_1_i2v_s_fast_portrait_ultra"  # I2V Fast Portrait (KHÔNG có _fl)
                 else:
-                    model = "veo_3_1_i2v_s_fast_ultra_fl"  # I2V Fast Landscape
+                    model = "veo_3_1_i2v_s_fast_ultra"  # I2V Fast Landscape (KHÔNG có _fl)
             elif model == "veo_3_1_t2v":  # Quality (100 credits)
                 if is_portrait:
                     model = "veo_3_1_i2v_s_portrait"  # I2V Quality Portrait
                 else:
-                    model = "veo_3_1_i2v_s_landscape"  # I2V Quality Landscape
+                    model = "veo_3_1_i2v_s"  # I2V Quality Landscape (KHÔNG có _landscape)
             elif model == "veo_3_1_t2v_fast_portrait_ultra_relaxed":  # Low Fast Portrait
                 model = "veo_3_1_i2v_s_fast_portrait_ultra_relaxed"
             elif model == "veo_3_1_t2v_fast_portrait_ultra":  # Fast Portrait
-                model = "veo_3_1_i2v_s_fast_portrait_ultra_fl"
+                model = "veo_3_1_i2v_s_fast_portrait_ultra"
             elif model == "veo_3_1_t2v_portrait":  # Quality Portrait
                 model = "veo_3_1_i2v_s_portrait"
         # ✅ Override model cho Integrate to Video mode
@@ -21976,14 +21976,12 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
             # Veo 3.1 R2V Portrait models (9:16)
             "veo_3_1_r2v_fast_portrait_ultra_relaxed": "veo_3_1_t2v_fast_portrait_ultra_relaxed",
             # Veo 3.1 I2V Landscape models - KHÔNG có "landscape" trong tên T2V
-            "veo_3_1_i2v_s_fast_ultra_fl": "veo_3_1_t2v_fast_ultra",
-            "veo_3_1_i2v_s_fast_ultra_fl_relaxed": "veo_3_1_t2v_fast_ultra_relaxed",
-            "veo_3_1_i2v_s_fast_landscape_ultra_fl": "veo_3_1_t2v_fast_ultra",
-            "veo_3_1_i2v_s_fast_landscape_ultra_fl_relaxed": "veo_3_1_t2v_fast_ultra_relaxed",
-            "veo_3_1_i2v_s_landscape": "veo_3_1_t2v",
+            "veo_3_1_i2v_s_fast_ultra": "veo_3_1_t2v_fast_ultra",
+            "veo_3_1_i2v_s_fast_ultra_relaxed": "veo_3_1_t2v_fast_ultra_relaxed",
+            "veo_3_1_i2v_s": "veo_3_1_t2v",
             # Veo 3.1 I2V Portrait models
-            "veo_3_1_i2v_s_fast_portrait_ultra_fl": "veo_3_1_t2v_fast_portrait_ultra",
-            "veo_3_1_i2v_s_fast_portrait_ultra_fl_relaxed": "veo_3_1_t2v_fast_portrait_ultra_relaxed",
+            "veo_3_1_i2v_s_fast_portrait_ultra": "veo_3_1_t2v_fast_portrait_ultra",
+            "veo_3_1_i2v_s_fast_portrait_ultra_relaxed": "veo_3_1_t2v_fast_portrait_ultra_relaxed",
             "veo_3_1_i2v_s_portrait": "veo_3_1_t2v_portrait",
         }
         
@@ -22955,14 +22953,14 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
             # ✅ Model đã được override trong on_start() nếu là Image to Video mode
             # Nhưng vẫn cần kiểm tra lại để đảm bảo đúng (phòng trường hợp gọi trực tiếp)
             if model in ["Fast", "Veo 3.1 Ultra", "veo_3_1_t2v_fast_ultra"]:
-                model = "veo_3_1_i2v_s_fast_ultra_fl"
+                model = "veo_3_1_i2v_s_fast_ultra"
             elif model in ["Quality", "Veo 3.1 Standard", "veo_3_1_t2v"]:
                 model = "veo_3_1_i2v_s"
             elif model in ["Veo 2.1 Fast", "veo_2_1_fast_d_15_t2v"]:
                 model = "veo_2_1_fast_d_15_i2v"
             elif model in ["Low Fast", "Veo 3.1 Relaxed", "veo_3_1_t2v_fast_ultra_relaxed", "veo_3_1_t2v_fast_portrait_ultra_relaxed"]:
                 # ✅ Đảm bảo model 0 credits cho I2V - _get_effective_model sẽ xử lý portrait/landscape
-                model = "veo_3_1_i2v_s_fast_ultra_fl_relaxed"
+                model = "veo_3_1_i2v_s_fast_ultra_relaxed"
                 self.log(f"✅ I2V: Model 0 credits được set: {model}")
             
             num_cookies = len(self.cookies_list) if self.cookies_list else 1
@@ -24343,7 +24341,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
             
             # OVERRIDE MODEL cho I2V (QUAN TRỌNG!)
             if model in ["Fast", "Veo 3.1 Ultra", "veo_3_1_t2v_fast_ultra"]:
-                model = "veo_3_1_i2v_s_fast_ultra_fl"
+                model = "veo_3_1_i2v_s_fast_ultra"
                 self.log(f"🎯 I2V: Override model → {model}")
             elif model in ["Quality", "Veo 3.1 Standard", "veo_3_1_t2v"]:
                 model = "veo_3_1_i2v_s"
@@ -24545,34 +24543,34 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
             is_portrait = "9:16" in model_text
             i2v_model_map = {
                 # Fast (10 credits) - Landscape (16:9) - KHỚP VỚI COMBO BOX
-                "Fast (16:9) - 10 credits": "veo_3_1_i2v_s_fast_ultra_fl",
+                "Fast (16:9) - 10 credits": "veo_3_1_i2v_s_fast_ultra",
                 # Quality (100 credits) - Landscape (16:9)
-                "Quality (16:9) - 100 credits": "veo_3_1_i2v_s_landscape",
+                "Quality (16:9) - 100 credits": "veo_3_1_i2v_s",
                 # Low Fast (0 credits) - Landscape (16:9)
                 "Low Fast (16:9) - 0 credits": "veo_3_1_i2v_s_fast_ultra_relaxed",
                 # Fast (10 credits) - Portrait (9:16)
-                "Fast (9:16) - 10 credits": "veo_3_1_i2v_s_fast_portrait_ultra_fl",
+                "Fast (9:16) - 10 credits": "veo_3_1_i2v_s_fast_portrait_ultra",
                 # Quality (100 credits) - Portrait (9:16)
                 "Quality (9:16) - 100 credits": "veo_3_1_i2v_s_portrait",
                 # Low Fast (0 credits) - Portrait (9:16)
                 "Low Fast (9:16) - 0 credits": "veo_3_1_i2v_s_fast_portrait_ultra_relaxed",
                 # Legacy names (backward compatibility - không có "- X credits")
-                "Fast (16:9)": "veo_3_1_i2v_s_fast_ultra_fl",
-                "Quality (16:9)": "veo_3_1_i2v_s_landscape",
+                "Fast (16:9)": "veo_3_1_i2v_s_fast_ultra",
+                "Quality (16:9)": "veo_3_1_i2v_s",
                 "Low Fast (16:9)": "veo_3_1_i2v_s_fast_ultra_relaxed",
-                "Fast (9:16)": "veo_3_1_i2v_s_fast_portrait_ultra_fl",
+                "Fast (9:16)": "veo_3_1_i2v_s_fast_portrait_ultra",
                 "Quality (9:16)": "veo_3_1_i2v_s_portrait",
                 "Low Fast (9:16)": "veo_3_1_i2v_s_fast_portrait_ultra_relaxed",
-                "Veo 3.1 Ultra": "veo_3_1_i2v_s_fast_ultra_fl",
-                "Veo 3.1 Standard": "veo_3_1_i2v_s_landscape",
+                "Veo 3.1 Ultra": "veo_3_1_i2v_s_fast_ultra",
+                "Veo 3.1 Standard": "veo_3_1_i2v_s",
                 "Veo 2.1 Fast": "veo_2_1_fast_d_15_i2v",
                 "Veo 3.1 Relaxed": "veo_3_1_i2v_s_fast_ultra_relaxed",
                 # Direct Veo 3.1 model keys
-                "veo_3_1_i2v_s_fast_ultra_fl": "veo_3_1_i2v_s_fast_ultra_fl",
-                "veo_3_1_i2v_s_fast_portrait_ultra_fl": "veo_3_1_i2v_s_fast_portrait_ultra_fl",
+                "veo_3_1_i2v_s_fast_ultra": "veo_3_1_i2v_s_fast_ultra",
+                "veo_3_1_i2v_s_fast_portrait_ultra": "veo_3_1_i2v_s_fast_portrait_ultra",
                 "veo_3_1_i2v_s_fast_ultra_relaxed": "veo_3_1_i2v_s_fast_ultra_relaxed",
                 "veo_3_1_i2v_s_fast_portrait_ultra_relaxed": "veo_3_1_i2v_s_fast_portrait_ultra_relaxed",
-                "veo_3_1_i2v_s_landscape": "veo_3_1_i2v_s_landscape",
+                "veo_3_1_i2v_s": "veo_3_1_i2v_s",
                 "veo_3_1_i2v_s_portrait": "veo_3_1_i2v_s_portrait",
             }
             
@@ -24580,7 +24578,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
             if model in i2v_model_map:
                 model = i2v_model_map[model]
             elif model in ["veo_3_1_t2v_fast_ultra", "veo_3_1_t2v"]:
-                model = "veo_3_1_i2v_s_fast_ultra_fl" if not is_portrait else "veo_3_1_i2v_s_fast_portrait_ultra_fl"
+                model = "veo_3_1_i2v_s_fast_ultra" if not is_portrait else "veo_3_1_i2v_s_fast_portrait_ultra"
             elif model in ["veo_3_1_t2v_fast_ultra_relaxed"]:
                 model = "veo_3_1_i2v_s_fast_ultra_relaxed" if not is_portrait else "veo_3_1_i2v_s_fast_portrait_ultra_relaxed"
             elif model in ["veo_2_1_fast_d_15_t2v"]:
@@ -34185,11 +34183,11 @@ QUAN TRỌNG:
             is_relaxed = "relaxed" in model.lower() if model else False
             
             if aspect_value == "VIDEO_ASPECT_RATIO_PORTRAIT":
-                se_model = "veo_3_1_i2v_s_fast_portrait_ultra_fl"  # Fast Portrait
+                se_model = "veo_3_1_i2v_s_fast_portrait_ultra"  # Fast Portrait (KHÔNG có _fl)
                 if is_relaxed:
                     se_model = "veo_3_1_i2v_s_fast_portrait_ultra_relaxed"  # Low Fast Portrait
             else:
-                se_model = "veo_3_1_i2v_s_fast_ultra_fl"  # Fast Landscape
+                se_model = "veo_3_1_i2v_s_fast_ultra"  # Fast Landscape
                 if is_relaxed:
                     se_model = "veo_3_1_i2v_s_fast_ultra_relaxed"  # Low Fast Landscape
             if not client.set_video_model_key(se_model):
