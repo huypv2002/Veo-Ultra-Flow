@@ -18340,79 +18340,11 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
         
         
         def on_accept_check():
-            """Check live status of all cookies before accepting."""
+            """Accept cookies without checking live status."""
             if not cookies_result:
                 QMessageBox.warning(dialog, "Cảnh báo", "Chưa có cookie nào được lấy!")
                 return
-
-            self.log("🔍 Đang kiểm tra Live status trước khi lưu (Set Model)...")
-            QApplication.setOverrideCursor(Qt.WaitCursor)
-            
-            dead_accounts = []
-            try:
-                emails_to_check = list(cookies_result.keys())
-                total_check = len(emails_to_check)
-                
-                for i, email in enumerate(emails_to_check):
-                    # Update process events to keep UI responsive
-                    if i % 2 == 0: QApplication.processEvents()
-                    
-                    # Check live (silent mode)
-                    is_live = _check_live_single(email, silent=True)
-                    if not is_live:
-                         dead_accounts.append(email)
-            except Exception as e:
-                self.log(f"⚠️ Lỗi trong quá trình check live pre-save: {e}")
-            finally:
-                QApplication.restoreOverrideCursor()
-            
-            if dead_accounts:
-                msg = f"⚠️ Phát hiện {len(dead_accounts)} tài khoản KHÔNG Live (không set được Model):\n\n"
-                
-                # List first 10
-                preview_list = dead_accounts[:10]
-                msg += "\n".join([f"❌ {e}" for e in preview_list])
-                if len(dead_accounts) > 10:
-                     msg += f"\n... và {len(dead_accounts) - 10} tài khoản khác."
-                
-                msg += "\n\n👉 Bạn muốn làm gì?"
-                
-                # Custom message box
-                msg_box = QMessageBox(dialog)
-                msg_box.setWindowTitle("Cảnh báo Cookie Die")
-                msg_box.setText(msg)
-                msg_box.setIcon(QMessageBox.Warning)
-                
-                btn_remove = msg_box.addButton("Xóa Lỗi & Lưu", QMessageBox.AcceptRole)
-                btn_save_all = msg_box.addButton("Vẫn Lưu Tất Cả", QMessageBox.YesRole)
-                btn_cancel = msg_box.addButton("Hủy Bỏ (Để Sửa)", QMessageBox.RejectRole)
-                
-                msg_box.exec()
-                
-                if msg_box.clickedButton() == btn_remove:
-                    # Remove dead accounts from cookies_result
-                    removed_count = 0
-                    for email in dead_accounts:
-                        if email in cookies_result:
-                            del cookies_result[email]
-                            removed_count += 1
-                    self.log(f"✅ Đã loại bỏ {removed_count} tài khoản lỗi trước khi lưu.")
-                    
-                    if not cookies_result:
-                         QMessageBox.warning(dialog, "Lỗi", "Không còn tài khoản nào hợp lệ sau khi lọc!")
-                         return
-                    
-                    dialog.accept()
-                    
-                elif msg_box.clickedButton() == btn_save_all:
-                    self.log("⚠️ User chọn lưu tất cả (bao gồm tài khoản lỗi).")
-                    dialog.accept()
-                else:
-                    # Cancel
-                    return
-            else:
-                # All good
-                dialog.accept()
+            dialog.accept()
 
         # Buttons
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
