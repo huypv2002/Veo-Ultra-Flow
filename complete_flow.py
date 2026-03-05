@@ -2952,14 +2952,14 @@ class LabsFlowClient:
                     else:
                         return "veo_3_1_i2v_s_landscape"
                 
-                # T2V models
+                # T2V models - Landscape: KHÔNG có "landscape" trong tên
                 if "t2v" in base_key:
                     if is_relaxed:
-                        return "veo_3_1_t2v_fast_landscape_ultra_relaxed"
+                        return "veo_3_1_t2v_fast_ultra_relaxed"
                     elif "fast" in base_key:
-                        return "veo_3_1_t2v_fast_landscape_ultra"
+                        return "veo_3_1_t2v_fast_ultra"
                     else:
-                        return "veo_3_1_t2v_landscape"
+                        return "veo_3_1_t2v"
                 
                 # Fallback: giữ nguyên
                 return base_key
@@ -3183,20 +3183,13 @@ class LabsFlowClient:
         mapped_aspect = self._map_video_aspect(aspect_ratio)
         effective_model = self._get_effective_model(model_key, mapped_aspect)
         
-        # ✅ VERIFY LIVE STATUS BEFORE GENERATING
-        print(f"  🔍 Checking live status for cookie {self._cookie_hash[:8]}... before generate_videos (T2V)...")
-        if not self.check_live_status():
-            print(f"  ❌ Cookie {self._cookie_hash[:8]}... appears DEAD. Aborting T2V generation.")
-            self.last_error_detail = "Cookie Check Fail: Unable to set model/fetch token in T2V"
-            return None
-
-        
+        # Bỏ check live status - chạy trực tiếp
         requests_body = []
         for i in range(num_videos):
             requests_body.append({
                 "aspectRatio": mapped_aspect,
                 "seed": seeds[i],
-                "textInput": {"prompt": prompt},
+                "textInput": {"structuredPrompt": {"parts": [{"text": prompt}]}},
                 "videoModelKey": effective_model,
                 "metadata": {"sceneId": scene_ids[i]},
             })
@@ -3639,13 +3632,7 @@ class LabsFlowClient:
         mapped_aspect = self._map_video_aspect(aspect_ratio)
         effective_model = self._get_effective_model(model_key, mapped_aspect)
         
-        # ✅ VERIFY LIVE STATUS BEFORE GENERATING
-        print(f"  🔍 Checking live status for cookie {self._cookie_hash[:8]}... before i2v generation...")
-        if not self.check_live_status():
-            print(f"  ❌ Cookie {self._cookie_hash[:8]}... appears DEAD. Aborting i2v generation.")
-            self.last_error_detail = "Cookie Check Fail: Unable to set model/fetch token in I2V"
-            return None
-        
+        # Bỏ check live status - chạy trực tiếp
         # Build requests body theo đúng format payload API yêu cầu
         # ✅ FIX: Dùng structuredPrompt thay vì double-encode prompt thành JSON string
         # Format đúng: "textInput": {"structuredPrompt": {"parts": [{"text": "..."}]}}
@@ -3875,14 +3862,7 @@ class LabsFlowClient:
         else:
             seeds = [int(time.time() * 1_000_000 + i) % 100_000 for i in range(num_videos)]
 
-        # Kiểm tra live status trước khi gọi
-        print(f"  🔍 Checking live status for cookie {self._cookie_hash[:8]}... before start-end generation...")
-        if not self.check_live_status():
-            print(f"  ❌ Cookie {self._cookie_hash[:8]}... appears DEAD. Aborting.")
-            self.last_error_detail = "Cookie Check Fail: Unable to set model/fetch token"
-            self.last_error = self.last_error_detail
-            return None
-
+        # Bỏ check live status - chạy trực tiếp
         # Build payload cơ bản - ✅ FIX: Dùng structuredPrompt thay vì double-encode
         requests_body: List[Dict[str, Any]] = []
         
@@ -4150,13 +4130,7 @@ class LabsFlowClient:
         # Map aspect ratio
         mapped_aspect = self._map_video_aspect(aspect_ratio)
         
-        # ✅ VERIFY LIVE STATUS BEFORE GENERATING
-        print(f"  🔍 Checking live status for cookie {self._cookie_hash[:8]}... before upscale...")
-        if not self.check_live_status():
-            print(f"  ❌ Cookie {self._cookie_hash[:8]}... appears DEAD. Aborting upscale.")
-            self.last_error_detail = "Cookie Check Fail: Unable to set model/fetch token"
-            return None
-
+        # Bỏ check live status - chạy trực tiếp
         requests_body = []
         for i, media_id in enumerate(media_ids):
             requests_body.append({
@@ -4458,13 +4432,7 @@ class LabsFlowClient:
         try:
             print(f"→ Generating image with prompt: '{prompt}'")
             
-            # ✅ VERIFY LIVE STATUS BEFORE GENERATING (Whisk)
-            print(f"  🔍 Checking live status for cookie {self._cookie_hash[:8]}... before Whisk generation...")
-            if not self.check_live_status():
-                print(f"  ❌ Cookie {self._cookie_hash[:8]}... appears DEAD. Aborting Whisk generation.")
-                self.last_error_detail = "Cookie Check Fail: Unable to set model/fetch token in Whisk"
-                return None
-            
+            # Bỏ check live status - chạy trực tiếp
             # Submit batch log first
             log_url = "https://labs.google/fx/api/trpc/general.submitBatchLog"
             app_events = [{
@@ -4686,13 +4654,7 @@ class LabsFlowClient:
             return None
         url = f"https://aisandbox-pa.googleapis.com/v1/projects/{project}/flowMedia:batchGenerateImages"
         
-        # ✅ VERIFY LIVE STATUS BEFORE GENERATING (Flow)
-        print(f"  🔍 Checking live status for cookie {self._cookie_hash[:8]}... before Flow generation...")
-        if not self.check_live_status():
-            print(f"  ❌ Cookie {self._cookie_hash[:8]}... appears DEAD. Aborting Flow generation.")
-            self.last_error_detail = "Cookie Check Fail: Unable to set model/fetch token in Flow"
-            return None
-            
+        # Bỏ check live status - chạy trực tiếp
         # ✅ Thêm clientContext + recaptchaToken cho Flow image
         # ✅ FIX: Thêm projectId, tool, userPaygateTier vào top-level clientContext (giống generate_videos)
         client_context: Dict[str, Any] = {

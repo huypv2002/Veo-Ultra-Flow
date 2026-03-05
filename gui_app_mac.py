@@ -18498,7 +18498,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
             self.update_max_image_concurrent_from_cookies()
     
     def check_cookie_live(self, cookie_str: str):
-        """Check cookie có live không bằng cách test set model (chính xác hơn fetch token)
+        """Check cookie có live không - Ưu tiên fetch credits, fallback set model
         
         Returns:
             (is_live, message)
@@ -18514,18 +18514,36 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
             if not client.fetch_access_token():
                 return False, "❌ Cookie chết (không fetch được token)"
             
-            # Bước 2: Test set model - nếu set được thì cookie live
-            # Dùng model mặc định để test
-            test_model = "veo_3_1_t2v_fast_ultra"
-            if client.set_video_model_key(test_model):
-                return True, "✅ Cookie live (set model OK)"
-            else:
-                error_msg = getattr(client, "last_error_detail", "") or getattr(client, "last_error", "") or "Không set được model"
-                # Kiểm tra nếu là lỗi 401 Unauthorized thì cookie die
-                if "401" in str(error_msg) or "Unauthorized" in str(error_msg):
-                    return False, "❌ Cookie chết (401 Unauthorized)"
+            # Bước 2: Ưu tiên - Check credits (chính xác hơn)
+            try:
+                success, credits_data, msg = self.check_cookie_credits(cookie_str)
+                if success and credits_data:
+                    credits = credits_data.get("credits", 0)
+                    tier = credits_data.get("userPaygateTier", "UNKNOWN")
+                    return True, f"✅ Cookie live - Credits: {credits:,} ({tier})"
                 else:
-                    return False, f"❌ Cookie chết (set model fail: {error_msg[:50]})"
+                    self.log(f"⚠️ Fetch credits failed: {msg}, thử cách khác...")
+            except Exception as e:
+                self.log(f"⚠️ Check credits lỗi: {e}, thử cách khác...")
+            
+            # Bước 3: Fallback - Test set model (thử nhiều model khác nhau)
+            test_models = [
+                "veo_3_1_t2v_fast_ultra",
+                "veo_3_1_t2v_fast", 
+                "veo_3_1",
+                "veo_3_0",
+            ]
+            
+            for test_model in test_models:
+                if client.set_video_model_key(test_model):
+                    return True, f"✅ Cookie live (set model {test_model} OK)"
+            
+            # Nếu không set được model nào
+            error_msg = getattr(client, "last_error_detail", "") or getattr(client, "last_error", "") or "Không set được model"
+            if "401" in str(error_msg) or "Unauthorized" in str(error_msg):
+                return False, "❌ Cookie chết (401 Unauthorized)"
+            else:
+                return False, f"❌ Cookie chết (set model fail: {error_msg[:50]})"
         except Exception as e:
             return False, f"❌ Lỗi: {str(e)[:50]}"
     
@@ -19623,17 +19641,23 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
         
         # Map display text to actual model key - Veo 3.1 Full Models
         model_map = {
-            # T2V Models
-            "Fast (16:9)": "veo_3_1_t2v_fast_ultra",         # 10 credits - Landscape
-            "Quality (16:9)": "veo_3_1_t2v",                 # 100 credits
-            "Low Fast (16:9)": "veo_3_1_t2v_fast_ultra_relaxed",  # 0 credits - Landscape
+            # T2V Models - Landscape (16:9) - KHỚP VỚI COMBO BOX
+            "Low Fast (16:9) - 0 credits": "veo_3_1_t2v_fast_ultra_relaxed",  # 0 credits
+            "Fast (16:9) - 10 credits": "veo_3_1_t2v_fast_ultra",              # 10 credits
+            "Quality (16:9) - 100 credits": "veo_3_1_t2v",                     # 100 credits
             
-            # Portrait T2V Models
-            "Fast (9:16)": "veo_3_1_t2v_fast_portrait_ultra",         # 10 credits - Portrait
-            "Quality (9:16)": "veo_3_1_t2v_portrait",                 # 100 credits - Portrait
-            "Low Fast (9:16)": "veo_3_1_t2v_fast_portrait_ultra_relaxed",  # 0 credits - Portrait
+            # Portrait T2V Models (9:16) - KHỚP VỚI COMBO BOX
+            "Low Fast (9:16) - 0 credits": "veo_3_1_t2v_fast_portrait_ultra_relaxed",  # 0 credits
+            "Fast (9:16) - 10 credits": "veo_3_1_t2v_fast_portrait_ultra",            # 10 credits
+            "Quality (9:16) - 100 credits": "veo_3_1_t2v_portrait",                  # 100 credits
             
-            # Legacy names (backward compatibility)
+            # Legacy names (backward compatibility - không có "- X credits")
+            "Low Fast (16:9)": "veo_3_1_t2v_fast_ultra_relaxed",
+            "Fast (16:9)": "veo_3_1_t2v_fast_ultra",
+            "Quality (16:9)": "veo_3_1_t2v",
+            "Low Fast (9:16)": "veo_3_1_t2v_fast_portrait_ultra_relaxed",
+            "Fast (9:16)": "veo_3_1_t2v_fast_portrait_ultra",
+            "Quality (9:16)": "veo_3_1_t2v_portrait",
             "Veo 3.1 Ultra": "veo_3_1_t2v_fast_ultra",
             "Veo 3.1 Ultra Portrait": "veo_3_1_t2v_fast_portrait_ultra",
             "Veo 3.1 Standard": "veo_3_1_t2v",
@@ -22003,28 +22027,28 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
             elif is_portrait:
                 return "veo_3_1_t2v_fast_portrait_ultra"
             elif is_relaxed:
-                return "veo_3_1_t2v_fast_landscape_ultra_relaxed"
+                return "veo_3_1_t2v_fast_ultra_relaxed"
             else:
-                return "veo_3_1_t2v_fast_landscape_ultra"
+                return "veo_3_1_t2v_fast_ultra"
         
         if model == "veo_3_1_r2v_fast_ultra_relaxed":
-            return "veo_3_1_t2v_fast_portrait_ultra_relaxed" if is_portrait else "veo_3_1_t2v_fast_landscape_ultra_relaxed"
+            return "veo_3_1_t2v_fast_portrait_ultra_relaxed" if is_portrait else "veo_3_1_t2v_fast_ultra_relaxed"
         
         model_map = {
             # Old models (backward compatibility)
             "veo_3_0_r2v_fast_ultra": "veo_3_1_t2v_fast_ultra",
             "veo_3_0_r2v_fast_ultra_relaxed": "veo_3_1_t2v_fast_ultra_relaxed",
-            # Veo 3.1 R2V Landscape models (16:9)
-            "veo_3_1_r2v_fast_landscape_ultra": "veo_3_1_t2v_fast_landscape_ultra",
-            "veo_3_1_r2v_fast_landscape_ultra_relaxed": "veo_3_1_t2v_fast_landscape_ultra_relaxed",
+            # Veo 3.1 R2V Landscape models (16:9) - KHÔNG có "landscape" trong tên T2V
+            "veo_3_1_r2v_fast_landscape_ultra": "veo_3_1_t2v_fast_ultra",
+            "veo_3_1_r2v_fast_landscape_ultra_relaxed": "veo_3_1_t2v_fast_ultra_relaxed",
             # Veo 3.1 R2V Portrait models (9:16)
             "veo_3_1_r2v_fast_portrait_ultra_relaxed": "veo_3_1_t2v_fast_portrait_ultra_relaxed",
-            # Veo 3.1 I2V Landscape models
-            "veo_3_1_i2v_s_fast_ultra_fl": "veo_3_1_t2v_fast_landscape_ultra",
-            "veo_3_1_i2v_s_fast_ultra_fl_relaxed": "veo_3_1_t2v_fast_landscape_ultra_relaxed",
-            "veo_3_1_i2v_s_fast_landscape_ultra_fl": "veo_3_1_t2v_fast_landscape_ultra",
-            "veo_3_1_i2v_s_fast_landscape_ultra_fl_relaxed": "veo_3_1_t2v_fast_landscape_ultra_relaxed",
-            "veo_3_1_i2v_s_landscape": "veo_3_1_t2v_landscape",
+            # Veo 3.1 I2V Landscape models - KHÔNG có "landscape" trong tên T2V
+            "veo_3_1_i2v_s_fast_ultra_fl": "veo_3_1_t2v_fast_ultra",
+            "veo_3_1_i2v_s_fast_ultra_fl_relaxed": "veo_3_1_t2v_fast_ultra_relaxed",
+            "veo_3_1_i2v_s_fast_landscape_ultra_fl": "veo_3_1_t2v_fast_ultra",
+            "veo_3_1_i2v_s_fast_landscape_ultra_fl_relaxed": "veo_3_1_t2v_fast_ultra_relaxed",
+            "veo_3_1_i2v_s_landscape": "veo_3_1_t2v",
             # Veo 3.1 I2V Portrait models
             "veo_3_1_i2v_s_fast_portrait_ultra_fl": "veo_3_1_t2v_fast_portrait_ultra",
             "veo_3_1_i2v_s_fast_portrait_ultra_fl_relaxed": "veo_3_1_t2v_fast_portrait_ultra_relaxed",
@@ -24588,19 +24612,25 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
             # Xác định portrait/landscape từ model text
             is_portrait = "9:16" in model_text
             i2v_model_map = {
-                # Fast (10 credits) - Landscape (16:9)
-                "Fast (16:9)": "veo_3_1_i2v_s_fast_ultra_fl",
+                # Fast (10 credits) - Landscape (16:9) - KHỚP VỚI COMBO BOX
+                "Fast (16:9) - 10 credits": "veo_3_1_i2v_s_fast_ultra_fl",
                 # Quality (100 credits) - Landscape (16:9)
-                "Quality (16:9)": "veo_3_1_i2v_s_landscape",
+                "Quality (16:9) - 100 credits": "veo_3_1_i2v_s_landscape",
                 # Low Fast (0 credits) - Landscape (16:9)
-                "Low Fast (16:9)": "veo_3_1_i2v_s_fast_ultra_relaxed",
+                "Low Fast (16:9) - 0 credits": "veo_3_1_i2v_s_fast_ultra_relaxed",
                 # Fast (10 credits) - Portrait (9:16)
-                "Fast (9:16)": "veo_3_1_i2v_s_fast_portrait_ultra_fl",
+                "Fast (9:16) - 10 credits": "veo_3_1_i2v_s_fast_portrait_ultra_fl",
                 # Quality (100 credits) - Portrait (9:16)
-                "Quality (9:16)": "veo_3_1_i2v_s_portrait",
+                "Quality (9:16) - 100 credits": "veo_3_1_i2v_s_portrait",
                 # Low Fast (0 credits) - Portrait (9:16)
+                "Low Fast (9:16) - 0 credits": "veo_3_1_i2v_s_fast_portrait_ultra_relaxed",
+                # Legacy names (backward compatibility - không có "- X credits")
+                "Fast (16:9)": "veo_3_1_i2v_s_fast_ultra_fl",
+                "Quality (16:9)": "veo_3_1_i2v_s_landscape",
+                "Low Fast (16:9)": "veo_3_1_i2v_s_fast_ultra_relaxed",
+                "Fast (9:16)": "veo_3_1_i2v_s_fast_portrait_ultra_fl",
+                "Quality (9:16)": "veo_3_1_i2v_s_portrait",
                 "Low Fast (9:16)": "veo_3_1_i2v_s_fast_portrait_ultra_relaxed",
-                # Legacy names (backward compatibility)
                 "Veo 3.1 Ultra": "veo_3_1_i2v_s_fast_ultra_fl",
                 "Veo 3.1 Standard": "veo_3_1_i2v_s_landscape",
                 "Veo 2.1 Fast": "veo_2_1_fast_d_15_i2v",
@@ -25580,15 +25610,21 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
             model_text = self.combo_model.currentText()
             is_portrait = "9:16" in model_text
             model_map = {
-                # Landscape (16:9)
+                # Landscape (16:9) - KHỚP VỚI COMBO BOX
+                "Fast (16:9) - 10 credits": "veo_3_1_t2v_fast_ultra",
+                "Quality (16:9) - 100 credits": "veo_3_1_t2v",
+                "Low Fast (16:9) - 0 credits": "veo_3_1_t2v_fast_ultra_relaxed",
+                # Portrait (9:16)
+                "Fast (9:16) - 10 credits": "veo_3_1_t2v_fast_portrait_ultra",
+                "Quality (9:16) - 100 credits": "veo_3_1_t2v_portrait",
+                "Low Fast (9:16) - 0 credits": "veo_3_1_t2v_fast_portrait_ultra_relaxed",
+                # Legacy names (backward compatibility)
                 "Fast (16:9)": "veo_3_1_t2v_fast_ultra",
                 "Quality (16:9)": "veo_3_1_t2v",
                 "Low Fast (16:9)": "veo_3_1_t2v_fast_ultra_relaxed",
-                # Portrait (9:16)
                 "Fast (9:16)": "veo_3_1_t2v_fast_portrait_ultra",
                 "Quality (9:16)": "veo_3_1_t2v_portrait",
                 "Low Fast (9:16)": "veo_3_1_t2v_fast_portrait_ultra_relaxed",
-                # Legacy
                 "Veo 2.1 Fast": "veo_2_1_fast_d_15_t2v",
                 "Veo 3.1 Ultra": "veo_3_1_t2v_fast_ultra",
                 "Veo 3.1 Relaxed": "veo_3_1_t2v_fast_ultra_relaxed",
@@ -26571,15 +26607,21 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
             is_portrait = "9:16" in model_text
             # Map display text to actual model key - Veo 3.1 Full Models
             model_map = {
-                # Landscape
+                # Landscape - KHỚP VỚI COMBO BOX
+                "Fast (16:9) - 10 credits": "veo_3_1_t2v_fast_ultra",
+                "Quality (16:9) - 100 credits": "veo_3_1_t2v",
+                "Low Fast (16:9) - 0 credits": "veo_3_1_t2v_fast_ultra_relaxed",
+                # Portrait
+                "Fast (9:16) - 10 credits": "veo_3_1_t2v_fast_portrait_ultra",
+                "Quality (9:16) - 100 credits": "veo_3_1_t2v_portrait",
+                "Low Fast (9:16) - 0 credits": "veo_3_1_t2v_fast_portrait_ultra_relaxed",
+                # Legacy names (backward compatibility)
                 "Fast": "veo_3_1_t2v_fast_ultra",
                 "Quality": "veo_3_1_t2v",
                 "Low Fast": "veo_3_1_t2v_fast_ultra_relaxed",
-                # Portrait
                 "Fast Portrait": "veo_3_1_t2v_fast_portrait_ultra",
                 "Quality Portrait": "veo_3_1_t2v_portrait",
                 "Low Fast Portrait": "veo_3_1_t2v_fast_portrait_ultra_relaxed",
-                # Legacy names (backward compatibility)
                 "Veo 3.1 Ultra": "veo_3_1_t2v_fast_ultra",
                 "Veo 3.1 Ultra Portrait": "veo_3_1_t2v_fast_portrait_ultra",
                 "Veo 3.1 Standard": "veo_3_1_t2v",
@@ -33922,15 +33964,21 @@ QUAN TRỌNG:
             is_portrait = "9:16" in model_text
             # Map display text to actual model key - Veo 3.1 Full Models
             model_map = {
-                # Landscape (16:9)
-                "Fast (16:9)": "veo_3_1_t2v_fast_ultra",   # 10 credits
-                "Quality (16:9)": "veo_3_1_t2v",           # 100 credits
-                "Low Fast (16:9)": "veo_3_1_t2v_fast_ultra_relaxed",  # 0 credits
+                # Landscape (16:9) - KHỚP VỚI COMBO BOX
+                "Fast (16:9) - 10 credits": "veo_3_1_t2v_fast_ultra",
+                "Quality (16:9) - 100 credits": "veo_3_1_t2v",
+                "Low Fast (16:9) - 0 credits": "veo_3_1_t2v_fast_ultra_relaxed",
                 # Portrait (9:16)
-                "Fast (9:16)": "veo_3_1_t2v_fast_portrait_ultra",   # 10 credits
-                "Quality (9:16)": "veo_3_1_t2v_portrait",           # 100 credits
-                "Low Fast (9:16)": "veo_3_1_t2v_fast_portrait_ultra_relaxed",  # 0 credits
-                # Legacy
+                "Fast (9:16) - 10 credits": "veo_3_1_t2v_fast_portrait_ultra",
+                "Quality (9:16) - 100 credits": "veo_3_1_t2v_portrait",
+                "Low Fast (9:16) - 0 credits": "veo_3_1_t2v_fast_portrait_ultra_relaxed",
+                # Legacy names (backward compatibility)
+                "Fast (16:9)": "veo_3_1_t2v_fast_ultra",
+                "Quality (16:9)": "veo_3_1_t2v",
+                "Low Fast (16:9)": "veo_3_1_t2v_fast_ultra_relaxed",
+                "Fast (9:16)": "veo_3_1_t2v_fast_portrait_ultra",
+                "Quality (9:16)": "veo_3_1_t2v_portrait",
+                "Low Fast (9:16)": "veo_3_1_t2v_fast_portrait_ultra_relaxed",
                 "Veo 3.1 Ultra": "veo_3_1_t2v_fast_ultra",
                 "Veo 3.1 Standard": "veo_3_1_t2v",
                 "Veo 2.1 Fast": "veo_2_1_fast_d_15_t2v",
@@ -43434,15 +43482,21 @@ Requirements:
                 is_portrait = "9:16" in model_text
                 # Map display text to actual model key - Veo 3.1 Full Models
                 model_map = {
-                    # Landscape
+                    # Landscape - KHỚP VỚI COMBO BOX
+                    "Fast (16:9) - 10 credits": "veo_3_1_t2v_fast_ultra",
+                    "Quality (16:9) - 100 credits": "veo_3_1_t2v",
+                    "Low Fast (16:9) - 0 credits": "veo_3_1_t2v_fast_ultra_relaxed",
+                    # Portrait
+                    "Fast (9:16) - 10 credits": "veo_3_1_t2v_fast_portrait_ultra",
+                    "Quality (9:16) - 100 credits": "veo_3_1_t2v_portrait",
+                    "Low Fast (9:16) - 0 credits": "veo_3_1_t2v_fast_portrait_ultra_relaxed",
+                    # Legacy names (backward compatibility)
                     "Fast": "veo_3_1_t2v_fast_ultra",
                     "Quality": "veo_3_1_t2v",
                     "Low Fast": "veo_3_1_t2v_fast_ultra_relaxed",
-                    # Portrait
                     "Fast Portrait": "veo_3_1_t2v_fast_portrait_ultra",
                     "Quality Portrait": "veo_3_1_t2v_portrait",
                     "Low Fast Portrait": "veo_3_1_t2v_fast_portrait_ultra_relaxed",
-                    # Legacy names (backward compatibility)
                     "Veo 3.1 Ultra": "veo_3_1_t2v_fast_ultra",
                     "Veo 3.1 Ultra Portrait": "veo_3_1_t2v_fast_portrait_ultra",
                     "Veo 3.1 Standard": "veo_3_1_t2v",
@@ -43786,15 +43840,21 @@ Requirements:
                 # Xác định portrait/landscape từ model text thay vì aspect combo
                 is_portrait = "9:16" in model_text
                 model_map = {
-                    # Landscape
+                    # Landscape - KHỚP VỚI COMBO BOX
+                    "Fast (16:9) - 10 credits": "veo_3_1_t2v_fast_ultra",
+                    "Quality (16:9) - 100 credits": "veo_3_1_t2v",
+                    "Low Fast (16:9) - 0 credits": "veo_3_1_t2v_fast_ultra_relaxed",
+                    # Portrait
+                    "Fast (9:16) - 10 credits": "veo_3_1_t2v_fast_portrait_ultra",
+                    "Quality (9:16) - 100 credits": "veo_3_1_t2v_portrait",
+                    "Low Fast (9:16) - 0 credits": "veo_3_1_t2v_fast_portrait_ultra_relaxed",
+                    # Legacy names (backward compatibility)
                     "Fast": "veo_3_1_t2v_fast_ultra",
                     "Quality": "veo_3_1_t2v",
                     "Low Fast": "veo_3_1_t2v_fast_ultra_relaxed",
-                    # Portrait
                     "Fast Portrait": "veo_3_1_t2v_fast_portrait_ultra",
                     "Quality Portrait": "veo_3_1_t2v_portrait",
                     "Low Fast Portrait": "veo_3_1_t2v_fast_portrait_ultra_relaxed",
-                    # Legacy names (backward compatibility)
                     "Veo 3.1 Ultra": "veo_3_1_t2v_fast_ultra",
                     "Veo 3.1 Ultra Portrait": "veo_3_1_t2v_fast_portrait_ultra",
                     "Veo 3.1 Standard": "veo_3_1_t2v",
@@ -45562,15 +45622,18 @@ Requirements:
             is_portrait = "9:16" in model_text
             # Map display text to actual model key - Veo 3.1 Full Models
             model_map = {
-                # Landscape
-                "Fast": "veo_3_1_t2v_fast_ultra",   # 10 credits
-                "Quality": "veo_3_1_t2v",           # 100 credits
-                "Low Fast": "veo_3_1_t2v_fast_ultra_relaxed",  # 0 credits
+                # Landscape - KHỚP VỚI COMBO BOX
+                "Fast (16:9) - 10 credits": "veo_3_1_t2v_fast_ultra",
+                "Quality (16:9) - 100 credits": "veo_3_1_t2v",
+                "Low Fast (16:9) - 0 credits": "veo_3_1_t2v_fast_ultra_relaxed",
                 # Portrait
-                "Fast (9:16)": "veo_3_1_t2v_fast_portrait_ultra",   # 10 credits
-                "Quality (9:16)": "veo_3_1_t2v_portrait",           # 100 credits
-                "Low Fast (9:16)": "veo_3_1_t2v_fast_portrait_ultra_relaxed",  # 0 credits
+                "Fast (9:16) - 10 credits": "veo_3_1_t2v_fast_portrait_ultra",
+                "Quality (9:16) - 100 credits": "veo_3_1_t2v_portrait",
+                "Low Fast (9:16) - 0 credits": "veo_3_1_t2v_fast_portrait_ultra_relaxed",
                 # Legacy names (backward compatibility)
+                "Fast": "veo_3_1_t2v_fast_ultra",
+                "Quality": "veo_3_1_t2v",
+                "Low Fast": "veo_3_1_t2v_fast_ultra_relaxed",
                 "Veo 3.1 Ultra": "veo_3_1_t2v_fast_ultra",
                 "Veo 3.1 Ultra Portrait": "veo_3_1_t2v_fast_portrait_ultra",
                 "Veo 3.1 Standard": "veo_3_1_t2v",
@@ -46418,15 +46481,21 @@ Requirements:
                 is_portrait = "9:16" in model_text
                 # Map display text to actual model key - Veo 3.1 Full Models
                 model_map = {
-                    # Landscape
-                    "Fast": "veo_3_1_t2v_fast_ultra",   # 10 credits
-                    "Quality": "veo_3_1_t2v",           # 100 credits
-                    "Low Fast": "veo_3_1_t2v_fast_ultra_relaxed",  # 0 credits
+                    # Landscape - KHỚP VỚI COMBO BOX
+                    "Fast (16:9) - 10 credits": "veo_3_1_t2v_fast_ultra",
+                    "Quality (16:9) - 100 credits": "veo_3_1_t2v",
+                    "Low Fast (16:9) - 0 credits": "veo_3_1_t2v_fast_ultra_relaxed",
                     # Portrait
-                    "Fast Portrait": "veo_3_1_t2v_fast_portrait_ultra",   # 10 credits
-                    "Quality Portrait": "veo_3_1_t2v_portrait",           # 100 credits
-                    "Low Fast Portrait": "veo_3_1_t2v_fast_portrait_ultra_relaxed",  # 0 credits
-                    # Legacy
+                    "Fast (9:16) - 10 credits": "veo_3_1_t2v_fast_portrait_ultra",
+                    "Quality (9:16) - 100 credits": "veo_3_1_t2v_portrait",
+                    "Low Fast (9:16) - 0 credits": "veo_3_1_t2v_fast_portrait_ultra_relaxed",
+                    # Legacy names (backward compatibility)
+                    "Fast": "veo_3_1_t2v_fast_ultra",
+                    "Quality": "veo_3_1_t2v",
+                    "Low Fast": "veo_3_1_t2v_fast_ultra_relaxed",
+                    "Fast Portrait": "veo_3_1_t2v_fast_portrait_ultra",
+                    "Quality Portrait": "veo_3_1_t2v_portrait",
+                    "Low Fast Portrait": "veo_3_1_t2v_fast_portrait_ultra_relaxed",
                     "Veo 3.1 Ultra": "veo_3_1_t2v_fast_ultra",
                     "Veo 3.1 Ultra Portrait": "veo_3_1_t2v_fast_portrait_ultra",
                     "Veo 3.1 Standard": "veo_3_1_t2v",
