@@ -2943,14 +2943,14 @@ class LabsFlowClient:
                     else:
                         return "veo_3_1_i2v_s_landscape_fl"
                 
-                # I2V single image models
+                # I2V single image models - KHÔNG thêm "_landscape" suffix (theo curl example)
                 if "i2v" in base_key:
                     if is_relaxed:
-                        return "veo_3_1_i2v_s_fast_landscape_ultra_relaxed"
+                        return "veo_3_1_i2v_s_fast_ultra_relaxed"
                     elif "fast" in base_key:
-                        return "veo_3_1_i2v_s_fast_landscape_ultra"
+                        return "veo_3_1_i2v_s_fast_ultra"
                     else:
-                        return "veo_3_1_i2v_s_landscape"
+                        return "veo_3_1_i2v_s"
                 
                 # T2V models - Landscape: KHÔNG có "landscape" trong tên
                 if "t2v" in base_key:
@@ -3233,6 +3233,9 @@ class LabsFlowClient:
                 # ✅ VERIFY: Đảm bảo token đã được inject vào payload trước khi gọi API
                 if not self._verify_token_before_api_call(payload):
                     return None
+                
+                # ✅ CRITICAL: Chuyển recaptchaToken → recaptchaContext (theo format chuẩn cho tất cả video APIs)
+                self._convert_to_recaptcha_context(payload["clientContext"])
                 
                 try:
                     # ✅ Rate limiting và warm-up delay per cookie (chỉ cho attempt đầu tiên)
@@ -3658,9 +3661,10 @@ class LabsFlowClient:
                 }
             )
         
-        # ✅ Payload khớp WebUI: thêm mediaGenerationContext và useV2ModelConfig
+        # ✅ Payload khớp với curl example chuẩn:
+        # - Có sessionId trong clientContext
+        # - Dùng recaptchaContext thay vì recaptchaToken
         batch_id = str(uuid.uuid4())
-        # ✅ Thêm sessionId theo format: ";timestamp"
         session_id = f";{int(time.time() * 1000)}"
         payload = {
             "mediaGenerationContext": {"batchId": batch_id},
@@ -3668,7 +3672,7 @@ class LabsFlowClient:
                 "projectId": project_id,
                 "tool": tool,
                 "userPaygateTier": user_tier,
-                "sessionId": session_id,  # ✅ Thêm sessionId theo format WebUI
+                "sessionId": session_id,  # ✅ Thêm sessionId theo format curl
             },
             "requests": requests_body,
             "useV2ModelConfig": True,
@@ -3693,9 +3697,18 @@ class LabsFlowClient:
                     print(f"  ✗ Không thể lấy reCAPTCHA token: {e}")
                     return None
 
-                # 2) Verify token đã được inject
-                if not self._verify_token_before_api_call(payload):
-                    return None
+                # ✅ CRITICAL: Chuyển đổi recaptchaToken → recaptchaContext (theo format curl)
+                # API I2V yêu cầu nested format, không phải flat format
+                self._convert_to_recaptcha_context(payload["clientContext"])
+                
+                # ✅ CRITICAL: Loại bỏ sessionId sau khi convert (vì đã inject token xong)
+                # SessionId không nên có trong payload cuối cùng
+                if "sessionId" in payload.get("clientContext", {}):
+                    payload["clientContext"].pop("sessionId", None)
+                if "sessionId" in payload.get("clientContext", {}):
+                    removed_session = payload["clientContext"].pop("sessionId", None)
+                    if removed_session:
+                        print(f"  🧹 [I2V] Đã loại bỏ sessionId khỏi payload: {removed_session[:30]}...")
 
                 try:
                     # 3) Rate limiting đơn giản dựa trên _min_api_call_interval
@@ -3709,7 +3722,22 @@ class LabsFlowClient:
                     self._last_api_call_time = time.time()
 
                     print(f"→ Generating {num_videos} videos from image (attempt {attempt + 1}/{max_retries})")
-
+                    
+                    # ✅ DEBUG: Log chi tiết payload trước khi gọi API - FULL VERSION
+                    try:
+                        debug_payload_str = json.dumps(payload, indent=2, ensure_ascii=False)
+                        print(f"  📤 [DEBUG] === FULL PAYLOAD ===")
+                        print(f"  📤 [DEBUG] Payload size: {len(debug_payload_str)} bytes")
+                        print(f"  📤 [DEBUG] clientContext: {json.dumps(payload.get('clientContext', {}), indent=2)}")
+                        print(f"  📤 [DEBUG] mediaGenerationContext: {json.dumps(payload.get('mediaGenerationContext', {}), indent=2)}")
+                        print(f"  📤 [DEBUG] useV2ModelConfig: {payload.get('useV2ModelConfig')}")
+                        print(f"  📤 [DEBUG] requests count: {len(payload.get('requests', []))}")
+                        if payload.get('requests'):
+                            print(f"  📤 [DEBUG] First request: {json.dumps(payload['requests'][0], indent=2)}")
+                        print(f"  📤 [DEBUG] ===================")
+                    except Exception as e:
+                        print(f"  📤 [DEBUG] Error serializing payload: {e}")
+                    
                     resp = self.session.post(
                         url,
                         headers=self._aisandbox_headers(),
@@ -3782,6 +3810,23 @@ class LabsFlowClient:
                     if resp.status_code >= 400:
                         error_msg = f"{resp.status_code} Client Error: {resp.text[:200]}"
                         print(f"  ⚠️ {error_msg}")
+                        
+                        # ✅ DEBUG chi tiết cho lỗi 400
+                        if resp.status_code == 400:
+                            print(f"  ❌ [I2V DEBUG] Lỗi 400 - Invalid Argument")
+                            print(f"  ❌ [I2V DEBUG] Cookie: {self._cookie_hash[:12]}...")
+                            print(f"  ❌ [I2V DEBUG] URL: {url}")
+                            print(f"  ❌ [I2V DEBUG] Media ID: {media_id[:60] if media_id else 'None'}...")
+                            print(f"  ❌ [I2V DEBUG] Model: {model_key}")
+                            print(f"  ❌ [I2V DEBUG] Aspect: {aspect_ratio} -> {mapped_aspect}")
+                            print(f"  ❌ [I2V DEBUG] Effective Model: {effective_model}")
+                            print(f"  ❌ [I2V DEBUG] Prompt: {prompt[:100]}...")
+                            print(f"  ❌ [I2V DEBUG] Crop Coordinates: {crop_coordinates}")
+                            try:
+                                error_json = resp.json()
+                                print(f"  ❌ [I2V DEBUG] Error JSON: {json.dumps(error_json, indent=2, ensure_ascii=False)[:1000]}")
+                            except:
+                                print(f"  ❌ [I2V DEBUG] Response text: {resp.text[:500]}")
                         
                         # ✅ Dùng unified error handler cho các lỗi 4xx khác
                         if resp.status_code in [400, 401]:
@@ -3931,6 +3976,13 @@ class LabsFlowClient:
                 # 2) Verify token đã inject
                 if not self._verify_token_before_api_call(payload):
                     return None
+
+                # ✅ CRITICAL: Chuyển recaptchaToken → recaptchaContext cho Start-End API
+                self._convert_to_recaptcha_context(payload["clientContext"])
+                
+                # ✅ CRITICAL: Loại bỏ sessionId sau khi convert (giống I2V)
+                if "sessionId" in payload.get("clientContext", {}):
+                    payload["clientContext"].pop("sessionId", None)
 
                 try:
                     # 3) Rate limit đơn giản
@@ -4167,6 +4219,13 @@ class LabsFlowClient:
             # ✅ VERIFY: Đảm bảo token đã được inject vào payload trước khi gọi API
             if not self._verify_token_before_api_call(payload):
                 return None
+            
+            # ✅ CRITICAL: Chuyển recaptchaToken → recaptchaContext cho Upscale API
+            self._convert_to_recaptcha_context(payload["clientContext"])
+            
+            # ✅ CRITICAL: Loại bỏ sessionId sau khi convert
+            if "sessionId" in payload.get("clientContext", {}):
+                payload["clientContext"].pop("sessionId", None)
 
             try:
                 # ✅ Rate limiting - delay trước khi gọi API để tránh 403
@@ -4729,6 +4788,9 @@ class LabsFlowClient:
                 # ✅ VERIFY: Đảm bảo token đã được inject vào payload trước khi gọi API
                 if not self._verify_token_before_api_call(payload):
                     return None
+                
+                # ✅ CRITICAL: Chuyển recaptchaToken → recaptchaContext (theo format chuẩn cho tất cả video APIs)
+                self._convert_to_recaptcha_context(payload["clientContext"])
                 
                 # ✅ Rate limiting - delay trước khi gọi API để tránh 403
                 if attempt == 0:
