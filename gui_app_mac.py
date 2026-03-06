@@ -21334,7 +21334,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
         
         return False
     
-    def upscale_if_needed(self, client, status, task_index):
+    def upscale_if_needed(self, client, status, task_index, aspect=None):
         """Helper function để upscale video nếu setting là 1080P hoặc 4K - GIỐNG HỆT gui_app.py"""
         try:
             # Check upscale setting
@@ -21353,8 +21353,17 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                 resolution = "VIDEO_RESOLUTION_1080P"
                 self.log(f"🔄 Bắt đầu upscale lên 1080P...")
             
-            # ✅ Lấy aspect ratio từ combo để truyền vào upscale
-            aspect = "16:9"  # Default - lấy từ model text thay vì combo
+            # ✅ Lấy aspect ratio từ tham số truyền vào
+            # Nếu không có, tự detect từ model text hiện tại (portrait vs landscape)
+            if aspect is None:
+                try:
+                    model_text = self.combo_model.currentText() if hasattr(self, 'combo_model') else ""
+                    if "9:16" in model_text or "portrait" in model_text.lower():
+                        aspect = "9:16"
+                    else:
+                        aspect = "16:9"
+                except Exception:
+                    aspect = "16:9"
             aspect_map = {
                 "16:9": "VIDEO_ASPECT_RATIO_LANDSCAPE",
                 "9:16": "VIDEO_ASPECT_RATIO_PORTRAIT"
@@ -24185,7 +24194,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
             is_upscaled = False
             if upscale_setting in ("1080P", "4K"):
                 original_status = status
-                status = self.upscale_if_needed(client, status, idx)
+                status = self.upscale_if_needed(client, status, idx, aspect)
                 is_upscaled = (status != original_status)
                 if is_upscaled:
                     self.log(f"✅ Đã upscale lên {upscale_setting}, extract URLs từ upscaled status")
@@ -24875,7 +24884,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
             is_upscaled = False
             if upscale_setting in ("1080P", "4K"):
                 original_status = status
-                status = self.upscale_if_needed(client, status, idx)
+                status = self.upscale_if_needed(client, status, idx, aspect)
                 is_upscaled = (status != original_status)
                 if is_upscaled:
                     self.log(f"✅ Đã upscale lên {upscale_setting}, extract URLs từ upscaled status")
@@ -34411,7 +34420,7 @@ QUAN TRỌNG:
                 return False
             
             # Upscale if needed (1080P or 4K)
-            status = self.upscale_if_needed(client, status, idx)
+            status = self.upscale_if_needed(client, status, idx, aspect)
             
             urls = _extract_file_urls(status)
             
@@ -35429,7 +35438,7 @@ QUAN TRỌNG:
                 return False
             
             # Upscale if needed (1080P or 4K)
-            status = self.upscale_if_needed(client, status, idx)
+            status = self.upscale_if_needed(client, status, idx, aspect)
             
             urls = _extract_file_urls(status)
             
@@ -35740,7 +35749,7 @@ QUAN TRỌNG:
                 return None
             
             # Upscale if needed
-            status = self.upscale_if_needed(client, status, idx)
+            status = self.upscale_if_needed(client, status, idx, aspect)
             
             return status
             
@@ -35808,7 +35817,7 @@ QUAN TRỌNG:
                 return None
             
             # Upscale if needed
-            status = self.upscale_if_needed(client, status, idx)
+            status = self.upscale_if_needed(client, status, idx, aspect)
             
             return status
             
@@ -35985,7 +35994,7 @@ QUAN TRỌNG:
                 return [], []
             
             # Upscale if needed
-            status = self.upscale_if_needed(client, status, idx)
+            status = self.upscale_if_needed(client, status, idx, aspect)
             
             # Extract mediaGenerationIds và URLs
             media_generation_ids = self._extract_media_ids(status)
@@ -36027,7 +36036,7 @@ QUAN TRỌNG:
                 return [], []
             
             # Upscale if needed
-            status = self.upscale_if_needed(client, status, idx)
+            status = self.upscale_if_needed(client, status, idx, aspect)
             
             # Extract mediaGenerationIds và URLs
             media_generation_ids = self._extract_media_ids(status)
