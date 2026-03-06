@@ -7379,6 +7379,68 @@ class GoogleLabsFlowQt6(QMainWindow):
             self.log(f"⚠️ Không tải được ảnh từ signedUri: {str(e)[:120]}")
             return False
 
+    def _create_renew_cookie_callback(self, cookie_str: str, cookies_result: Optional[Dict[str, Any]] = None):
+        """Tạo callback để renew cookie khi bị chặn - dùng chung cho cả Flow và Extend"""
+        # Lưu reference đến cookies_list để có thể lấy cookie tiếp theo
+        cookies_list = self.cookies_list if hasattr(self, 'cookies_list') else []
+        
+        def renew_cookie_callback(cookie_hash: str, old_cookies: Dict[str, str]) -> Optional[Dict[str, str]]:
+            try:
+                # Tìm cookie mới từ cookies_result (so sánh với cookie_str gốc) - cho Flow mode
+                if cookies_result:
+                    for email, cookies_list_item in cookies_result.items():
+                        if isinstance(cookies_list_item, str):
+                            test_cookies = _parse_cookie_string(cookies_list_item)
+                            test_hash = LabsFlowClient._get_cookie_hash(test_cookies)
+                            if test_hash == cookie_hash:
+                                # Tìm cookie mới cho email này
+                                new_cookies_list = cookies_result.get(email)
+                                if new_cookies_list:
+                                    if isinstance(new_cookies_list, str):
+                                        new_cookies = _parse_cookie_string(new_cookies_list)
+                                    elif isinstance(new_cookies_list, list):
+                                        new_cookies = {}
+                                        for c in new_cookies_list:
+                                            if isinstance(c, dict):
+                                                new_cookies[c.get('name', '')] = c.get('value', '')
+
+                                    # Kiểm tra xem cookie mới có khác cookie cũ không
+                                    if new_cookies and new_cookies != old_cookies:
+                                        self.log(f"  ✅ [Renew Cookie] Đã lấy cookie mới cho {email} (hash: {cookie_hash[:8]}...)")
+                                        return new_cookies
+
+                # ✅ Extend mode: Thử lấy cookie tiếp theo từ cookies_list
+                if cookies_list and len(cookies_list) > 1:
+                    self.log(f"  🔄 [Renew Cookie] Đang thử lấy cookie mới từ cookies_list...")
+                    
+                    # Tìm index của cookie hiện tại
+                    current_idx = -1
+                    for idx, c in enumerate(cookies_list):
+                        test_cookies = _parse_cookie_string(c)
+                        test_hash = LabsFlowClient._get_cookie_hash(test_cookies)
+                        if test_hash == cookie_hash:
+                            current_idx = idx
+                            break
+                    
+                    # Lấy cookie tiếp theo
+                    if current_idx >= 0:
+                        next_idx = (current_idx + 1) % len(cookies_list)
+                        next_cookie_str = cookies_list[next_idx]
+                        next_cookies = _parse_cookie_string(next_cookie_str)
+                        
+                        if next_cookies and next_cookies != old_cookies:
+                            self.log(f"  ✅ [Renew Cookie] Đã lấy cookie mới (index: {next_idx}, hash: {LabsFlowClient._get_cookie_hash(next_cookies)[:8]}...)")
+                            return next_cookies
+                
+                self.log(f"  ⚠️ [Renew Cookie] Không tìm thấy cookie mới cho hash: {cookie_hash[:8]}...")
+                return None
+            except Exception as e:
+                self.log(f"  ✗ [Renew Cookie] Lỗi renew cookie: {e}")
+                import traceback
+                self.log(traceback.format_exc())
+                return None
+        return renew_cookie_callback
+
     def _flow_generation_worker(
         self,
         prompts: List[str],
@@ -7405,61 +7467,14 @@ class GoogleLabsFlowQt6(QMainWindow):
             
             num_cookies = len(available_cookies)
             self.log(f"🔑 Flow sử dụng {num_cookies} cookie(s) với round-robin distribution")
-            
-            # ✅ Đăng ký callback để renew cookie khi bị chặn
-            def create_renew_cookie_callback(cookie_str: str):
-                """Tạo callback để lấy cookie mới từ cookies_result hoặc DB"""
-                def renew_cookie_callback(cookie_hash: str, old_cookies: Dict[str, str]) -> Optional[Dict[str, str]]:
-                    try:
-                        # Tìm cookie mới từ cookies_result (so sánh với cookie_str gốc)
-                        # Hoặc lấy từ DB nếu có email
-                        # Tạm thời: trả về cookie mới từ cookies_result nếu có
-                        for email, cookies_list in cookies_result.items():
-                            if isinstance(cookies_list, str):
-                                test_cookies = _parse_cookie_string(cookies_list)
-                                test_hash = LabsFlowClient._get_cookie_hash(test_cookies)
-                                if test_hash == cookie_hash:
-                                    # Tìm cookie mới cho email này
-                                    new_cookies_list = cookies_result.get(email)
-                                    if new_cookies_list:
-                                        if isinstance(new_cookies_list, str):
-                                            new_cookies = _parse_cookie_string(new_cookies_list)
-                                        elif isinstance(new_cookies_list, list):
-                                            new_cookies = {}
-                                            for c in new_cookies_list:
-                                                if isinstance(c, dict):
-                                                    new_cookies[c.get('name', '')] = c.get('value', '')
-                                        
-                                        # Kiểm tra xem cookie mới có khác cookie cũ không
-                                        if new_cookies and new_cookies != old_cookies:
-                                            self.log(f"  ✅ [Renew Cookie] Đã lấy cookie mới cho {email} (hash: {cookie_hash[:8]}...)")
-                                            return new_cookies
-                        
-                        # Nếu không tìm thấy trong cookies_result, thử lấy từ DB
-                        try:
-                            from cookiauto import db_get_account_cookies
-                            # Tìm email từ cookie_hash (cần mapping, tạm thời skip)
-                            # TODO: Cần cách để map cookie_hash -> email
-                            pass
-                        except:
-                            pass
-                        
-                        self.log(f"  ⚠️ [Renew Cookie] Không tìm thấy cookie mới cho hash: {cookie_hash[:8]}...")
-                        return None
-                    except Exception as e:
-                        self.log(f"  ✗ [Renew Cookie] Lỗi renew cookie: {e}")
-                        import traceback
-                        self.log(traceback.format_exc())
-                        return None
-                return renew_cookie_callback
-            
+
             # ✅ Dùng cookie đầu tiên cho upload reference images và setup
             main_cookies = _parse_cookie_string(available_cookies[0])
             main_client = LabsFlowClient(main_cookies)
-            
+
             # Đăng ký callback cho cookie đầu tiên
             main_cookie_hash = main_client._cookie_hash
-            LabsFlowClient.register_renew_cookie_callback(main_cookie_hash, create_renew_cookie_callback(available_cookies[0]))
+            LabsFlowClient.register_renew_cookie_callback(main_cookie_hash, self._create_renew_cookie_callback(available_cookies[0], cookies_result))
             if not main_client:
                 self._flow_handle_error("Vui lòng nhập cookie trước khi chạy Flow.")
                 return
@@ -7711,7 +7726,7 @@ class GoogleLabsFlowQt6(QMainWindow):
                         
                         # Đăng ký callback renew cookie cho cookie này
                         job_cookie_hash = job_client._cookie_hash
-                        LabsFlowClient.register_renew_cookie_callback(job_cookie_hash, create_renew_cookie_callback(cookie_str))
+                        LabsFlowClient.register_renew_cookie_callback(job_cookie_hash, self._create_renew_cookie_callback(cookie_str, cookies_result))
                         try:
                             if job_client.fetch_access_token():
                                 # ✅ Cookie fetch token thành công → remove khỏi failed_cookies_die nếu có
@@ -8055,7 +8070,7 @@ class GoogleLabsFlowQt6(QMainWindow):
                                 cookie_retry_count = job["_cookie_retry_count"][cookie_index]
                                 
                                 # ✅ Sau 6 lần retry → restart BrowserContext (renew cookie)
-                                if cookie_retry_count == 6 and cookie_index not in job["_cookie_restarted"]:
+                                if cookie_retry_count >= 2 and cookie_index not in job["_cookie_restarted"]:
                                     self.log(f"🔄 Flow job {job_idx}: Cookie {cookie_index+1} đã retry 6 lần → restart BrowserContext (renew cookie)")
                                     self._flow_update_tile_status(job_idx, f"🔄 Restart BrowserContext (retry 6/6)")
                                     
@@ -8109,7 +8124,7 @@ class GoogleLabsFlowQt6(QMainWindow):
                                     continue
                                 
                                 # ✅ Sau lần thứ 7 (sau khi đã restart) mà vẫn lỗi → đánh dấu cookie die
-                                if cookie_retry_count >= 7 and cookie_index in job["_cookie_restarted"]:
+                                if cookie_retry_count >= 3 and cookie_index in job["_cookie_restarted"]:
                                     self.log(f"💀 Flow job {job_idx}: Cookie {cookie_index+1} đã restart nhưng vẫn lỗi sau lần thứ 7 → đánh dấu die")
                                     failed_cookies_die.add(cookie_index)
                                     
@@ -21811,7 +21826,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                 task._cookie_retry_count[cookie_index] = cookie_retry_count
                 
                 # ✅ Sau 6 lần retry → restart BrowserContext (renew cookie)
-                if cookie_retry_count == 6 and cookie_index not in task._cookie_restarted:
+                if cookie_retry_count >= 2 and cookie_index not in task._cookie_restarted:
                     self.log(f"🔄 Task {idx}: Cookie {cookie_index+1} đã retry 6 lần → restart BrowserContext (renew cookie)")
                     self.signals.update_status.emit(idx, f"🔄 Restart BrowserContext (retry 6/6)")
                     
@@ -21861,7 +21876,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                     continue
                 
                 # ✅ Sau lần thứ 7 (sau khi đã restart) mà vẫn lỗi → đánh dấu cookie die
-                if cookie_retry_count >= 7 and cookie_index in task._cookie_restarted:
+                if cookie_retry_count >= 3 and cookie_index in task._cookie_restarted:
                     self.log(f"💀 Task {idx}: Cookie {cookie_index+1} đã restart nhưng vẫn lỗi sau lần thứ 7 → đánh dấu die")
                     
                     # Đánh dấu cookie die
@@ -22285,7 +22300,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                 task._cookie_retry_count[cookie_index] = cookie_retry_count
                 
                 # ✅ Sau 6 lần retry → restart BrowserContext (renew cookie)
-                if cookie_retry_count == 6 and cookie_index not in task._cookie_restarted:
+                if cookie_retry_count >= 2 and cookie_index not in task._cookie_restarted:
                     self.log(f"🔄 Task {idx}: Cookie {cookie_index+1} đã retry 6 lần → restart BrowserContext (renew cookie)")
                     self.signals.update_status.emit(idx, f"🔄 Restart BrowserContext (retry 6/6)")
                     
@@ -22335,7 +22350,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                     continue
                 
                 # ✅ Sau lần thứ 7 (sau khi đã restart) mà vẫn lỗi → đánh dấu cookie die
-                if cookie_retry_count >= 7 and cookie_index in task._cookie_restarted:
+                if cookie_retry_count >= 3 and cookie_index in task._cookie_restarted:
                     self.log(f"💀 Task {idx}: Cookie {cookie_index+1} đã restart nhưng vẫn lỗi sau lần thứ 7 → đánh dấu die")
                     
                     # Đánh dấu cookie die
@@ -22596,7 +22611,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                         cookie_retry_count = task._cookie_retry_count[cookie_index]
                         
                         # ✅ Sau 6 lần retry → restart BrowserContext (renew cookie)
-                        if cookie_retry_count == 6 and cookie_index not in task._cookie_restarted:
+                        if cookie_retry_count >= 2 and cookie_index not in task._cookie_restarted:
                             self.log(f"🔄 Task {idx}: Cookie {cookie_index+1} đã retry 6 lần → restart BrowserContext (renew cookie)")
                             self.signals.update_status.emit(idx, f"🔄 Restart BrowserContext (retry 6/6)")
                             
@@ -22646,7 +22661,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                             continue
                         
                         # ✅ Sau lần thứ 7 (sau khi đã restart) mà vẫn lỗi → đánh dấu cookie die
-                        if cookie_retry_count >= 7 and cookie_index in task._cookie_restarted:
+                        if cookie_retry_count >= 3 and cookie_index in task._cookie_restarted:
                             self.log(f"💀 Task {idx}: Cookie {cookie_index+1} đã restart nhưng vẫn lỗi sau lần thứ 7 → đánh dấu die")
                             
                             # Đánh dấu cookie die
@@ -22728,7 +22743,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                     cookie_retry_count = task._cookie_retry_count[cookie_index]
                     
                     # ✅ Sau 6 lần retry → restart BrowserContext (renew cookie)
-                    if cookie_retry_count == 6 and cookie_index not in task._cookie_restarted:
+                    if cookie_retry_count >= 2 and cookie_index not in task._cookie_restarted:
                         self.log(f"🔄 Task {idx}: Cookie {cookie_index+1} đã retry 6 lần (không lấy được mediaGenerationId) → restart BrowserContext (renew cookie)")
                         self.signals.update_status.emit(idx, f"🔄 Restart BrowserContext (retry 6/6)")
                         
@@ -22779,7 +22794,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                         continue
                     
                     # ✅ Sau lần thứ 7 (sau khi đã restart) mà vẫn lỗi → đánh dấu cookie die
-                    if cookie_retry_count >= 7 and cookie_index in task._cookie_restarted:
+                    if cookie_retry_count >= 3 and cookie_index in task._cookie_restarted:
                         self.log(f"💀 Task {idx}: Cookie {cookie_index+1} đã restart nhưng vẫn không lấy được mediaGenerationId sau lần thứ 7 → đánh dấu die")
                         
                         # Đánh dấu cookie die
@@ -23228,7 +23243,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                 task._cookie_retry_count[cookie_index] = cookie_retry_count
                 
                 # ✅ Sau 6 lần retry → restart BrowserContext (renew cookie)
-                if cookie_retry_count == 6 and cookie_index not in task._cookie_restarted:
+                if cookie_retry_count >= 2 and cookie_index not in task._cookie_restarted:
                     self.log(f"🔄 Task {idx}: Cookie {cookie_index+1} đã retry 6 lần → restart BrowserContext (renew cookie)")
                     self.signals.update_status.emit(idx, f"🔄 Restart BrowserContext (retry 6/6)")
                     
@@ -23278,7 +23293,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                     continue
                 
                 # ✅ Sau lần thứ 7 (sau khi đã restart) mà vẫn lỗi → đánh dấu cookie die
-                if cookie_retry_count >= 7 and cookie_index in task._cookie_restarted:
+                if cookie_retry_count >= 3 and cookie_index in task._cookie_restarted:
                     self.log(f"💀 Task {idx}: Cookie {cookie_index+1} đã restart nhưng vẫn lỗi sau lần thứ 7 → đánh dấu die")
                     
                     # Đánh dấu cookie die
@@ -23674,7 +23689,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                 task._cookie_retry_count[cookie_index] = cookie_retry_count
                 
                 # ✅ Sau 6 lần retry → restart BrowserContext (renew cookie)
-                if cookie_retry_count == 6 and cookie_index not in task._cookie_restarted:
+                if cookie_retry_count >= 2 and cookie_index not in task._cookie_restarted:
                     self.log(f"🔄 Task {idx}: Cookie {cookie_index+1} đã retry 6 lần → restart BrowserContext (renew cookie)")
                     self.signals.update_status.emit(idx, f"🔄 Restart BrowserContext (retry 6/6)")
                     
@@ -23724,7 +23739,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                     continue
                 
                 # ✅ Sau lần thứ 7 (sau khi đã restart) mà vẫn lỗi → đánh dấu cookie die
-                if cookie_retry_count >= 7 and cookie_index in task._cookie_restarted:
+                if cookie_retry_count >= 3 and cookie_index in task._cookie_restarted:
                     self.log(f"💀 Task {idx}: Cookie {cookie_index+1} đã restart nhưng vẫn lỗi sau lần thứ 7 → đánh dấu die")
                     
                     # Đánh dấu cookie die
@@ -32397,8 +32412,8 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                     
                     # ✅ Tạo renew cookie callback cho cookie này
                     cookie_str = self.cookies_list[cookie_index] if cookie_index < len(self.cookies_list) else ""
-                    renew_cookie_callback = create_renew_cookie_callback(cookie_str) if cookie_str else None
-                    
+                    renew_cookie_callback = self._create_renew_cookie_callback(cookie_str, None) if cookie_str else None
+
                     processor = ExtendVideoProcessor(
                         project_client, 
                         log_callback=self.log, 
@@ -32483,7 +32498,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                                                     
                                                     # ✅ Tạo renew cookie callback cho cookie này
                                                     cookie_str = self.cookies_list[cookie_index] if cookie_index < len(self.cookies_list) else ""
-                                                    renew_cookie_callback = create_renew_cookie_callback(cookie_str) if cookie_str else None
+                                                    renew_cookie_callback = self._create_renew_cookie_callback(cookie_str, None) if cookie_str else None
                                                     
                                                     processor = ExtendVideoProcessor(
                                                         project_client, 
@@ -32539,7 +32554,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                                                     
                                                     # ✅ Tạo renew cookie callback cho cookie này
                                                     cookie_str = self.cookies_list[cookie_index] if cookie_index < len(self.cookies_list) else ""
-                                                    renew_cookie_callback = create_renew_cookie_callback(cookie_str) if cookie_str else None
+                                                    renew_cookie_callback = self._create_renew_cookie_callback(cookie_str, None) if cookie_str else None
                                                     
                                                     processor = ExtendVideoProcessor(
                                                         project_client, 

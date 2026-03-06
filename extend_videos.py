@@ -367,13 +367,13 @@ class ExtendVideoProcessor:
                             self.log(f"  ❌ Lỗi 429 sau {max_retries_429} lần thử: {e}\n")
                             return None
                     else:
-                        # ✅ Lỗi khác: retry 5 lần
+                        # ✅ Lỗi khác (bao gồm 403): retry 5 lần
                         retry_count_other += 1
                         self._cookie_retry_count += 1
                         
-                        # ✅ Sau 6 lần retry → restart BrowserContext (renew cookie)
-                        if self._cookie_retry_count == 6 and not self._cookie_restarted and self.cookie_index is not None and self.renew_cookie_callback:
-                            self.log(f"  🔄 Cookie {self.cookie_index+1} đã retry 6 lần (create scene) → restart BrowserContext (renew cookie)\n")
+                        # ✅ Sau 5 lần retry (lần cuối trước khi báo lỗi) → restart BrowserContext (renew cookie)
+                        if self._cookie_retry_count >= 2 and not self._cookie_restarted and self.cookie_index is not None and self.renew_cookie_callback:
+                            self.log(f"  🔄 Cookie {self.cookie_index+1} đã retry {self._cookie_retry_count} lần (create scene) → restart BrowserContext (renew cookie)\n")
                             
                             # Gọi renew cookie và restart context
                             try:
@@ -406,11 +406,11 @@ class ExtendVideoProcessor:
                             # Tiếp tục retry với cookie (có thể đã được renew)
                             continue
                         
-                        # ✅ Sau lần thứ 7 (sau khi đã restart) mà vẫn lỗi → raise exception để đánh dấu cookie die
-                        if self._cookie_retry_count >= 7 and self._cookie_restarted:
-                            self.log(f"  💀 Cookie {self.cookie_index+1} đã restart nhưng vẫn lỗi create scene sau lần thứ 7 → đánh dấu die\n")
+                        # ✅ Sau khi đã restart mà vẫn lỗi → raise exception để đánh dấu cookie die
+                        if self._cookie_retry_count >= 3 and self._cookie_restarted:
+                            self.log(f"  💀 Cookie {self.cookie_index+1} đã restart nhưng vẫn lỗi create scene → đánh dấu die\n")
                             # Raise exception để extend_worker có thể xử lý và switch cookie
-                            raise Exception(f"Cookie {self.cookie_index+1} die sau 7 lần retry (create scene)")
+                            raise Exception(f"Cookie {self.cookie_index+1} die sau khi restart (create scene)")
                         
                         if retry_count_other < max_retries_other:
                             wait_time = retry_count_other * 5
@@ -1578,9 +1578,9 @@ class ExtendVideoProcessor:
                     retry_count_other += 1
                     self._cookie_retry_count += 1
                     
-                    # ✅ Sau 6 lần retry → restart BrowserContext (renew cookie)
-                    if self._cookie_retry_count == 6 and not self._cookie_restarted and self.cookie_index is not None and self.renew_cookie_callback:
-                        self.log(f"  🔄 Cookie {self.cookie_index+1} đã retry 6 lần (poll extend) → restart BrowserContext (renew cookie)\n")
+                    # ✅ Sau 5 lần retry (lần cuối trước khi báo lỗi) → restart BrowserContext (renew cookie)
+                    if self._cookie_retry_count >= 2 and not self._cookie_restarted and self.cookie_index is not None and self.renew_cookie_callback:
+                        self.log(f"  🔄 Cookie {self.cookie_index+1} đã retry {self._cookie_retry_count} lần (poll extend) → restart BrowserContext (renew cookie)\n")
                         
                         # Gọi renew cookie và restart context
                         try:
@@ -1613,11 +1613,11 @@ class ExtendVideoProcessor:
                         # Tiếp tục retry với cookie (có thể đã được renew)
                         continue
                     
-                    # ✅ Sau lần thứ 7 (sau khi đã restart) mà vẫn lỗi → raise exception để đánh dấu cookie die
-                    if self._cookie_retry_count >= 7 and self._cookie_restarted:
-                        self.log(f"  💀 Cookie {self.cookie_index+1} đã restart nhưng vẫn lỗi poll extend sau lần thứ 7 → đánh dấu die\n")
+                    # ✅ Sau khi đã restart mà vẫn lỗi → raise exception để đánh dấu cookie die
+                    if self._cookie_retry_count >= 6 and self._cookie_restarted:
+                        self.log(f"  💀 Cookie {self.cookie_index+1} đã restart nhưng vẫn lỗi poll extend → đánh dấu die\n")
                         # Raise exception để extend_worker có thể xử lý và switch cookie
-                        raise Exception(f"Cookie {self.cookie_index+1} die sau 7 lần retry (poll extend)")
+                        raise Exception(f"Cookie {self.cookie_index+1} die sau khi restart (poll extend)")
                     
                     if retry_count_other < max_retries_other:
                         wait_time = retry_count_other * 5
