@@ -4860,10 +4860,11 @@ class LabsFlowClient:
                         error_status = error_data.get('error', {}).get('status', '')
                         if 'invalid argument' in error_message.lower() or 'INVALID_ARGUMENT' in error_status:
                             print(f"  ⚠️ [Flow API] Prompt không tuân thủ quy tắc cộng đồng của Google (attempt {attempt + 1}/{max_retries})")
-                            # ✅ Chỉ set error message khi đã retry hết, còn không thì tiếp tục retry
+                            # ✅ Luôn lưu thông báo lỗi chi tiết để GUI hiển thị cho người dùng
+                            self.last_error_detail = "Prompt không tuân thủ quy tắc cộng đồng của Google (400 INVALID_ARGUMENT - PUBLIC_ERROR_UNSAFE_GENERATION)"
+                            # ✅ Chỉ dừng hẳn khi đã retry hết, còn không thì tiếp tục retry
                             if attempt >= max_retries - 1:
-                                self.last_error_detail = "Không tạo được hình ảnh"
-                                print(f"  ⚠️ [Flow API] Đã retry {max_retries} lần, hiển thị thông báo: Không tạo được hình ảnh")
+                                print(f"  ⚠️ [Flow API] Đã retry {max_retries} lần, hiển thị thông báo lỗi cho GUI")
                                 return None
                             # ✅ Nếu chưa retry hết, tiếp tục retry
                             print(f"  ⚠️ [Flow API] Sẽ retry lại...")
@@ -4873,8 +4874,9 @@ class LabsFlowClient:
                         print(f"  🔍 [DEBUG] Error parsing response: {e}")
                         # ✅ Nếu không parse được JSON, kiểm tra text và retry nếu chưa hết
                         if 'invalid argument' in resp.text.lower() or 'INVALID_ARGUMENT' in resp.text:
+                            # ✅ Luôn lưu thông báo lỗi chi tiết để GUI hiển thị cho người dùng
+                            self.last_error_detail = "Prompt không tuân thủ quy tắc cộng đồng của Google (400 INVALID_ARGUMENT)"
                             if attempt >= max_retries - 1:
-                                self.last_error_detail = "Không tạo được hình ảnh"
                                 return None
                 
                 # ✅ Check 429 - Rate Limit (log chi tiết - FULL)
@@ -5012,9 +5014,13 @@ class LabsFlowClient:
                 
                 # ✅ Xử lý đặc biệt cho lỗi 500 - Internal Server Error từ Google
                 if resp is not None and resp.status_code == 500:
+                    # ✅ Luôn set error detail để GUI hiển thị cho user
+                    error_msg_500 = "500 Internal Server Error - Lỗi tạm thời từ phía Google Labs, vui lòng thử lại sau."
+                    self.last_error_detail = error_msg_500
+                    
                     if attempt < max_retries - 1:
                         wait_time = (attempt + 1) * 10  # Đợi lâu hơn cho lỗi 500
-                        print(f"  ⚠️ Google API Internal Server Error (500), đây là lỗi tạm thời từ Google")
+                        print(f"  ⚠️ [Flow API] {error_msg_500}")
                         print(f"  ⚠️ Retry sau {wait_time}s... (attempt {attempt + 1}/{max_retries})")
                         time.sleep(wait_time)
                         

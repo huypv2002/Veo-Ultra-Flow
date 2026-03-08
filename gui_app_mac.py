@@ -351,6 +351,7 @@ class WorkerSignals(QObject):
     show_update_available = Signal(object)  # (update_info dict) - hiển thị dialog cập nhật
     show_flow_success_popup = Signal(int)  # (success_count) - hiển thị popup thành công Banana Pro
     flow_update_task_grid_status = Signal(int, str, str)  # (task_index, status, error_msg) - update Task_Grid row
+    flow_update_task_grid_preview = Signal(int, str)  # (task_index, image_path) - update preview column
 
 
 class FrameExtractionWorker(QThread):
@@ -2835,6 +2836,7 @@ class GoogleLabsFlowQt6(QMainWindow):
         self.signals.flow_worker_done.connect(self._flow_worker_done_main)
         self.signals.show_flow_success_popup.connect(self._show_flow_success_popup_slot)  # Popup thành công Banana Pro
         self.signals.flow_update_task_grid_status.connect(self._flow_update_task_grid_status_slot)  # Task Grid status
+        self.signals.flow_update_task_grid_preview.connect(self._flow_update_task_grid_preview_slot)  # Task Grid preview
         self._log_buffer = []
         
         # Cookie storage (hỗ trợ NHIỀU cookies)
@@ -4341,8 +4343,8 @@ class GoogleLabsFlowQt6(QMainWindow):
 
         # ==================== TASK GRID (QTableWidget) ====================
         self.flow_task_grid = QTableWidget()
-        self.flow_task_grid.setColumnCount(4)
-        self.flow_task_grid.setHorizontalHeaderLabels(["#", "Trạng thái", "Ảnh tham chiếu", "Prompt"])
+        self.flow_task_grid.setColumnCount(5)
+        self.flow_task_grid.setHorizontalHeaderLabels(["#", "Trạng thái", "Ảnh tham chiếu", "Preview", "Prompt"])
         self.flow_task_grid.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.flow_task_grid.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.flow_task_grid.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -4397,13 +4399,20 @@ class GoogleLabsFlowQt6(QMainWindow):
 
         # Column widths
         header = self.flow_task_grid.horizontalHeader()
+        # Col 0: STT
         header.setSectionResizeMode(0, QHeaderView.Fixed)
         self.flow_task_grid.setColumnWidth(0, 45)
+        # Col 1: Trạng thái
         header.setSectionResizeMode(1, QHeaderView.Fixed)
         self.flow_task_grid.setColumnWidth(1, 180)
+        # Col 2: Ảnh tham chiếu
         header.setSectionResizeMode(2, QHeaderView.Fixed)
         self.flow_task_grid.setColumnWidth(2, 170)
-        header.setSectionResizeMode(3, QHeaderView.Stretch)
+        # Col 3: Preview (nhỏ, cố định)
+        header.setSectionResizeMode(3, QHeaderView.Fixed)
+        self.flow_task_grid.setColumnWidth(3, 110)
+        # Col 4: Prompt (chiếm phần còn lại)
+        header.setSectionResizeMode(4, QHeaderView.Stretch)
 
         layout.addWidget(self.flow_task_grid, 1)
 
@@ -4485,7 +4494,9 @@ class GoogleLabsFlowQt6(QMainWindow):
         self.btn_run_selected.setFixedHeight(34)
         self.btn_run_selected.setCursor(Qt.PointingHandCursor)
         self.btn_run_selected.setStyleSheet(btn_base.format(bg="#10b981", fg="white", hover="#059669"))
+        self.btn_run_selected.clicked.connect(self.on_flow_run_clicked)
         toolbar.addWidget(self.btn_run_selected)
+        self.log(f"DEBUG: btn_run_selected created and connected to on_flow_run_clicked")
 
         layout.addWidget(toolbar_frame)
 
@@ -5810,6 +5821,10 @@ class GoogleLabsFlowQt6(QMainWindow):
         """Emit signal to update Task_Grid row status (thread-safe)"""
         self.signals.flow_update_task_grid_status.emit(task_index, status, error_msg)
 
+    def _flow_update_task_grid_preview(self, task_index: int, image_path: str):
+        """Emit signal to update Task_Grid preview column (thread-safe)"""
+        self.signals.flow_update_task_grid_preview.emit(task_index, image_path)
+
     def _flow_set_tile_image(self, tile_index: int, image_path: str):
         """Emit signal to set tile image (thread-safe)"""
         self.signals.flow_set_tile_image.emit(tile_index, image_path)
@@ -5878,6 +5893,38 @@ class GoogleLabsFlowQt6(QMainWindow):
                     thumb.set_locked(status == "running")
         # Update summary bar
         self._flow_update_summary_bar()
+
+    def _flow_update_task_grid_preview_slot(self, task_index: int, image_path: str):
+        """Slot handler: update preview column với ảnh đã tạo (main thread)."""
+        try:
+            if not hasattr(self, "flow_task_grid"):
+                return
+            if not hasattr(self, "flow_task_preview_widgets"):
+                return
+                
+            row = task_index
+            if 0 <= row < self.flow_task_grid.rowCount():
+                # Lấy preview widget
+                preview_label = self.flow_task_preview_widgets.get(row)
+                if preview_label:
+                    # Load và hiển thị ảnh với kích thước cố định
+                    img_path = Path(image_path)
+                    if img_path.exists():
+                        pix = QPixmap(str(img_path.resolve()))
+                        if not pix.isNull():
+                            # Scale với kích thước cố định 80x56
+                            scaled = pix.scaled(80, 56, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                            preview_label.setPixmap(scaled)
+                            preview_label.setText("")
+                            preview_label.setToolTip(str(img_path.resolve()))
+                            preview_label.setStyleSheet("QLabel { border-radius: 8px; }")
+                            self.log(f"✅ Đã hiển thị preview cho task {row + 1}: {img_path.name}")
+                        else:
+                            preview_label.setText("Lỗi ảnh")
+                    else:
+                        preview_label.setText("Không tìm thấy")
+        except Exception as e:
+            self.log(f"⚠️ Lỗi cập nhật preview: {e}")
 
     def _flow_update_tile_status_slot(self, tile_index: int, text: str):
         """Slot handler for flow_update_tile_status signal"""
@@ -6028,15 +6075,21 @@ class GoogleLabsFlowQt6(QMainWindow):
     def _flow_set_tile_image_slot(self, tile_index: int, image_path: str):
         """Slot handler for flow_set_tile_image signal (runs in main thread)"""
         try:
+            # ✅ Debug log
+            self.log(f"🔍 DEBUG: _flow_set_tile_image_slot called with tile_index={tile_index}, image_path={image_path}")
+            
             if not hasattr(self, "flow_result_tiles") or not self.flow_result_tiles:
+                self.log(f"⚠️ DEBUG: flow_result_tiles is empty or None")
                 return
             
             if not (0 <= tile_index < len(self.flow_result_tiles)):
+                self.log(f"⚠️ DEBUG: tile_index {tile_index} out of range (0-{len(self.flow_result_tiles)-1})")
                 return
             
             tile = self.flow_result_tiles[tile_index]
             label = tile.get("image_widget")
             if not label:
+                self.log(f"⚠️ DEBUG: image_widget not found in tile {tile_index}")
                 return
             
             # ✅ Kiểm tra label còn tồn tại không
@@ -6973,6 +7026,9 @@ class GoogleLabsFlowQt6(QMainWindow):
         """Slot handler for flow_enable_run_button signal (runs in main thread)"""
         if hasattr(self, "btn_flow_run"):
             self.btn_flow_run.setEnabled(enabled)
+        # ✅ Enable/disable cả nút btn_run_selected (toolbar)
+        if hasattr(self, "btn_run_selected"):
+            self.btn_run_selected.setEnabled(enabled)
         # ✅ Enable/disable nút dừng ngược lại với nút run
         if hasattr(self, "btn_flow_stop"):
             self.btn_flow_stop.setEnabled(not enabled)
@@ -7474,7 +7530,7 @@ class GoogleLabsFlowQt6(QMainWindow):
 
             # Đăng ký callback cho cookie đầu tiên
             main_cookie_hash = main_client._cookie_hash
-            LabsFlowClient.register_renew_cookie_callback(main_cookie_hash, self._create_renew_cookie_callback(available_cookies[0], cookies_result))
+            LabsFlowClient.register_renew_cookie_callback(main_cookie_hash, self._create_renew_cookie_callback(available_cookies[0], None))
             if not main_client:
                 self._flow_handle_error("Vui lòng nhập cookie trước khi chạy Flow.")
                 return
@@ -7726,7 +7782,7 @@ class GoogleLabsFlowQt6(QMainWindow):
                         
                         # Đăng ký callback renew cookie cho cookie này
                         job_cookie_hash = job_client._cookie_hash
-                        LabsFlowClient.register_renew_cookie_callback(job_cookie_hash, self._create_renew_cookie_callback(cookie_str, cookies_result))
+                        LabsFlowClient.register_renew_cookie_callback(job_cookie_hash, self._create_renew_cookie_callback(cookie_str, None))
                         try:
                             if job_client.fetch_access_token():
                                 # ✅ Cookie fetch token thành công → remove khỏi failed_cookies_die nếu có
@@ -7998,6 +8054,56 @@ class GoogleLabsFlowQt6(QMainWindow):
                         if not api_result:
                             error_detail = job_client.last_error_detail or job_client.last_error or "API trả về lỗi"
                             error_str = str(error_detail).lower()
+
+                            # ✅ Nếu là lỗi prompt vi phạm quy tắc cộng đồng / INVALID_ARGUMENT → báo lỗi rõ ràng cho user và bỏ qua task
+                            if ("invalid_argument" in error_str
+                                or "public_error_unsafe_generation" in error_str
+                                or "prompt không tuân thủ quy tắc cộng đồng" in error_str):
+                                user_msg = (
+                                    "Prompt không tuân thủ quy tắc cộng đồng của Google "
+                                    "(400 INVALID_ARGUMENT - PUBLIC_ERROR_UNSAFE_GENERATION). "
+                                    "Vui lòng chỉnh sửa nội dung prompt rồi chạy lại."
+                                )
+                                self.log(f"⚠️ Flow job {job_idx}: {user_msg}")
+                                self._flow_update_tile_status(job_idx, "❌ Prompt vi phạm quy tắc cộng đồng")
+                                return {
+                                    "job": job,
+                                    "image_path": None,
+                                    "success": False,
+                                    "error": user_msg,
+                                }
+                            
+                            # ✅ Nếu là lỗi 500 Internal Server Error từ Google → báo lỗi rõ ràng và bỏ qua task
+                            if ("500" in error_str and "internal" in error_str) or "lỗi tạm thời từ google labs" in error_str:
+                                user_msg = (
+                                    "500 Internal Server Error - Lỗi tạm thời từ phía Google Labs. "
+                                    "Vui lòng chờ vài giây rồi thử chạy lại."
+                                )
+                                self.log(f"⚠️ Flow job {job_idx}: {user_msg}")
+                                self._flow_update_tile_status(job_idx, "❌ Lỗi Server Google (500)")
+                                return {
+                                    "job": job,
+                                    "image_path": None,
+                                    "success": False,
+                                    "error": user_msg,
+                                }
+                            
+                            # ✅ Nếu là lỗi 502/503/504 (Gateway Error, Service Unavailable, Gateway Timeout) → báo lỗi rõ ràng
+                            if ("502" in error_str or "503" in error_str or "504" in error_str) and (
+                                "bad gateway" in error_str or "unavailable" in error_str or "timeout" in error_str
+                            ):
+                                user_msg = (
+                                    "Lỗi kết nối tạm thời với Google Labs (502/503/504). "
+                                    "Vui lòng chờ vài giây rồi thử chạy lại."
+                                )
+                                self.log(f"⚠️ Flow job {job_idx}: {user_msg}")
+                                self._flow_update_tile_status(job_idx, "❌ Lỗi kết nối Google (502/503/504)")
+                                return {
+                                    "job": job,
+                                    "image_path": None,
+                                    "success": False,
+                                    "error": user_msg,
+                                }
                             
                             # ✅ Phân biệt lỗi 429/high traffic vs cookie die vs lỗi khác
                             if self._check_is_429_or_high_traffic(str(error_detail)):
@@ -8760,6 +8866,8 @@ class GoogleLabsFlowQt6(QMainWindow):
                             # ── Mark task as "success" in Task Grid ──
                             if grid_row >= 0:
                                 self._flow_update_task_grid_status(grid_row, "success")
+                                # ── Update preview column ──
+                                self._flow_update_task_grid_preview(grid_row, image_path)
                         else:
                             # ✅ Track status lỗi vào job để retry chỉ chạy lại các prompt lỗi
                             job["status"] = "failed"
@@ -9526,10 +9634,30 @@ class GoogleLabsFlowQt6(QMainWindow):
             self.flow_task_grid.setCellWidget(row, 2, thumb)
             self.flow_task_grid.setRowHeight(row, max(56, self.flow_task_grid.rowHeight(row)))
 
-            # Prompt
+            # Col 3: Preview (ảnh đã tạo) - placeholder widget
+            preview_label = QLabel("Chờ...")
+            preview_label.setAlignment(Qt.AlignCenter)
+            preview_label.setStyleSheet("""
+                QLabel {
+                    background: #f1f5f9;
+                    border-radius: 8px;
+                    color: #94a3b8;
+                    font-size: 11px;
+                }
+            """)
+            preview_label.setFixedSize(80, 56)
+            preview_label.setProperty("row_index", row)
+            preview_label.setProperty("preview_type", "task_grid")
+            self.flow_task_grid.setCellWidget(row, 3, preview_label)
+            # Lưu reference để cập nhật sau
+            if not hasattr(self, "flow_task_preview_widgets"):
+                self.flow_task_preview_widgets = {}
+            self.flow_task_preview_widgets[row] = preview_label
+
+            # Prompt (Col 4)
             prompt_item = QTableWidgetItem(prompt)
             prompt_item.setToolTip(prompt)
-            self.flow_task_grid.setItem(row, 3, prompt_item)
+            self.flow_task_grid.setItem(row, 4, prompt_item)
 
         self._flow_update_summary_bar()
 
