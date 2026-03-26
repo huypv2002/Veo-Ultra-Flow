@@ -663,244 +663,267 @@ class ManualCookieDialog(QDialog):
 
 
 class ProxyDialog(QDialog):
-    """Dialog để cấu hình proxy cho account"""
+    """Dialog cấu hình proxy cho account - hỗ trợ 5 loại proxy."""
+
     def __init__(self, parent=None, email: str = "", current_proxy: Optional[Dict[str, str]] = None):
         super().__init__(parent)
-        self.setWindowTitle(f"Cấu hình Proxy - {email}")
-        self.setMinimumSize(500, 300)
-        
+        self.setWindowTitle(f"⚙ Cấu hình Proxy - {email}")
+        self.setMinimumSize(520, 480)
+        self._email = email
+
+        # Parse current_proxy → ProxyConfig
+        from proxy_manager import ProxyConfig
+        if current_proxy and isinstance(current_proxy, dict) and current_proxy.get("proxy_type"):
+            self._config = ProxyConfig.from_dict(current_proxy)
+        elif current_proxy and current_proxy.get("server"):
+            # Legacy format: {server, username, password}
+            self._config = ProxyConfig(
+                proxy_type="static",
+                static_server=current_proxy.get("server", ""),
+                static_username=current_proxy.get("username", ""),
+                static_password=current_proxy.get("password", ""),
+            )
+        else:
+            self._config = ProxyConfig()
+
+        self._setup_ui()
+        self._apply_config_to_ui()
+
+    def _setup_ui(self):
         layout = QVBoxLayout(self)
-        layout.setSpacing(12)
-        
-        # Info label
-        info_label = QLabel("Cấu hình proxy cho account này (mặc định: None - không dùng proxy)")
-        info_label.setStyleSheet("color: #666; font-style: italic; font-size: 11px;")
-        layout.addWidget(info_label)
-        
-        # Quick Paste Field (New)
-        paste_label = QLabel("📋 Dán Proxy (Tự động parse):")
-        paste_label.setStyleSheet("color: #6f42c1; font-weight: bold; font-size: 12px; margin-top: 5px;")
-        layout.addWidget(paste_label)
-        
-        self.txt_paste = QLineEdit()
-        self.txt_paste.setPlaceholderText("username:password:host:port hoặc username:password@host:port (ví dụ: user:pass:127.0.0.1:8080)")
-        self.txt_paste.setStyleSheet("font-family: Consolas; font-size: 11px; padding: 5px;")
-        self.txt_paste.textChanged.connect(self._on_paste_changed)
-        layout.addWidget(self.txt_paste)
-        
-        # Separator
-        separator = QLabel("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-        separator.setStyleSheet("color: #666; font-size: 10px; margin: 5px 0;")
-        layout.addWidget(separator)
-        
-        # Form
-        form = QFormLayout()
-        
-        # Proxy Server
-        self.txt_server = QLineEdit()
-        self.txt_server.setPlaceholderText("http://host:port hoặc socks5://host:port (ví dụ: http://127.0.0.1:8080)")
-        if current_proxy and current_proxy.get('server'):
-            self.txt_server.setText(current_proxy['server'])
-        form.addRow("Proxy Server:", self.txt_server)
-        
-        # Username (optional)
-        self.txt_username = QLineEdit()
-        self.txt_username.setPlaceholderText("Username (tùy chọn)")
-        if current_proxy and current_proxy.get('username'):
-            self.txt_username.setText(current_proxy['username'])
-        form.addRow("Username:", self.txt_username)
-        
-        # Password (optional)
-        self.txt_password = QLineEdit()
-        self.txt_password.setEchoMode(QLineEdit.Password)
-        self.txt_password.setPlaceholderText("Password (tùy chọn)")
-        if current_proxy and current_proxy.get('password'):
-            self.txt_password.setText(current_proxy['password'])
-        form.addRow("Password:", self.txt_password)
-        
-        layout.addLayout(form)
-        
-        # Status label
-        self.lbl_status = QLabel("Trạng thái: Chưa kiểm tra")
-        self.lbl_status.setStyleSheet("color: #666; font-weight: bold;")
+        layout.setSpacing(8)
+        layout.setContentsMargins(15, 12, 15, 12)
+
+        # ── Radio buttons cho 5 loại proxy ──
+        from PySide6.QtWidgets import QButtonGroup
+        self._radio_group = QButtonGroup(self)
+
+        radio_data = [
+            ("none",     "🚫 Không dùng (IP gốc)"),
+            ("static",   "📌 Proxy Tĩnh"),
+            ("rotating", "🔄 Proxy Xoay"),
+            ("warp",     "☁ WARP (Cloudflare 1.1.1.1)"),
+            ("tor",      "🧅 Tor Network"),
+        ]
+        self._radios: Dict[str, Any] = {}
+        for idx, (key, label) in enumerate(radio_data):
+            from PySide6.QtWidgets import QRadioButton
+            rb = QRadioButton(label)
+            rb.setStyleSheet("font-size: 13px; padding: 3px 0;")
+            rb.toggled.connect(self._on_type_changed)
+            self._radio_group.addButton(rb, idx)
+            self._radios[key] = rb
+            layout.addWidget(rb)
+
+        # ── Stacked widget cho settings từng loại ──
+        from PySide6.QtWidgets import QStackedWidget
+        self._stack = QStackedWidget()
+        layout.addWidget(self._stack)
+
+        # Page 0: none (trống)
+        page_none = QWidget()
+        QVBoxLayout(page_none)
+        self._stack.addWidget(page_none)
+
+        # Page 1: static proxy
+        page_static = QWidget()
+        sl = QVBoxLayout(page_static)
+        sl.setContentsMargins(0, 5, 0, 0)
+        # Quick paste
+        self.txt_static_paste = QLineEdit()
+        self.txt_static_paste.setPlaceholderText("Dán: user:pass@host:port hoặc user:pass:host:port")
+        self.txt_static_paste.setStyleSheet("font-family: Consolas; font-size: 11px; padding: 4px;")
+        self.txt_static_paste.textChanged.connect(lambda: self._on_paste("static"))
+        sl.addWidget(self.txt_static_paste)
+        form_s = QFormLayout()
+        self.txt_static_server = QLineEdit()
+        self.txt_static_server.setPlaceholderText("http://host:port hoặc socks5://host:port")
+        form_s.addRow("Server:", self.txt_static_server)
+        self.txt_static_user = QLineEdit()
+        self.txt_static_user.setPlaceholderText("Username (tùy chọn)")
+        form_s.addRow("Username:", self.txt_static_user)
+        self.txt_static_pass = QLineEdit()
+        self.txt_static_pass.setEchoMode(QLineEdit.Password)
+        self.txt_static_pass.setPlaceholderText("Password (tùy chọn)")
+        form_s.addRow("Password:", self.txt_static_pass)
+        sl.addLayout(form_s)
+        self._stack.addWidget(page_static)
+
+        # Page 2: rotating proxy
+        page_rotating = QWidget()
+        rl = QVBoxLayout(page_rotating)
+        rl.setContentsMargins(0, 5, 0, 0)
+        self.txt_rotating_paste = QLineEdit()
+        self.txt_rotating_paste.setPlaceholderText("Dán: user:pass@gateway:port")
+        self.txt_rotating_paste.setStyleSheet("font-family: Consolas; font-size: 11px; padding: 4px;")
+        self.txt_rotating_paste.textChanged.connect(lambda: self._on_paste("rotating"))
+        rl.addWidget(self.txt_rotating_paste)
+        form_r = QFormLayout()
+        self.txt_rotating_server = QLineEdit()
+        self.txt_rotating_server.setPlaceholderText("http://gateway:port (proxy xoay tự đổi IP)")
+        form_r.addRow("Gateway:", self.txt_rotating_server)
+        self.txt_rotating_user = QLineEdit()
+        self.txt_rotating_user.setPlaceholderText("Username")
+        form_r.addRow("Username:", self.txt_rotating_user)
+        self.txt_rotating_pass = QLineEdit()
+        self.txt_rotating_pass.setEchoMode(QLineEdit.Password)
+        self.txt_rotating_pass.setPlaceholderText("Password")
+        form_r.addRow("Password:", self.txt_rotating_pass)
+        rl.addLayout(form_r)
+        info_r = QLabel("ℹ Proxy xoay: mỗi request sẽ tự động đổi IP qua gateway.")
+        info_r.setStyleSheet("color: #888; font-size: 10px; font-style: italic;")
+        rl.addWidget(info_r)
+        self._stack.addWidget(page_rotating)
+
+        # Page 3: WARP
+        page_warp = QWidget()
+        wl = QVBoxLayout(page_warp)
+        wl.setContentsMargins(0, 5, 0, 0)
+        wl.addWidget(QLabel("WARP sử dụng Cloudflare 1.1.1.1 qua SOCKS5 local."))
+        form_w = QFormLayout()
+        self.spin_warp_port = QSpinBox()
+        self.spin_warp_port.setRange(1024, 65535)
+        self.spin_warp_port.setValue(40000)
+        form_w.addRow("SOCKS5 Port:", self.spin_warp_port)
+        wl.addLayout(form_w)
+        info_w = QLabel("ℹ Cần cài warp-cli và chạy: warp-cli connect\n   Proxy mode: warp-cli set-mode proxy --port 40000")
+        info_w.setStyleSheet("color: #888; font-size: 10px; font-style: italic;")
+        wl.addWidget(info_w)
+        wl.addStretch()
+        self._stack.addWidget(page_warp)
+
+        # Page 4: Tor
+        page_tor = QWidget()
+        tl = QVBoxLayout(page_tor)
+        tl.setContentsMargins(0, 5, 0, 0)
+        tl.addWidget(QLabel("Tor Network qua SOCKS5 local."))
+        form_t = QFormLayout()
+        self.spin_tor_port = QSpinBox()
+        self.spin_tor_port.setRange(1024, 65535)
+        self.spin_tor_port.setValue(9050)
+        form_t.addRow("SOCKS5 Port:", self.spin_tor_port)
+        tl.addLayout(form_t)
+        info_t = QLabel("ℹ Cần cài Tor và chạy tor service.\n   macOS: brew install tor && brew services start tor")
+        info_t.setStyleSheet("color: #888; font-size: 10px; font-style: italic;")
+        tl.addWidget(info_t)
+        tl.addStretch()
+        self._stack.addWidget(page_tor)
+
+        # ── Status + Buttons ──
+        self.lbl_status = QLabel("")
+        self.lbl_status.setStyleSheet("color: #666; font-weight: bold; margin-top: 5px;")
         layout.addWidget(self.lbl_status)
-        
-        # Buttons
+
         btn_box = QHBoxLayout()
         btn_box.addStretch()
-        
-        # Test Proxy button
         self.btn_test = QPushButton("🔍 Test Proxy")
         self.btn_test.setStyleSheet("background-color: #17a2b8; color: white; font-weight: bold; padding: 6px 12px;")
         self.btn_test.clicked.connect(self._test_proxy)
         btn_box.addWidget(self.btn_test)
-        
-        self.btn_cancel = QPushButton("Hủy")
-        self.btn_cancel.clicked.connect(self.reject)
-        
-        self.btn_save = QPushButton("💾 Lưu")
-        self.btn_save.setStyleSheet("background-color: #28a745; color: white; font-weight: bold; padding: 6px 12px;")
-        self.btn_save.clicked.connect(self.accept)
-        
-        btn_box.addWidget(self.btn_cancel)
-        btn_box.addWidget(self.btn_save)
+        btn_cancel = QPushButton("Hủy")
+        btn_cancel.clicked.connect(self.reject)
+        btn_box.addWidget(btn_cancel)
+        btn_save = QPushButton("💾 Lưu")
+        btn_save.setStyleSheet("background-color: #28a745; color: white; font-weight: bold; padding: 6px 12px;")
+        btn_save.clicked.connect(self.accept)
+        btn_box.addWidget(btn_save)
         layout.addLayout(btn_box)
-    
-    def _on_paste_changed(self):
-        """Parse proxy string và tự động fill vào các ô"""
-        paste_text = self.txt_paste.text().strip()
-        if not paste_text:
+
+    # ── Helpers ──
+
+    def _apply_config_to_ui(self):
+        """Load ProxyConfig vào UI."""
+        c = self._config
+        self._radios.get(c.proxy_type, self._radios["none"]).setChecked(True)
+        self.txt_static_server.setText(c.static_server)
+        self.txt_static_user.setText(c.static_username)
+        self.txt_static_pass.setText(c.static_password)
+        self.txt_rotating_server.setText(c.rotating_server)
+        self.txt_rotating_user.setText(c.rotating_username)
+        self.txt_rotating_pass.setText(c.rotating_password)
+        self.spin_warp_port.setValue(c.warp_port)
+        self.spin_tor_port.setValue(c.tor_port)
+        self._on_type_changed()
+
+    def _get_selected_type(self) -> str:
+        for key, rb in self._radios.items():
+            if rb.isChecked():
+                return key
+        return "none"
+
+    def _on_type_changed(self):
+        type_map = {"none": 0, "static": 1, "rotating": 2, "warp": 3, "tor": 4}
+        idx = type_map.get(self._get_selected_type(), 0)
+        self._stack.setCurrentIndex(idx)
+
+    def _on_paste(self, target: str):
+        """Auto-parse proxy paste cho static hoặc rotating."""
+        src = self.txt_static_paste if target == "static" else self.txt_rotating_paste
+        text = src.text().strip()
+        if not text or len(text) < 8:
             return
-        
-        # Chỉ parse khi user paste xong (không parse khi đang gõ từng ký tự)
-        # Parse khi có ít nhất 10 ký tự (đủ cho host:port)
-        if len(paste_text) < 10:
+        from proxy_manager import ProxyManager
+        entry = ProxyManager._parse_proxy_line(text)
+        if not entry:
             return
-        
-        try:
-            username = ""
-            password = ""
-            host = ""
-            port = ""
-            
-            # Format 1: username:password@host:port (ưu tiên vì có @)
-            if "@" in paste_text:
-                at_parts = paste_text.split("@", 1)  # Chỉ split 1 lần
-                if len(at_parts) == 2:
-                    auth_part = at_parts[0].strip()
-                    host_port_part = at_parts[1].strip()
-                    
-                    # Parse auth: username:password
-                    if ":" in auth_part:
-                        auth_parts = auth_part.split(":", 1)  # Chỉ split 1 lần
-                        if len(auth_parts) == 2:
-                            username = auth_parts[0].strip()
-                            password = auth_parts[1].strip()
-                    
-                    # Parse host:port
-                    if ":" in host_port_part:
-                        host_port_parts = host_port_part.rsplit(":", 1)  # Split từ bên phải (port có thể có : nếu IPv6)
-                        if len(host_port_parts) == 2:
-                            host = host_port_parts[0].strip()
-                            port = host_port_parts[1].strip()
-                    else:
-                        # Chỉ có host, không có port
-                        host = host_port_part.strip()
-                        port = "8080"  # Default port
-            
-            # Format 2: username:password:host:port (không có @)
-            elif paste_text.count(":") >= 3:
-                # Có ít nhất 3 dấu : -> có thể là username:password:host:port
-                parts = paste_text.split(":")
-                if len(parts) >= 4:
-                    # Format: username:password:host:port
-                    username = parts[0].strip()
-                    password = parts[1].strip()
-                    # Host có thể có nhiều : (IPv6), nên lấy tất cả trừ phần đầu và cuối
-                    host = ":".join(parts[2:-1]).strip() if len(parts) > 4 else parts[2].strip()
-                    port = parts[-1].strip()
-                elif len(parts) == 2:
-                    # Format: host:port (không có auth)
-                    host = parts[0].strip()
-                    port = parts[1].strip()
-            
-            # Format 3: host:port (chỉ 1 dấu :)
-            elif paste_text.count(":") == 1:
-                parts = paste_text.split(":")
-                host = parts[0].strip()
-                port = parts[1].strip()
-            
-            # Fill vào các ô (chỉ khi có host và port)
-            if host and port:
-                # Tự động thêm http:// nếu chưa có protocol
-                if not host.startswith("http://") and not host.startswith("https://") and not host.startswith("socks5://"):
-                    server_url = f"http://{host}:{port}"
-                else:
-                    # Đã có protocol, chỉ cần thêm port nếu chưa có
-                    if ":" not in host.split("://")[1] if "://" in host else True:
-                        server_url = f"{host}:{port}"
-                    else:
-                        server_url = host  # Đã có port trong host
-                
-                self.txt_server.setText(server_url)
-            
-            if username:
-                self.txt_username.setText(username)
-            
-            if password:
-                self.txt_password.setText(password)
-            
-            # Xóa text trong ô paste sau khi parse thành công (chỉ khi có đủ host và port)
-            if host and port:
-                # Tạm thời block signal để tránh parse lại khi clear
-                self.txt_paste.blockSignals(True)
-                self.txt_paste.clear()
-                self.txt_paste.setPlaceholderText("✅ Đã parse! Có thể dán proxy khác...")
-                self.txt_paste.blockSignals(False)
-                
-        except Exception as e:
-            # Ignore parse errors - user có thể đang gõ
-            pass
-    
+        if target == "static":
+            self.txt_static_server.setText(entry.server)
+            self.txt_static_user.setText(entry.username)
+            self.txt_static_pass.setText(entry.password)
+        else:
+            self.txt_rotating_server.setText(entry.server)
+            self.txt_rotating_user.setText(entry.username)
+            self.txt_rotating_pass.setText(entry.password)
+        src.blockSignals(True)
+        src.clear()
+        src.setPlaceholderText("✅ Đã parse!")
+        src.blockSignals(False)
+
     def _test_proxy(self):
-        """Test proxy connection"""
-        server = self.txt_server.text().strip()
-        if not server:
-            self.lbl_status.setText("Trạng thái: ❌ Chưa nhập proxy server")
+        """Test proxy hiện tại."""
+        config = self._build_config()
+        entry = config.get_active_proxy() if config else None
+        if not entry:
+            self.lbl_status.setText("❌ Chưa cấu hình proxy để test")
             self.lbl_status.setStyleSheet("color: red; font-weight: bold;")
             return
-        
-        self.lbl_status.setText("Trạng thái: ⏳ Đang test proxy...")
+        self.lbl_status.setText("⏳ Đang test...")
         self.lbl_status.setStyleSheet("color: orange; font-weight: bold;")
         self.btn_test.setEnabled(False)
-        
-        # Test proxy in background thread
+
         import threading
-        def test_thread():
-            try:
-                import requests
-                proxy_dict = {'http': server, 'https': server}
-                username = self.txt_username.text().strip()
-                password = self.txt_password.text().strip()
-                
-                if username and password:
-                    from urllib.parse import quote
-                    auth_server = server.replace('://', f'://{quote(username)}:{quote(password)}@')
-                    proxy_dict = {'http': auth_server, 'https': auth_server}
-                
-                # Test với httpbin.org
-                response = requests.get('http://httpbin.org/ip', proxies=proxy_dict, timeout=10)
-                if response.status_code == 200:
-                    self.lbl_status.setText(f"Trạng thái: ✅ Proxy hoạt động! IP: {response.json().get('origin', 'N/A')}")
-                    self.lbl_status.setStyleSheet("color: green; font-weight: bold;")
-                else:
-                    self.lbl_status.setText(f"Trạng thái: ❌ Proxy không hoạt động (Status: {response.status_code})")
-                    self.lbl_status.setStyleSheet("color: red; font-weight: bold;")
-            except Exception as e:
-                self.lbl_status.setText(f"Trạng thái: ❌ Lỗi: {str(e)[:50]}")
+        def _run():
+            from proxy_manager import test_proxy_connection
+            ok, info = test_proxy_connection(entry)
+            if ok:
+                self.lbl_status.setText(f"✅ Proxy OK! IP: {info}")
+                self.lbl_status.setStyleSheet("color: green; font-weight: bold;")
+            else:
+                self.lbl_status.setText(f"❌ Lỗi: {info}")
                 self.lbl_status.setStyleSheet("color: red; font-weight: bold;")
-            finally:
-                self.btn_test.setEnabled(True)
-        
-        thread = threading.Thread(target=test_thread, daemon=True)
-        thread.start()
-    
+            self.btn_test.setEnabled(True)
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _build_config(self):
+        from proxy_manager import ProxyConfig
+        return ProxyConfig(
+            proxy_type=self._get_selected_type(),
+            static_server=self.txt_static_server.text().strip(),
+            static_username=self.txt_static_user.text().strip(),
+            static_password=self.txt_static_pass.text().strip(),
+            rotating_server=self.txt_rotating_server.text().strip(),
+            rotating_username=self.txt_rotating_user.text().strip(),
+            rotating_password=self.txt_rotating_pass.text().strip(),
+            warp_port=self.spin_warp_port.value(),
+            tor_port=self.spin_tor_port.value(),
+        )
+
     def get_data(self) -> Optional[Dict[str, str]]:
-        """Return proxy config dict hoặc None nếu không có proxy"""
-        server = self.txt_server.text().strip()
-        if not server:
+        """Return proxy config dict. Trả về None nếu chọn 'none'."""
+        config = self._build_config()
+        if config.proxy_type == "none":
             return None
-        
-        proxy_config = {'server': server}
-        username = self.txt_username.text().strip()
-        password = self.txt_password.text().strip()
-        
-        if username:
-            proxy_config['username'] = username
-        if password:
-            proxy_config['password'] = password
-        
-        return proxy_config
+        return config.to_dict()
 
 
 class ProxyPoolDialog(QDialog):
@@ -1402,30 +1425,131 @@ class CookieWorker(QThread):
         self._stopped = True
     
     def run(self):
-        """Run cookie extraction using BrowserPool from main tool"""
+        """Run cookie extraction using Chrome thật + CDP (không dùng Playwright/Selenium)"""
         results = {}
         total = len(self.accounts)
         
-        self.log.emit(f"🚀 Bắt đầu lấy cookies cho {total} tài khoản...")
-        
-        # Create event loop for async operations
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        self.log.emit(f"🚀 Bắt đầu lấy cookies cho {total} tài khoản (Chrome CDP)...")
         
         try:
-            results = loop.run_until_complete(self._get_all_cookies())
+            results = self._get_all_cookies_cdp()
         except Exception as e:
             self.log.emit(f"❌ Lỗi: {e}")
             import traceback
             self.log.emit(traceback.format_exc()[:200])
-        finally:
-            loop.close()
         
         self.finished_signal.emit(results)
     
-    async def _get_all_cookies(self) -> Dict[str, str]:
-        """Get cookies - simple Playwright method"""
-        return await self._get_cookies_simple()
+    def _get_all_cookies_cdp(self) -> Dict[str, list]:
+        """Get cookies cho tất cả accounts bằng Chrome CDP (threaded)."""
+        from chrome_cdp_cookie import ChromeCDPSession, kill_chrome_for_profile, check_profile_has_cookies, PROFILES_DIR
+        import concurrent.futures
+        import random
+        
+        results = {}
+        total = len(self.accounts)
+        
+        # Semaphore để giới hạn concurrent
+        sem = threading.Semaphore(self.threads)
+        results_lock = threading.Lock()
+        completed = [0]
+        
+        def process_account(idx, account):
+            if self._stopped:
+                return
+            
+            with sem:
+                if self._stopped:
+                    return
+                
+                email = account.get('email', f'Account_{idx}')
+                password = account.get('password', '')
+                profile_path = account.get('profile_path', '')
+                
+                self.log.emit(f"📂 [{idx+1}/{total}] Bắt đầu: {email} (Chrome CDP)")
+                self.ui_log.emit(f"📂 [{idx+1}/{total}] Bắt đầu: {email}")
+                
+                # Profile path
+                if not profile_path:
+                    safe_email = email.replace("@", "_at_").replace(".", "_")
+                    profile_path = str(PROFILES_DIR / safe_email)
+                    self.log.emit(f"   ⚠️ [{email}] Tạo profile mới: {profile_path}")
+                elif not Path(profile_path).exists():
+                    self.log.emit(f"   ❌ [{email}] Profile không tồn tại: {profile_path}")
+                    self.account_failed.emit(email)
+                    self.progress.emit(idx + 1, total, email)
+                    return
+                
+                Path(profile_path).mkdir(parents=True, exist_ok=True)
+                
+                # Tính vị trí cửa sổ
+                win_w, win_h = 500, 600
+                cols = max(1, self.screen_width // win_w)
+                slot = idx % self.threads
+                col = slot % cols
+                row = slot // cols
+                pos_x = col * win_w
+                pos_y = row * win_h
+                
+                # Tạo CDP session
+                session = ChromeCDPSession(
+                    profile_path=profile_path,
+                    headless=True,  # Sẽ được override trong extract_cookies
+                    window_pos=(pos_x, pos_y),
+                    window_size=(win_w, win_h),
+                    log_fn=lambda msg: self.log.emit(msg),
+                )
+                
+                try:
+                    cookies = session.extract_cookies(
+                        email=email,
+                        password=password,
+                        force_login=self.force_login,
+                    )
+                    
+                    if cookies:
+                        with results_lock:
+                            results[email] = cookies
+                        self.log.emit(f"   ✅ [{email}] Lấy được {len(cookies)} cookies!")
+                        self.ui_log.emit(f"🍪 Done - {email}")
+                        self.account_done.emit(email, cookies)
+                    else:
+                        self.log.emit(f"   ❌ [{email}] Không lấy được cookies → FAIL")
+                        self.ui_log.emit(f"🍪 Fail - {email}")
+                        self.account_failed.emit(email)
+                        
+                except Exception as e:
+                    self.log.emit(f"   ❌ [{email}] Error: {str(e)[:80]}")
+                    self.ui_log.emit(f"🍪 Fail - {email}")
+                    self.account_failed.emit(email)
+                finally:
+                    session.close()
+                    
+                    if self.delay > 0:
+                        time.sleep(self.delay)
+                    
+                    completed[0] += 1
+                    self.progress.emit(completed[0], total, email)
+        
+        # Run with thread pool
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.threads) as executor:
+            futures = []
+            for idx, account in enumerate(self.accounts):
+                if self._stopped:
+                    break
+                # Delay giữa các account
+                if idx > 0 and self.delay > 0:
+                    time.sleep(max(1, self.delay // 2))
+                futures.append(executor.submit(process_account, idx, account))
+            
+            # Wait for all
+            for f in concurrent.futures.as_completed(futures):
+                try:
+                    f.result()
+                except Exception as e:
+                    self.log.emit(f"⚠️ Thread error: {str(e)[:60]}")
+        
+        return results
     
     async def _get_cookies_simple(self) -> Dict[str, str]:
         """Cookie extraction with auto-login - threaded - Logic rõ ràng theo cookieauto_base.py"""

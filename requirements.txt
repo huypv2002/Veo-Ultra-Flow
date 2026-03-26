@@ -20,6 +20,7 @@ selenium>=4.15.0
 flask>=3.0.0
 zendriver>=0.5.0
 websockets>=12.0
+websocket-client>=1.6.0
 emoji>=2.0.0
 grapheme>=0.6.0
 mss>=9.0.0

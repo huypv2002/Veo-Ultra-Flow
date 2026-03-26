@@ -170,6 +170,8 @@ class LabsFlowClient:
     def _check_proxy_live(cls, proxy: Dict[str, str], timeout: float = 10.0) -> bool:
         """Kiểm tra proxy có live không bằng cách request đến httpbin.org/ip
         
+        Hỗ trợ HTTP, HTTPS, SOCKS5 (WARP, Tor).
+        
         Args:
             proxy: Dict với server, username, password
             timeout: Timeout cho request (giây)
@@ -179,17 +181,23 @@ class LabsFlowClient:
         """
         import requests
         try:
-            proxy_url = proxy["server"]
+            proxy_url = proxy.get("server", "")
             username = proxy.get("username", "")
             password = proxy.get("password", "")
             
+            if not proxy_url:
+                return False
+            
             # Build proxy URL với auth
+            from urllib.parse import quote
             if username and password:
-                # http://user:pass@host:port
-                parts = proxy_url.replace("http://", "").replace("https://", "")
-                proxy_with_auth = f"http://{username}:{password}@{parts}"
+                if "://" in proxy_url:
+                    scheme, rest = proxy_url.split("://", 1)
+                else:
+                    scheme, rest = "http", proxy_url
+                proxy_with_auth = f"{scheme}://{quote(username)}:{quote(password)}@{rest}"
             else:
-                proxy_with_auth = proxy_url
+                proxy_with_auth = proxy_url if "://" in proxy_url else f"http://{proxy_url}"
             
             proxies = {
                 "http": proxy_with_auth,
@@ -293,28 +301,92 @@ class LabsFlowClient:
         
         Nếu cookie chưa có proxy (lần đầu bị 403), assign proxy đầu tiên.
         Nếu cookie đã có proxy, xoay sang proxy tiếp theo.
+        
+        Enhanced với:
+        - Proxy health tracking (đánh dấu proxy xấu khi liên tục lỗi)
+        - Tự động bỏ qua proxy xấu khi xoay
         """
         if not cls._use_proxy_pool:
             print(f"  ℹ️ [Proxy Pool] Proxy pool đang TẮT, không xoay proxy")
             return None
+        
         with cls._proxy_pool_lock:
+            # Khởi tạo proxy health tracking nếu chưa có
+            if not hasattr(cls, '_proxy_health_status'):
+                cls._proxy_health_status: Dict[int, Dict[str, Any]] = {}
+                for idx, proxy in enumerate(cls._proxy_pool):
+                    cls._proxy_health_status[idx] = {
+                        'consecutive_errors': 0,
+                        'total_errors': 0,
+                        'last_error_time': 0,
+                        'is_bad': False,
+                    }
+            
+            # Tìm proxy tốt tiếp theo (không bị đánh dấu xấu)
+            def get_next_good_proxy(start_idx: int) -> Optional[tuple]:
+                """Tìm proxy tốt tiếp theo, bỏ qua proxy xấu."""
+                pool_size = len(cls._proxy_pool)
+                for offset in range(pool_size):
+                    idx = (start_idx + offset) % pool_size
+                    if not cls._proxy_health_status.get(idx, {}).get('is_bad', False):
+                        return idx, cls._proxy_pool[idx]
+                return None  # Tất cả proxy đều xấu
+            
             if cookie_hash not in cls._cookie_proxy_map:
-                # Lần đầu bị 403, assign proxy đầu tiên từ pool
-                new_idx = cls._proxy_pool_index
-                cls._proxy_pool_index = (cls._proxy_pool_index + 1) % len(cls._proxy_pool)
+                # Lần đầu bị 403, assign proxy đầu tiên tốt
+                start_idx = cls._proxy_pool_index
+                result = get_next_good_proxy(start_idx)
+                if result is None:
+                    print(f"  ⚠️ [Proxy Pool] Tất cả proxy đều bị đánh dấu xấu, không assign được")
+                    return None
+                    
+                new_idx, new_proxy = result
+                cls._proxy_pool_index = (new_idx + 1) % len(cls._proxy_pool)
                 cls._cookie_proxy_map[cookie_hash] = new_idx
-                new_proxy = cls._proxy_pool[new_idx]
                 print(f"  🌐 [Proxy Pool] Đã assign proxy #{new_idx} cho cookie {cookie_hash[:8]}... (lần đầu bị 403)")
                 print(f"     → Proxy session: {new_proxy['username'][:30]}...")
             else:
-                # Đã có proxy, xoay sang proxy tiếp theo
-                current_idx = cls._cookie_proxy_map[cookie_hash]
-                new_idx = (current_idx + 1) % len(cls._proxy_pool)
+                # Đánh dấu proxy hiện tại là xấu nếu đây là lỗi liên tiếp
+                current_idx = cls._cookie_proxy_map.get(cookie_hash, -1)
+                if current_idx >= 0:
+                    health = cls._proxy_health_status.get(current_idx, {})
+                    health['consecutive_errors'] = health.get('consecutive_errors', 0) + 1
+                    health['total_errors'] = health.get('total_errors', 0) + 1
+                    health['last_error_time'] = time.time()
+                    
+                    # Đánh dấu xấu nếu > 3 lỗi liên tiếp
+                    if health['consecutive_errors'] > 3:
+                        health['is_bad'] = True
+                        print(f"  🚫 [Proxy Pool] Proxy #{current_idx} bị đánh dấu xấu sau {health['consecutive_errors']} lỗi liên tiếp")
+                
+                # Xoay sang proxy tốt tiếp theo
+                result = get_next_good_proxy(current_idx + 1)
+                if result is None:
+                    print(f"  ⚠️ [Proxy Pool] Không tìm được proxy tốt để xoay")
+                    return None
+                    
+                new_idx, new_proxy = result
                 cls._cookie_proxy_map[cookie_hash] = new_idx
-                new_proxy = cls._proxy_pool[new_idx]
                 print(f"  🔄 [Proxy Pool] Cookie {cookie_hash[:8]}... xoay proxy: #{current_idx} → #{new_idx}")
                 print(f"     → New proxy session: {new_proxy['username'][:30]}...")
             return new_proxy
+    
+    @classmethod
+    def _reset_proxy_health_for_cookie(cls, cookie_hash: str):
+        """Reset proxy health counter khi request thành công."""
+        with cls._proxy_pool_lock:
+            if hasattr(cls, '_cookie_proxy_map') and cookie_hash in cls._cookie_proxy_map:
+                idx = cls._cookie_proxy_map[cookie_hash]
+                if hasattr(cls, '_proxy_health_status') and idx in cls._proxy_health_status:
+                    health = cls._proxy_health_status[idx]
+                    health['consecutive_errors'] = 0
+                    # Giảm total_errors để proxy có cơ hội phục hồi
+                    health['total_errors'] = max(0, health.get('total_errors', 1) - 1)
+                    # Reset is_bad nếu đã phục hồi đủ (ít lỗi hơn ngưỡng)
+                    if health['consecutive_errors'] == 0 and health.get('total_errors', 0) < 3:
+                        if health.get('is_bad'):
+                            health['is_bad'] = False
+                            print(f"  ✅ [Proxy Pool] Proxy #{idx} đã phục hồi (is_bad = False)")
     
     # ✅ SINGLE PROCESS ARCHITECTURE: Thread-local Browser instances (Playwright)
     # Mỗi thread có Browser instance riêng (thread-safe với Playwright sync API)
@@ -352,22 +424,38 @@ class LabsFlowClient:
     _recaptcha_cookie_blocked_lock = threading.Lock()  # Lock để bảo vệ flags
     
     # ═══════════════════════════════════════════════════════════════════════
-    # ✅ ZENDRIVER (nodriver) - Primary token source, fallback to Playwright
+    # ✅ CHROME CDP - Primary token source (Chrome thật + CDP protocol)
+    # Dùng Chrome thật thay vì zendriver để có trust score cao hơn
     # ═══════════════════════════════════════════════════════════════════════
-    _zendriver_available: bool = False       # True nếu zendriver đã cài
-    _zendriver_started: bool = False         # True nếu worker thread đang chạy
-    _zendriver_loop: Optional[Any] = None    # asyncio event loop trong worker thread
-    _zendriver_thread: Optional[threading.Thread] = None
-    _zendriver_browser: Optional[Any] = None # zendriver Browser instance (persistent, headed)
-    _zendriver_pages: Dict[str, Any] = {}    # {cookie_hash: page} - 1 page per cookie
-    _zendriver_lock = threading.Lock()       # Lock bảo vệ zendriver init
-    _zendriver_cookies_injected: Dict[str, bool] = {}  # {cookie_hash: True}
+    _chrome_cdp_available: bool = False       # True nếu tìm thấy Chrome binary
+    _chrome_cdp_started: bool = False         # True nếu Chrome process đang chạy
+    _chrome_cdp_process: Optional[Any] = None # subprocess.Popen instance
+    _chrome_cdp_port: int = 9222             # Remote debugging port
+    _chrome_cdp_lock = threading.Lock()       # Lock bảo vệ Chrome init
+    _chrome_cdp_pages: Dict[str, str] = {}   # {cookie_hash: ws_url} - WebSocket URL per cookie tab
+    _chrome_cdp_cookies_injected: Dict[str, bool] = {}  # {cookie_hash: True}
+    _chrome_cdp_tab_ids: Dict[str, str] = {} # {cookie_hash: tab_id}
+    _chrome_cdp_ws_conns: Dict[str, Any] = {}  # {cookie_hash: websocket connection}
+    _chrome_cdp_ws_msg_ids: Dict[str, int] = {}  # {cookie_hash: next msg_id}
+    _chrome_cdp_page_ready: Dict[str, bool] = {}  # {cookie_hash: True nếu page đã load xong}
     
-    # Token source tracking: "zendriver" hoặc "playwright"
+    # ✅ Giữ lại zendriver variables cho backward compat (sẽ không dùng nữa)
+    _zendriver_available: bool = False
+    _zendriver_started: bool = False
+    _zendriver_loop: Optional[Any] = None
+    _zendriver_thread: Optional[threading.Thread] = None
+    _zendriver_browser: Optional[Any] = None
+    _zendriver_pages: Dict[str, Any] = {}
+    _zendriver_lock = threading.Lock()
+    _zendriver_cookies_injected: Dict[str, bool] = {}
+    
+    # Token source tracking: "chrome_cdp" hoặc "playwright"
     _last_token_source: Dict[str, str] = {}           # {cookie_hash: source}
-    _zendriver_consecutive_403: Dict[str, int] = {}    # {cookie_hash: count}
+    _zendriver_consecutive_403: Dict[str, int] = {}    # {cookie_hash: count} - giữ cho compat
+    _chrome_cdp_consecutive_403: Dict[str, int] = {}   # {cookie_hash: count}
     _playwright_consecutive_403: Dict[str, int] = {}   # {cookie_hash: count}
-    MAX_ZENDRIVER_403 = 3   # Sau 3 lần 403 liên tiếp từ zendriver → chuyển sang playwright
+    MAX_ZENDRIVER_403 = 3   # Giữ cho compat
+    MAX_CHROME_CDP_403 = 3  # Sau 3 lần 403 liên tiếp từ Chrome CDP → chuyển sang playwright
     MAX_PLAYWRIGHT_403 = 3  # Sau 3 lần 403 liên tiếp từ playwright → reset cookie
     
     @classmethod
@@ -431,6 +519,93 @@ class LabsFlowClient:
         mode_str = "HEADLESS" if headless else "OFF-SCREEN"
         print(f"  ✅ reCAPTCHA mode: LOCAL BROWSER ({mode_str})")
     
+    # ═══════════════════════════════════════════════════════════════════════
+    # ✅ AUTO COOKIE RENEWAL - Tự động lấy cookie mới khi bị 403
+    # Lưu thông tin account (email, password, profile_path) cho mỗi cookie_hash
+    # Khi bị 403 liên tiếp → tự động headless login lại để lấy cookie mới
+    # ═══════════════════════════════════════════════════════════════════════
+    _cookie_account_info: Dict[str, Dict[str, str]] = {}  # {cookie_hash: {email, password, profile_path}}
+    _cookie_auto_renew_lock = threading.Lock()  # Lock bảo vệ auto-renew (tránh nhiều thread cùng renew)
+    _cookie_renewing: Dict[str, bool] = {}  # {cookie_hash: True} - đánh dấu đang renew
+    
+    @classmethod
+    def register_account_info(cls, cookie_hash: str, email: str, password: str, profile_path: str):
+        """Đăng ký thông tin account cho cookie để auto-renew khi bị 403.
+        
+        Args:
+            cookie_hash: Hash của cookie
+            email: Email Google account
+            password: Password Google account
+            profile_path: Đường dẫn profile browser
+        """
+        cls._cookie_account_info[cookie_hash] = {
+            "email": email,
+            "password": password,
+            "profile_path": profile_path,
+        }
+        print(f"  ✅ [Auto Renew] Đã đăng ký account info cho cookie {cookie_hash[:8]}... (email: {email})")
+    
+    @classmethod
+    def register_account_info_from_db(cls):
+        """Đọc tất cả accounts từ DB và đăng ký auto-renew cho mỗi cookie.
+        
+        Gọi hàm này khi khởi động app hoặc khi cookies_list thay đổi.
+        """
+        try:
+            from cookiauto import db_get_all_accounts, db_get_account_cookies
+            from complete_flow import _parse_cookie_string
+            
+            accounts = db_get_all_accounts()
+            registered = 0
+            for acc in accounts:
+                email = acc.get("email", "")
+                password = acc.get("password", "")
+                profile_path = acc.get("profile_path", "")
+                
+                if not email or not profile_path:
+                    continue
+                
+                # Lấy cookies từ DB để tính cookie_hash
+                try:
+                    cookies_json = db_get_account_cookies(email)
+                    if cookies_json:
+                        import json
+                        cookies_list = json.loads(cookies_json)
+                        # Chuyển list of cookie objects → dict {name: value}
+                        cookies_dict: Dict[str, str] = {}
+                        for c in cookies_list:
+                            if isinstance(c, dict):
+                                cookies_dict[c.get("name", "")] = c.get("value", "")
+                        
+                        if cookies_dict:
+                            ch = cls._get_cookie_hash(cookies_dict)
+                            cls.register_account_info(ch, email, password, profile_path)
+                            registered += 1
+                except Exception:
+                    pass
+            
+            if registered > 0:
+                print(f"  ✅ [Auto Renew] Đã đăng ký {registered} accounts từ DB cho auto-renew")
+        except Exception as e:
+            print(f"  ⚠️ [Auto Renew] Lỗi đọc accounts từ DB: {e}")
+    
+    @classmethod
+    def register_account_info_for_cookie_str(cls, cookie_str: str, email: str, password: str, profile_path: str):
+        """Đăng ký account info cho cookie string (tiện dùng từ GUI).
+        
+        Args:
+            cookie_str: Cookie string (format: "name=value; name2=value2; ...")
+            email: Email Google account
+            password: Password Google account
+            profile_path: Đường dẫn profile browser
+        """
+        try:
+            cookies = _parse_cookie_string(cookie_str)
+            if cookies:
+                ch = cls._get_cookie_hash(cookies)
+                cls.register_account_info(ch, email, password, profile_path)
+        except Exception as e:
+            print(f"  ⚠️ [Auto Renew] Lỗi đăng ký account info: {e}")
     
     @classmethod
     def register_renew_cookie_callback(cls, cookie_hash: str, callback: Any):
@@ -457,12 +632,16 @@ class LabsFlowClient:
         self.session = session or requests.Session()
         self.cookies = cookies
         self.profile_path = profile_path
-        # ✅ Proxy configuration: {server: "http://host:port", username: "", password: ""} hoặc None
+        # ✅ Proxy configuration: ProxyConfig dict hoặc legacy {server, username, password} hoặc None
         self.proxy_config: Optional[Dict[str, str]] = proxy_config
         self.access_token: Optional[str] = None
         self.last_error_detail: Optional[str] = None
         # ✅ Luôn khởi tạo last_error để tránh AttributeError: 'LabsFlowClient' has no attribute 'last_error'
         self.last_error: Optional[str] = None
+        
+        # ✅ Áp dụng proxy vào session ngay khi khởi tạo (nếu có)
+        if proxy_config:
+            self._apply_proxy_to_session(proxy_config)
         self.user_agent = _env(
             "USER_AGENT",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -561,10 +740,17 @@ class LabsFlowClient:
         self._last_api_call_time: float = 0
         self._api_call_count: int = 0
         self._min_api_call_interval = 0.3  # Minimum 0.3s giữa các API calls của cookie này
+        
+        # ✅ Token freshness tracking - reCAPTCHA token hết hạn sau 120s (Google docs)
+        # Lưu timestamp khi token được generate để kiểm tra trước khi gọi API
+        if not hasattr(LabsFlowClient, '_token_timestamps'):
+            LabsFlowClient._token_timestamps: Dict[str, float] = {}
+        # Token được coi là "fresh" nếu < TOKEN_MAX_AGE_SECONDS
+        self.TOKEN_MAX_AGE_SECONDS = 90  # 90s (buffer 30s trước khi hết hạn 120s)
     
     @classmethod
     def cleanup_selenium_driver(cls):
-        """Đóng tất cả Selenium drivers (shared giữa các instances)."""
+        """Đóng tất cả Selenium drivers và Chrome CDP process."""
         if hasattr(cls, '_shared_selenium_drivers'):
             for cookie_hash, driver in list(cls._shared_selenium_drivers.items()):
                 try:
@@ -575,6 +761,61 @@ class LabsFlowClient:
             cls._shared_selenium_drivers.clear()
         if hasattr(cls, '_shared_cookies_injected'):
             cls._shared_cookies_injected.clear()
+        
+        # ✅ Cleanup Chrome CDP process
+        cls._cleanup_chrome_cdp()
+    
+    @classmethod
+    def _cleanup_chrome_cdp(cls):
+        """Đóng Chrome CDP process và cleanup resources."""
+        # Close tất cả persistent WebSocket connections
+        for ch, ws_conn in list(cls._chrome_cdp_ws_conns.items()):
+            try:
+                ws_conn.close()
+            except Exception:
+                pass
+        cls._chrome_cdp_ws_conns.clear()
+        cls._chrome_cdp_ws_msg_ids.clear()
+        cls._chrome_cdp_page_ready.clear()
+        
+        # Close tất cả tabs
+        if cls._chrome_cdp_started:
+            for cookie_hash, tab_id in list(cls._chrome_cdp_tab_ids.items()):
+                try:
+                    requests.get(
+                        f"http://127.0.0.1:{cls._chrome_cdp_port}/json/close/{tab_id}",
+                        timeout=2,
+                    )
+                except Exception:
+                    pass
+        
+        cls._chrome_cdp_pages.clear()
+        cls._chrome_cdp_tab_ids.clear()
+        cls._chrome_cdp_cookies_injected.clear()
+        
+        # Kill Chrome process
+        if cls._chrome_cdp_process:
+            try:
+                cls._chrome_cdp_process.terminate()
+                cls._chrome_cdp_process.wait(timeout=5)
+                print("  ✓ [Chrome CDP] Chrome process terminated")
+            except Exception:
+                try:
+                    cls._chrome_cdp_process.kill()
+                except Exception:
+                    pass
+            cls._chrome_cdp_process = None
+        
+        cls._chrome_cdp_started = False
+        
+        # Cleanup temp user-data-dir
+        if hasattr(cls, '_chrome_cdp_user_data_dir') and cls._chrome_cdp_user_data_dir:
+            import shutil
+            try:
+                shutil.rmtree(cls._chrome_cdp_user_data_dir, ignore_errors=True)
+            except Exception:
+                pass
+            cls._chrome_cdp_user_data_dir = None
     
     @classmethod
     def _get_global_browser(cls, headless: bool = False, browser_path: Optional[str] = None) -> Any:
@@ -1019,8 +1260,10 @@ class LabsFlowClient:
         
         cookie_hash = self._cookie_hash
         
+        # ✅ FIX: Reset token timestamp để buộc lấy token hoàn toàn mới
+        LabsFlowClient._token_timestamps.pop(cookie_hash, None)
+        
         # ✅ Dùng unified error handler để kiểm tra và reset nếu cần
-        # Lưu ý: _handle_error_and_maybe_reset đã tăng counter và reset nếu đạt ngưỡng
         should_retry_fresh = self._handle_error_and_maybe_reset(403, "403 Forbidden/Captcha")
         
         if should_retry_fresh:
@@ -1051,7 +1294,77 @@ class LabsFlowClient:
         """Reset counter lỗi cho cookie này (gọi khi thành công)."""
         # ✅ Dùng function mới để reset tất cả counters
         self._reset_all_error_counters()
-    
+
+    @staticmethod
+    def _parse_google_error_details(response_text: str) -> Dict[str, Any]:
+        """Parse detailed error information from Google API error response.
+        
+        Trích xuất thông tin lỗi chi tiết từ Google API response để xác định:
+        - Error reason (vd: RECAPTCHA_INVALID, TOKEN_EXPIRED, etc.)
+        - Error domain
+        - Details field
+        
+        Args:
+            response_text: JSON response text from Google API
+            
+        Returns:
+            Dict với các thông tin: 'reason', 'domain', 'details', 'is_recaptcha_error'
+        """
+        import json
+        result = {
+            'reason': None,
+            'domain': None,
+            'details': [],
+            'is_recaptcha_error': False,
+            'raw_error': None,
+        }
+        
+        try:
+            error_data = json.loads(response_text)
+            result['raw_error'] = error_data
+            
+            # Google API error format
+            if 'error' in error_data:
+                error_info = error_data['error']
+                result['domain'] = error_info.get('domain')
+                
+                # Trích xuất reason trực tiếp
+                result['reason'] = error_info.get('reason')
+                
+                # Trích xuất từ details array
+                details = error_info.get('details', [])
+                for detail in details:
+                    if isinstance(detail, dict):
+                        # Lấy reason từ detail
+                        if not result['reason'] and detail.get('reason'):
+                            result['reason'] = detail.get('reason')
+                        
+                        # Trích xuất metadata
+                        if '@type' in detail:
+                            detail_type = detail['@type']
+                            result['details'].append({
+                                'type': detail_type,
+                                'reason': detail.get('reason'),
+                                'metadata': detail.get('metadata', {}),
+                            })
+                            
+                            # Kiểm tra recaptcha error
+                            if 'Recaptcha' in detail_type or 'recaptcha' in detail_type.lower():
+                                result['is_recaptcha_error'] = True
+                            if detail.get('reason') in ['RECAPTCHA_INVALID', 'RECAPTCHA_UNAVAILABLE', 'TOKEN_INVALID']:
+                                result['is_recaptcha_error'] = True
+                                
+        except json.JSONDecodeError:
+            # Không phải JSON, có thể là text thường
+            response_lower = response_text.lower()
+            if 'recaptcha' in response_lower or 'captcha' in response_lower:
+                result['is_recaptcha_error'] = True
+                result['reason'] = 'RECAPTCHA_ERROR'
+            if '403' in response_text:
+                result['reason'] = 'FORBIDDEN'
+                
+        return result
+
     @staticmethod
     def _get_cookie_hash(cookies: Dict[str, str]) -> str:
         """Generate a hash for cookie dict to identify unique cookies."""
@@ -1153,15 +1466,38 @@ class LabsFlowClient:
         """
         Áp dụng proxy vào requests.Session cho API HTTP calls.
         
+        Hỗ trợ tất cả loại proxy:
+        - HTTP/HTTPS proxy: http://host:port
+        - SOCKS5 proxy: socks5://host:port (WARP, Tor)
+        - Proxy với auth: user:pass@host:port
+        
         ✅ QUAN TRỌNG: Proxy chỉ dùng cho API calls (requests.post/get),
         KHÔNG dùng cho BrowserContext (Playwright navigation).
-        Lý do: Google Labs page load qua proxy rất chậm/timeout,
-        nhưng API calls qua proxy hoạt động tốt.
         
         Args:
             proxy: Dict với server, username, password
+                   HOẶC ProxyConfig dict với proxy_type, static_server, etc.
         """
         try:
+            # Hỗ trợ cả ProxyConfig dict (proxy_type) và legacy dict (server)
+            proxy_type = proxy.get("proxy_type", "")
+            
+            if proxy_type and proxy_type != "none":
+                # New ProxyConfig format
+                from proxy_manager import ProxyConfig
+                config = ProxyConfig.from_dict(proxy)
+                entry = config.get_active_proxy()
+                if not entry:
+                    print(f"  ⚠️ [Proxy Session] ProxyConfig type={proxy_type} nhưng không có proxy active")
+                    return
+                proxies = entry.to_requests_proxy()
+                self.session.proxies = proxies
+                print(f"  🌐 [Proxy Session] Áp dụng {proxy_type} proxy: {entry.server}")
+                if entry.username:
+                    print(f"     → Auth: {entry.username[:30]}...")
+                return
+            
+            # Legacy format: {server, username, password}
             proxy_server = proxy.get("server", "")
             username = proxy.get("username", "")
             password = proxy.get("password", "")
@@ -1170,12 +1506,17 @@ class LabsFlowClient:
                 print(f"  ⚠️ [Proxy Session] Proxy server rỗng, bỏ qua")
                 return
             
-            # Build proxy URL với auth: http://user:pass@host:port
-            parts = proxy_server.replace("http://", "").replace("https://", "")
+            # Build proxy URL với auth
+            from urllib.parse import quote
+            parts = proxy_server
             if username and password:
-                proxy_url = f"http://{username}:{password}@{parts}"
+                if "://" in parts:
+                    scheme, rest = parts.split("://", 1)
+                else:
+                    scheme, rest = "http", parts
+                proxy_url = f"{scheme}://{quote(username)}:{quote(password)}@{rest}"
             else:
-                proxy_url = f"http://{parts}"
+                proxy_url = parts if "://" in parts else f"http://{parts}"
             
             self.session.proxies = {
                 "http": proxy_url,
@@ -1183,7 +1524,8 @@ class LabsFlowClient:
             }
             
             print(f"  🌐 [Proxy Session] Đã áp dụng proxy cho API calls: {proxy_server}")
-            print(f"     → Session: {username[:30]}..." if username else "     → No auth")
+            if username:
+                print(f"     → Auth: {username[:30]}...")
         except Exception as e:
             print(f"  ⚠️ [Proxy Session] Lỗi áp dụng proxy: {e}")
     
@@ -1282,6 +1624,423 @@ class LabsFlowClient:
             print(traceback.format_exc())
             return None
     
+    def _auto_renew_cookies_on_403(self) -> bool:
+        """Tự động lấy cookie mới khi bị 403 - KHÔNG cần user thao tác.
+        
+        Flow ưu tiên (hỗ trợ proxy per-account):
+        1. Thử lấy cookie mới từ profile (headless, nhanh nhất)
+        2. Nếu fail → thử headless re-login với email/password từ DB
+        3. Áp dụng proxy per-account (nếu có) vào session
+        4. Update cookies mới vào instance, DB, và tất cả browser contexts
+        5. Reset tất cả error counters và token timestamps
+        
+        Returns:
+            True nếu lấy được cookie mới, False nếu thất bại
+        """
+        cookie_hash = self._cookie_hash
+        
+        # Tránh nhiều thread cùng renew cho 1 cookie
+        with LabsFlowClient._cookie_auto_renew_lock:
+            if LabsFlowClient._cookie_renewing.get(cookie_hash, False):
+                print(f"  ⏳ [Auto Renew] Cookie {cookie_hash[:8]}... đang được renew bởi thread khác, đợi...")
+                for _ in range(60):
+                    time.sleep(1)
+                    if not LabsFlowClient._cookie_renewing.get(cookie_hash, False):
+                        if self.cookies != self._original_cookies_before_renew:
+                            print(f"  ✅ [Auto Renew] Cookie đã được renew bởi thread khác")
+                            return True
+                        break
+                return False
+            LabsFlowClient._cookie_renewing[cookie_hash] = True
+        
+        self._original_cookies_before_renew = dict(self.cookies)
+        
+        try:
+            new_cookies = None
+            account_info = LabsFlowClient._cookie_account_info.get(cookie_hash)
+            profile_path = self._get_profile_path_for_cookie()
+            
+            # ═══════════════════════════════════════════════════════════════
+            # BƯỚC 0: Clear session cũ + áp dụng proxy per-account
+            # ═══════════════════════════════════════════════════════════════
+            print(f"  🧹 [Auto Renew] Clear session cũ...")
+            self._remove_proxy_from_session()
+            self.session.cookies.clear()
+            
+            # Load proxy config per-account
+            account_proxy_config = None
+            if account_info and account_info.get("email"):
+                try:
+                    from cookiauto import db_get_account_proxy_config
+                    account_proxy_config = db_get_account_proxy_config(account_info["email"])
+                    if account_proxy_config:
+                        proxy_type = account_proxy_config.get("proxy_type", account_proxy_config.get("server", ""))
+                        print(f"  🌐 [Auto Renew] Proxy per-account: {proxy_type}")
+                except Exception:
+                    pass
+            
+            # ═══════════════════════════════════════════════════════════════
+            # BƯỚC 1: Thử lấy cookie mới từ profile (headless, nhanh nhất)
+            # ═══════════════════════════════════════════════════════════════
+            if profile_path and self._get_cookie_source() == "profile":
+                print(f"  🔄 [Auto Renew] BƯỚC 1: Thử lấy cookie từ profile (headless)...")
+                new_cookies = self._refresh_cookies_from_profile()
+                
+                if new_cookies and self._verify_new_cookies(new_cookies):
+                    print(f"  ✅ [Auto Renew] BƯỚC 1 thành công - Lấy được cookie mới từ profile")
+                    self._apply_new_cookies(new_cookies, cookie_hash, account_info)
+                    # Áp dụng proxy per-account vào session
+                    if account_proxy_config:
+                        self._apply_proxy_to_session(account_proxy_config)
+                        self.proxy_config = account_proxy_config
+                    return True
+                else:
+                    print(f"  ⚠️ [Auto Renew] BƯỚC 1 thất bại - Cookie từ profile không hợp lệ hoặc đã hết hạn")
+            
+            # ═══════════════════════════════════════════════════════════════
+            # BƯỚC 2: Headless re-login với email/password
+            # ═══════════════════════════════════════════════════════════════
+            if account_info and account_info.get("email") and account_info.get("password"):
+                email = account_info["email"]
+                password = account_info["password"]
+                acc_profile = account_info.get("profile_path", profile_path or "")
+                
+                print(f"  🔄 [Auto Renew] BƯỚC 2: Headless re-login cho {email}...")
+                new_cookies = self._headless_relogin(email, password, acc_profile)
+                
+                if new_cookies and self._verify_new_cookies(new_cookies):
+                    print(f"  ✅ [Auto Renew] BƯỚC 2 thành công - Đã re-login và lấy cookie mới cho {email}")
+                    self._apply_new_cookies(new_cookies, cookie_hash, account_info)
+                    # Áp dụng proxy per-account vào session
+                    if account_proxy_config:
+                        self._apply_proxy_to_session(account_proxy_config)
+                        self.proxy_config = account_proxy_config
+                    return True
+                else:
+                    print(f"  ⚠️ [Auto Renew] BƯỚC 2 thất bại - Không thể re-login cho {email}")
+            else:
+                print(f"  ⚠️ [Auto Renew] Không có account info (email/password) cho cookie {cookie_hash[:8]}...")
+                print(f"  💡 Tip: Đăng ký account info bằng LabsFlowClient.register_account_info()")
+            
+            # ═══════════════════════════════════════════════════════════════
+            # BƯỚC 3: Fallback - thử callback renew (nếu có)
+            # ═══════════════════════════════════════════════════════════════
+            callback = LabsFlowClient._recaptcha_renew_cookie_callbacks.get(cookie_hash)
+            if callback:
+                print(f"  🔄 [Auto Renew] BƯỚC 3: Thử callback renew...")
+                try:
+                    new_cookies = callback(cookie_hash, self.cookies)
+                    if new_cookies and isinstance(new_cookies, dict) and len(new_cookies) > 0:
+                        print(f"  ✅ [Auto Renew] BƯỚC 3 thành công - Callback trả về cookie mới")
+                        self._apply_new_cookies(new_cookies, cookie_hash, account_info)
+                        if account_proxy_config:
+                            self._apply_proxy_to_session(account_proxy_config)
+                            self.proxy_config = account_proxy_config
+                        return True
+                except Exception as e:
+                    print(f"  ⚠️ [Auto Renew] BƯỚC 3 thất bại: {e}")
+            
+            print(f"  ❌ [Auto Renew] Tất cả các bước đều thất bại cho cookie {cookie_hash[:8]}...")
+            return False
+            
+        except Exception as e:
+            print(f"  ❌ [Auto Renew] Lỗi không mong đợi: {e}")
+            import traceback
+            print(traceback.format_exc())
+            return False
+        finally:
+            with LabsFlowClient._cookie_auto_renew_lock:
+                LabsFlowClient._cookie_renewing[cookie_hash] = False
+    
+    def _verify_new_cookies(self, new_cookies: Dict[str, str]) -> bool:
+        """Kiểm tra cookies mới có hợp lệ không bằng cách thử fetch access token.
+        
+        Returns:
+            True nếu cookies hợp lệ (fetch AT thành công)
+        """
+        try:
+            import requests
+            session = requests.Session()
+            url = "https://labs.google/fx/api/auth/session"
+            headers = self._labs_headers()
+            
+            resp = session.get(url, headers=headers, cookies=new_cookies, timeout=30)
+            if resp.status_code == 200:
+                data = resp.json()
+                token = data.get("access_token") if isinstance(data, dict) else None
+                if token:
+                    print(f"  ✅ [Verify] Cookie mới hợp lệ - AT: {token[:20]}...")
+                    return True
+                else:
+                    print(f"  ⚠️ [Verify] Cookie mới không có access_token trong response")
+                    return False
+            else:
+                print(f"  ⚠️ [Verify] Cookie mới trả về status {resp.status_code}")
+                return False
+        except Exception as e:
+            print(f"  ⚠️ [Verify] Lỗi verify cookie: {e}")
+            return False
+    
+    def _apply_new_cookies(self, new_cookies: Dict[str, str], cookie_hash: str, account_info: Optional[Dict[str, str]] = None):
+        """Áp dụng cookies mới vào tất cả các nơi cần thiết.
+        
+        1. Update instance cookies
+        2. Update session cookies
+        3. Fetch access token mới
+        4. Reset tất cả browser contexts
+        5. Reset error counters
+        6. Update DB (nếu có account info)
+        """
+        # 1. Update instance
+        self.cookies = new_cookies
+        new_hash = self._get_cookie_hash(new_cookies)
+        print(f"  🔄 [Apply] Cookie hash: {cookie_hash[:8]}... → {new_hash[:8]}...")
+        
+        # 2. Update session cookies
+        self.session.cookies.clear()
+        for name, value in new_cookies.items():
+            self.session.cookies.set(name, value)
+        
+        # 3. Fetch access token mới
+        try:
+            if self.fetch_access_token():
+                print(f"  ✅ [Apply] Đã fetch access token mới")
+            else:
+                print(f"  ⚠️ [Apply] Không fetch được access token mới")
+        except Exception as e:
+            print(f"  ⚠️ [Apply] Lỗi fetch AT: {e}")
+        
+        # 4. Reset browser contexts
+        self._reset_browser_context_for_cookie(new_cookies)
+        
+        # Reset zendriver
+        LabsFlowClient._zendriver_reset_page(cookie_hash)
+        LabsFlowClient._zendriver_cookies_injected.pop(cookie_hash, None)
+        
+        # 5. Reset error counters
+        LabsFlowClient._token_timestamps.pop(cookie_hash, None)
+        self._reset_all_error_counters()
+        LabsFlowClient._zendriver_consecutive_403[cookie_hash] = 0
+        LabsFlowClient._playwright_consecutive_403[cookie_hash] = 0
+        if hasattr(self, '_403_refresh_retries'):
+            self._403_refresh_retries[cookie_hash] = 0
+        
+        # Clear blocked flag
+        with LabsFlowClient._recaptcha_cookie_blocked_lock:
+            if hasattr(LabsFlowClient, '_recaptcha_cookie_blocked_flags'):
+                LabsFlowClient._recaptcha_cookie_blocked_flags[cookie_hash] = False
+        
+        # 6. Update DB (nếu có account info)
+        if account_info and account_info.get("email"):
+            try:
+                from cookiauto import db_update_account_cookies
+                import json
+                # Chuyển dict → list of cookie objects (format DB)
+                cookies_list = [{"name": k, "value": v, "domain": ".google.com"} for k, v in new_cookies.items()]
+                db_update_account_cookies(account_info["email"], json.dumps(cookies_list))
+                print(f"  ✅ [Apply] Đã update cookies mới vào DB cho {account_info['email']}")
+            except Exception as e:
+                print(f"  ⚠️ [Apply] Lỗi update DB: {e}")
+        
+        # 7. Đăng ký lại account info cho cookie_hash mới (nếu hash thay đổi)
+        if new_hash != cookie_hash and account_info:
+            LabsFlowClient._cookie_account_info[new_hash] = account_info
+            # Giữ cả mapping cũ để tránh mất reference
+        
+        print(f"  ✅ [Apply] Đã áp dụng cookies mới hoàn tất")
+    
+    def _headless_relogin(self, email: str, password: str, profile_path: str) -> Optional[Dict[str, str]]:
+        """Headless re-login để lấy cookie mới - KHÔNG cần user thao tác.
+        
+        Sử dụng Playwright persistent context với profile đã có để:
+        1. Mở browser headless
+        2. Navigate đến Google Labs
+        3. Nếu cần login → tự động nhập email/password
+        4. Lấy cookies mới
+        
+        Returns:
+            Dict cookies mới hoặc None nếu thất bại
+        """
+        from pathlib import Path
+        
+        print(f"  🔐 [Headless Login] Bắt đầu re-login cho {email}...")
+        
+        try:
+            from playwright.sync_api import sync_playwright
+            
+            profile_dir = Path(profile_path)
+            profile_dir.mkdir(parents=True, exist_ok=True)
+            
+            with sync_playwright() as p:
+                # Mở browser headless với profile
+                context = p.chromium.launch_persistent_context(
+                    user_data_dir=str(profile_dir),
+                    headless=True,
+                    channel="chrome",
+                    args=[
+                        '--no-first-run',
+                        '--no-default-browser-check',
+                        '--disable-blink-features=AutomationControlled',
+                        '--disable-extensions',
+                        '--disable-infobars',
+                        '--disable-sync',
+                    ],
+                    viewport={"width": 1280, "height": 720},
+                )
+                
+                try:
+                    page = context.pages[0] if context.pages else context.new_page()
+                    
+                    # Navigate đến Google Labs
+                    print(f"  🌍 [Headless Login] Đang vào Google Labs...")
+                    try:
+                        page.goto("https://labs.google/fx/tools/flow", wait_until="domcontentloaded", timeout=30000)
+                    except Exception:
+                        pass  # Timeout OK, tiếp tục
+                    time.sleep(3)
+                    
+                    # Kiểm tra xem đã login chưa bằng cách check cookies
+                    cookies = context.cookies()
+                    session_cookies = [c for c in cookies if c.get("name") == "__Secure-next-auth.session-token" and "labs.google" in c.get("domain", "")]
+                    
+                    if session_cookies:
+                        print(f"  ✅ [Headless Login] Đã có session token - không cần login lại")
+                    else:
+                        # Cần login - navigate đến Google signin
+                        print(f"  🔐 [Headless Login] Chưa có session - bắt đầu login...")
+                        
+                        # Thử click Sign In trên Labs page
+                        try:
+                            page.evaluate("""
+                                () => {
+                                    const elements = document.querySelectorAll('button, a, [role="button"]');
+                                    for (const el of elements) {
+                                        const text = (el.innerText || '').toLowerCase();
+                                        if (text.includes('sign in') || text.includes('đăng nhập')) {
+                                            el.click(); return true;
+                                        }
+                                    }
+                                    return false;
+                                }
+                            """)
+                            time.sleep(3)
+                        except Exception:
+                            pass
+                        
+                        # Nếu vẫn chưa ở trang login, navigate trực tiếp
+                        if "accounts.google.com" not in page.url:
+                            page.goto("https://accounts.google.com/signin", wait_until="networkidle", timeout=30000)
+                            time.sleep(3)
+                        
+                        # Kiểm tra nếu đã login sẵn (redirect về myaccount)
+                        if "myaccount.google.com" in page.url or "accounts.google.com/b/" in page.url:
+                            print(f"  ✅ [Headless Login] Đã login sẵn trong profile")
+                        else:
+                            # Nhập email
+                            print(f"  📧 [Headless Login] Nhập email: {email}...")
+                            try:
+                                page.wait_for_selector('input[type="email"]', state="visible", timeout=10000)
+                                time.sleep(0.5)
+                                page.fill('input[type="email"]', email)
+                                page.click("#identifierNext")
+                                time.sleep(4)
+                            except Exception as e:
+                                print(f"  ⚠️ [Headless Login] Email step failed: {e}")
+                                return None
+                            
+                            # Nhập password
+                            print(f"  🔑 [Headless Login] Nhập password...")
+                            try:
+                                page.wait_for_selector('input[type="password"]', state="visible", timeout=15000)
+                                time.sleep(1)
+                                page.fill('input[type="password"]', password)
+                                time.sleep(0.5)
+                                page.click("#passwordNext")
+                                time.sleep(5)
+                            except Exception as e:
+                                print(f"  ⚠️ [Headless Login] Password step failed: {e}")
+                                return None
+                            
+                            # Kiểm tra captcha/2FA - nếu có thì fail (headless không giải được)
+                            page_text = page.evaluate("() => document.body.innerText.toLowerCase()")
+                            captcha_indicators = ["challenge", "captcha", "recaptcha", "verify", "unusual activity"]
+                            if any(ind in page_text for ind in captcha_indicators):
+                                print(f"  ⚠️ [Headless Login] Phát hiện captcha/2FA - không thể tự động giải")
+                                print(f"  💡 Tip: Mở tool Cookie để login thủ công 1 lần, sau đó auto-renew sẽ hoạt động")
+                                return None
+                            
+                            # Kiểm tra login thành công
+                            if "myaccount.google.com" not in page.url and "accounts.google.com/b/" not in page.url:
+                                # Đợi thêm
+                                time.sleep(5)
+                                if "myaccount.google.com" not in page.url and "accounts.google.com/b/" not in page.url:
+                                    print(f"  ⚠️ [Headless Login] Login có thể chưa thành công, URL: {page.url[:80]}")
+                                    # Vẫn tiếp tục thử lấy cookies
+                        
+                        # Sau khi login, navigate lại Labs để lấy session cookie
+                        print(f"  🌍 [Headless Login] Navigate lại Labs để lấy session cookie...")
+                        try:
+                            page.goto("https://labs.google/fx/tools/flow", wait_until="domcontentloaded", timeout=30000)
+                        except Exception:
+                            pass
+                        time.sleep(5)
+                        
+                        # Click "Create with Flow" nếu có
+                        try:
+                            page.evaluate("""
+                                () => {
+                                    const buttons = document.querySelectorAll('button, a, div[role="button"]');
+                                    for (const btn of buttons) {
+                                        const text = (btn.innerText || '').trim().toLowerCase();
+                                        if (text.includes('create with flow') || text === 'create') {
+                                            btn.click(); return true;
+                                        }
+                                    }
+                                    return false;
+                                }
+                            """)
+                            time.sleep(5)
+                        except Exception:
+                            pass
+                    
+                    # Lấy tất cả cookies
+                    all_cookies = context.cookies()
+                    
+                    # Filter cookies cho Google domains
+                    google_cookies: Dict[str, str] = {}
+                    has_session = False
+                    for cookie in all_cookies:
+                        domain = cookie.get("domain", "")
+                        if "google" in domain or "youtube" in domain:
+                            google_cookies[cookie["name"]] = cookie["value"]
+                            if cookie["name"] == "__Secure-next-auth.session-token":
+                                has_session = True
+                    
+                    page.close()
+                    
+                    if has_session and google_cookies:
+                        print(f"  ✅ [Headless Login] Đã lấy {len(google_cookies)} cookies (có session token)")
+                        return google_cookies
+                    elif google_cookies:
+                        print(f"  ⚠️ [Headless Login] Có {len(google_cookies)} cookies nhưng KHÔNG có session token")
+                        # Vẫn trả về cookies, _verify_new_cookies sẽ kiểm tra
+                        return google_cookies
+                    else:
+                        print(f"  ❌ [Headless Login] Không lấy được cookies")
+                        return None
+                        
+                finally:
+                    try:
+                        context.close()
+                    except Exception:
+                        pass
+                    
+        except Exception as e:
+            print(f"  ❌ [Headless Login] Lỗi: {e}")
+            import traceback
+            print(traceback.format_exc())
+            return None
+    
     def _reset_browser_context_for_cookie(self, new_cookies: Optional[Dict[str, str]] = None) -> bool:
         """
         Reset BrowserContext cho cookie này:
@@ -1347,13 +2106,14 @@ class LabsFlowClient:
         """
         Xử lý lỗi 403 và reset BrowserContext nếu cần.
         
-        SMART FLOW (đơn giản & hiệu quả):
+        SMART FLOW (hỗ trợ proxy per-account):
         1. Tăng counter lỗi
         2. Nếu đạt ngưỡng (3 lần 403 liên tiếp):
-           a. Đóng BrowserContext của cookie đó
-           b. Lấy cookie MỚI từ profile (headless) - không ảnh hưởng cookie khác
-           c. Thử lại với cookie mới + NO PROXY trước
-           d. Nếu vẫn 403 → áp dụng proxy từ pool (nếu có)
+           a. Clear session + cookies cũ
+           b. Lấy proxy config từ account (hỗ trợ static/rotating/warp/tor)
+           c. Áp dụng proxy vào session
+           d. Re-login lấy cookie mới (qua Chrome CDP với proxy)
+           e. Reset BrowserContext
         
         Args:
             error_code: HTTP error code (400, 403, 429, 500)
@@ -1373,69 +2133,106 @@ class LabsFlowClient:
             return False
         
         # ═══════════════════════════════════════════════════════════════════
-        # ✅ SMART 403 HANDLING - Đơn giản & Hiệu quả
+        # ✅ SMART 403 HANDLING - Clear session + proxy + re-login
         # ═══════════════════════════════════════════════════════════════════
         
         print(f"  🔄 [Smart 403] Bắt đầu xử lý 403 cho cookie {cookie_hash[:8]}...")
         
-        # Bước 1: Kiểm tra cookie có đang dùng proxy không
-        is_using_proxy = LabsFlowClient._cookie_using_proxy.get(cookie_hash, False)
+        # Bước 1: Clear session hiện tại
+        print(f"  🧹 [Smart 403] Clear session + cookies cũ...")
+        self._remove_proxy_from_session()
+        self.session.cookies.clear()
         
-        # Bước 2: Lấy cookie mới từ profile (nếu có)
+        # Bước 2: Lấy proxy config từ account (per-account proxy)
+        account_info = LabsFlowClient._cookie_account_info.get(cookie_hash)
+        account_proxy_config = None
+        
+        if account_info:
+            email = account_info.get("email", "")
+            if email:
+                try:
+                    from cookiauto import db_get_account_proxy_config
+                    account_proxy_config = db_get_account_proxy_config(email)
+                    if account_proxy_config:
+                        print(f"  🌐 [Smart 403] Tìm thấy proxy config cho {email}: type={account_proxy_config.get('proxy_type', account_proxy_config.get('server', 'N/A'))}")
+                except Exception as e:
+                    print(f"  ⚠️ [Smart 403] Lỗi load proxy config: {e}")
+        
+        # Bước 3: Áp dụng proxy vào session (nếu có)
+        should_use_proxy = False
+        new_proxy = None
+        
+        if account_proxy_config:
+            proxy_type = account_proxy_config.get("proxy_type", "")
+            if proxy_type and proxy_type != "none":
+                # New ProxyConfig format (static/rotating/warp/tor)
+                self._apply_proxy_to_session(account_proxy_config)
+                should_use_proxy = True
+                new_proxy = account_proxy_config
+                LabsFlowClient._cookie_using_proxy[cookie_hash] = True
+            elif account_proxy_config.get("server"):
+                # Legacy format
+                self._apply_proxy_to_session(account_proxy_config)
+                should_use_proxy = True
+                new_proxy = account_proxy_config
+                LabsFlowClient._cookie_using_proxy[cookie_hash] = True
+        
+        # Nếu không có per-account proxy → thử proxy pool
+        if not should_use_proxy:
+            is_using_proxy = LabsFlowClient._cookie_using_proxy.get(cookie_hash, False)
+            if not is_using_proxy:
+                print(f"  ℹ️ [Smart 403] Thử lại với cookie mới + NO PROXY trước")
+                LabsFlowClient._cookie_using_proxy[cookie_hash] = True
+            else:
+                if LabsFlowClient._use_proxy_pool and LabsFlowClient._proxy_pool:
+                    new_proxy = LabsFlowClient._rotate_proxy_for_cookie(cookie_hash)
+                    if new_proxy:
+                        should_use_proxy = True
+                        self._apply_proxy_to_session(new_proxy)
+                        print(f"  🌐 [Smart 403] Áp dụng proxy pool: {new_proxy.get('server', 'unknown')}")
+                    else:
+                        print(f"  ⚠️ [Smart 403] Không có proxy khả dụng trong pool")
+                else:
+                    print(f"  ⚠️ [Smart 403] Proxy pool rỗng hoặc đã tắt")
+        
+        # Bước 4: Lấy cookie mới (re-login với proxy nếu có)
         cookie_source = self._get_cookie_source()
         new_cookies = None
         
         if cookie_source == "profile":
-            print(f"  🔄 [Smart 403] Đang lấy cookie mới từ profile (headless)...")
+            print(f"  🔄 [Smart 403] Đang lấy cookie mới từ profile...")
             new_cookies = self._refresh_cookies_from_profile()
-            
             if new_cookies:
                 print(f"  ✅ [Smart 403] Đã lấy được cookie mới từ profile")
             else:
-                print(f"  ⚠️ [Smart 403] Không lấy được cookie mới, sẽ dùng cookie cũ")
+                print(f"  ⚠️ [Smart 403] Không lấy được cookie mới từ profile")
+                # Thử re-login
+                if account_info and account_info.get("email") and account_info.get("password"):
+                    email = account_info["email"]
+                    password = account_info["password"]
+                    profile_path = account_info.get("profile_path", self._get_profile_path_for_cookie() or "")
+                    print(f"  🔐 [Smart 403] Thử re-login cho {email}...")
+                    new_cookies = self._headless_relogin(email, password, profile_path)
+                    if new_cookies:
+                        print(f"  ✅ [Smart 403] Re-login thành công, có cookie mới")
+                    else:
+                        print(f"  ⚠️ [Smart 403] Re-login thất bại")
         else:
             print(f"  ℹ️ [Smart 403] Cookie là import, không thể lấy cookie mới")
         
-        # Bước 3: Quyết định có dùng proxy không
-        # ✅ QUAN TRỌNG: Proxy chỉ áp dụng cho API HTTP calls (requests.Session),
-        # KHÔNG áp dụng cho BrowserContext (Playwright navigation bị timeout qua proxy)
-        should_use_proxy = False
-        new_proxy = None
-        
-        if not is_using_proxy:
-            # Lần đầu bị 403 liên tiếp → thử NO PROXY trước
-            # ✅ Set flag = True để lần 403 tiếp theo sẽ escalate lên dùng proxy
-            print(f"  ℹ️ [Smart 403] Thử lại với cookie mới + NO PROXY trước")
-            LabsFlowClient._cookie_using_proxy[cookie_hash] = True  # Đánh dấu "đã thử NO PROXY"
-            self._remove_proxy_from_session()
-        else:
-            # Đã thử NO PROXY rồi mà vẫn 403 → dùng proxy cho API calls
-            if LabsFlowClient._use_proxy_pool and LabsFlowClient._proxy_pool:
-                new_proxy = LabsFlowClient._rotate_proxy_for_cookie(cookie_hash)
-                if new_proxy:
-                    should_use_proxy = True
-                    LabsFlowClient._cookie_using_proxy[cookie_hash] = True
-                    print(f"  🌐 [Smart 403] Áp dụng proxy cho API calls: {new_proxy.get('server', 'unknown')}")
-                else:
-                    print(f"  ⚠️ [Smart 403] Không có proxy khả dụng trong pool")
-            else:
-                print(f"  ⚠️ [Smart 403] Proxy pool rỗng hoặc đã tắt")
-        
-        # Bước 4: Reset BrowserContext (để lấy reCAPTCHA token mới)
-        # ✅ BrowserContext luôn KHÔNG dùng proxy (direct connection)
+        # Bước 5: Reset BrowserContext
         reset_success = self._reset_browser_context_for_cookie(new_cookies)
         
         if reset_success:
-            # ✅ Áp dụng proxy vào requests.Session (cho API calls)
-            # KHÔNG áp dụng vào BrowserContext (Playwright navigation)
             if should_use_proxy and new_proxy:
                 self.proxy_config = new_proxy
-                self._apply_proxy_to_session(new_proxy)
             else:
                 self.proxy_config = None
                 self._remove_proxy_from_session()
             
-            print(f"  ✅ [Smart 403] Đã reset BrowserContext + {'proxy ON' if should_use_proxy else 'NO proxy'}, sẽ retry request")
+            proxy_info = "proxy ON" if should_use_proxy else "NO proxy"
+            cookie_info = "cookie MỚI" if new_cookies else "cookie cũ"
+            print(f"  ✅ [Smart 403] Đã reset: {cookie_info} + {proxy_info}, sẽ retry request")
             return True
         else:
             print(f"  ❌ [Smart 403] Không thể reset BrowserContext")
@@ -1469,20 +2266,21 @@ class LabsFlowClient:
             "origin": "https://labs.google",
             "priority": "u=1, i",
             "referer": "https://labs.google/",
-            "sec-ch-ua": _env("SEC_CH_UA", '"Not;A=Brand";v="99", "Google Chrome";v="139", "Chromium";v="139"'),
+            "sec-ch-ua": _env("SEC_CH_UA", '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"'),
             "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": _env("SEC_CH_UA_PLATFORM", '"Windows"'),
+            "sec-ch-ua-platform": _env("SEC_CH_UA_PLATFORM", '"macOS"'),
             "sec-fetch-dest": "empty",
             "sec-fetch-mode": "cors",
             "sec-fetch-site": "cross-site",
-            "user-agent": self.user_agent,
+            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
             "x-browser-channel": _env("X_BROWSER_CHANNEL", "stable"),
             "x-browser-copyright": _env(
                 "X_BROWSER_COPYRIGHT",
-                "Copyright 2025 Google LLC. All rights reserved.",
+                "Copyright 2026 Google LLC. All Rights reserved.",
             ),
-            "x-browser-year": _env("X_BROWSER_YEAR", "2025"),
-            "x-client-data": _env("X_CLIENT_DATA", "CI62yQEIo7bJAQipncoBCPbrygEIlaHLAQjGo8sBCIWgzQEIxIPPARjh4s4B"),
+            "x-browser-year": _env("X_BROWSER_YEAR", "2026"),
+            "x-client-data": _env("X_CLIENT_DATA", "CIq2yQEIprbJAQipncoBCNDiygEIlaHLAQiGoM0BGLGKzwEY57HPAQ=="),
+            "x-browser-validation": "lYo6cDWNH/3Bt+JG4mYU+Q3kh6s=",
         }
         # Optional validation header if you have one
         x_validation = _env("X_BROWSER_VALIDATION")
@@ -2385,81 +3183,244 @@ class LabsFlowClient:
     
     @classmethod
     def _check_zendriver_available(cls) -> bool:
-        """Kiểm tra zendriver có cài đặt không."""
-        try:
-            import zendriver
-            cls._zendriver_available = True
+        """Kiểm tra Chrome CDP có sẵn không (tìm Chrome binary)."""
+        chrome_path = cls._find_chrome_binary()
+        if chrome_path:
+            cls._zendriver_available = True  # compat flag
+            cls._chrome_cdp_available = True
             return True
-        except ImportError:
-            cls._zendriver_available = False
-            return False
+        cls._zendriver_available = False
+        cls._chrome_cdp_available = False
+        return False
     
     @classmethod
-    def _ensure_zendriver_worker(cls):
-        """Khởi động zendriver worker thread với asyncio event loop riêng."""
-        if cls._zendriver_started:
-            return
+    def _find_chrome_binary(cls) -> Optional[str]:
+        """Tìm Chrome binary trên hệ thống."""
+        import platform
+        import shutil
         
-        with cls._zendriver_lock:
-            if cls._zendriver_started:
+        system = platform.system()
+        candidates = []
+        
+        if system == "Darwin":  # macOS
+            candidates = [
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                "/Applications/Chromium.app/Contents/MacOS/Chromium",
+                os.path.expanduser("~/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+            ]
+        elif system == "Windows":
+            candidates = [
+                os.path.expandvars(r"%ProgramFiles%\Google\Chrome\Application\chrome.exe"),
+                os.path.expandvars(r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"),
+                os.path.expandvars(r"%LocalAppData%\Google\Chrome\Application\chrome.exe"),
+            ]
+        else:  # Linux
+            candidates = [
+                "/usr/bin/google-chrome",
+                "/usr/bin/google-chrome-stable",
+                "/usr/bin/chromium-browser",
+                "/usr/bin/chromium",
+            ]
+        
+        for path in candidates:
+            if os.path.isfile(path):
+                return path
+        
+        # Fallback: tìm trong PATH
+        for name in ["google-chrome", "google-chrome-stable", "chromium-browser", "chromium", "chrome"]:
+            found = shutil.which(name)
+            if found:
+                return found
+        
+        return None
+    
+    @classmethod
+    def _ensure_zendriver_worker(cls, profile_path: str = None):
+        """Khởi động Chrome thật với --remote-debugging-port cho CDP.
+        
+        Nếu có profile_path (profile đã đăng nhập), sẽ copy profile vào temp dir
+        để Chrome mở với session đã đăng nhập (tránh bị redirect to login).
+        """
+        # ✅ Nếu profile_path thay đổi so với lần trước, cần restart Chrome
+        current_profile = getattr(cls, '_chrome_cdp_current_profile', None)
+        if profile_path and current_profile != profile_path and cls._chrome_cdp_started:
+            print(f"  🔄 [Chrome CDP] Profile thay đổi ({current_profile} → {profile_path}), restart Chrome...")
+            cls._cleanup_chrome_cdp()
+        
+        if cls._chrome_cdp_started:
+            # Verify Chrome process vẫn đang chạy
+            if cls._chrome_cdp_process and cls._chrome_cdp_process.poll() is None:
+                return
+            # Process đã chết, reset
+            cls._chrome_cdp_started = False
+            cls._chrome_cdp_process = None
+        
+        with cls._chrome_cdp_lock:
+            if cls._chrome_cdp_started and cls._chrome_cdp_process and cls._chrome_cdp_process.poll() is None:
                 return
             
-            if not cls._check_zendriver_available():
-                print("  ⚠️ [Zendriver] Chưa cài đặt zendriver. pip install zendriver")
+            # ✅ Kiểm tra xem có Chrome CDP nào đang chạy sẵn trên port mặc định không
+            # (từ session trước chưa cleanup, hoặc user tự chạy)
+            port = cls._chrome_cdp_port
+            try:
+                resp = requests.get(f"http://127.0.0.1:{port}/json/version", timeout=2)
+                if resp.status_code == 200:
+                    version_info = resp.json()
+                    print(f"  ✅ [Chrome CDP] Reuse Chrome đang chạy trên port {port}: {version_info.get('Browser', 'unknown')}")
+                    cls._chrome_cdp_started = True
+                    cls._chrome_cdp_process = None  # Không quản lý process (external)
+                    # Chỉ return nếu profile hiện tại đã match
+                    if not profile_path or getattr(cls, '_chrome_cdp_current_profile', None) == profile_path:
+                        return
+                    print(f"  🔄 [Chrome CDP] Profile thay đổi, cần khởi động lại...")
+                    cls._cleanup_chrome_cdp()
+            except Exception:
+                pass
+            
+            chrome_path = cls._find_chrome_binary()
+            if not chrome_path:
+                print("  ⚠️ [Chrome CDP] Không tìm thấy Chrome binary")
                 return
             
-            cls._zendriver_started = True
+            import subprocess
+            import tempfile
             
-            def zendriver_loop():
-                """Thread chạy asyncio event loop cho zendriver."""
-                import asyncio
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                cls._zendriver_loop = loop
-                print("  🚀 [Zendriver] Worker thread started (asyncio event loop)")
-                
-                async def init_browser():
-                    import zendriver as zd
-                    config = zd.Config()
-                    config.headless = False  # HEADED mode - tránh 403
-                    config.add_argument("--no-first-run")
-                    config.add_argument("--no-default-browser-check")
-                    config.add_argument("--disable-infobars")
-                    # Off-screen window
-                    config.add_argument("--window-position=-3000,-3000")
-                    config.add_argument("--window-size=400,300")
+            # ✅ Dùng profile thật (copy) nếu có, fallback temp dir trống
+            current_data_dir = getattr(cls, '_chrome_cdp_user_data_dir', None)
+            current_profile_saved = getattr(cls, '_chrome_cdp_current_profile', None)
+            
+            need_new_dir = (
+                current_data_dir is None
+                or (profile_path and current_profile_saved != profile_path and current_profile_saved is None)
+            )
+
+            if need_new_dir:
+                if current_data_dir and current_profile_saved is None:
+                    import shutil
+                    try:
+                        shutil.rmtree(current_data_dir, ignore_errors=True)
+                    except Exception:
+                        pass
+                    cls._chrome_cdp_user_data_dir = None
                     
-                    browser = await zd.start(config)
-                    cls._zendriver_browser = browser
-                    print("  ✅ [Zendriver] Browser launched (headed, off-screen)")
-                    return browser
-                
+                if profile_path and os.path.exists(profile_path):
+                    # Copy profile thật vào temp dir để không lock profile gốc
+                    import shutil
+                    temp_dir = tempfile.mkdtemp(prefix="chrome_cdp_profile_")
+                    try:
+                        # Copy toàn bộ profile (bao gồm cookies, localStorage, etc.)
+                        shutil.copytree(profile_path, temp_dir, dirs_exist_ok=True)
+                        # Xóa lock files để Chrome có thể mở
+                        for lock_file in ["SingletonLock", "SingletonSocket", "SingletonCookie"]:
+                            lock_path = os.path.join(temp_dir, lock_file)
+                            if os.path.exists(lock_path):
+                                try:
+                                    os.remove(lock_path)
+                                except Exception:
+                                    pass
+                        cls._chrome_cdp_user_data_dir = temp_dir
+                        cls._chrome_cdp_current_profile = profile_path
+                        print(f"  📂 [Chrome CDP] Dùng profile thật (copy): {profile_path}")
+                    except Exception as e:
+                        print(f"  ⚠️ [Chrome CDP] Không copy được profile: {e}, dùng temp dir trống")
+                        cls._chrome_cdp_user_data_dir = tempfile.mkdtemp(prefix="chrome_cdp_recaptcha_")
+                        cls._chrome_cdp_current_profile = None
+                else:
+                    cls._chrome_cdp_user_data_dir = tempfile.mkdtemp(prefix="chrome_cdp_recaptcha_")
+                    cls._chrome_cdp_current_profile = None
+                    if profile_path:
+                        print(f"  ⚠️ [Chrome CDP] Profile path không tồn tại: {profile_path}, dùng temp dir trống")
+            
+            # Tìm port trống (bắt đầu từ port hiện tại)
+            import socket
+            for try_port in range(port, port + 20):
                 try:
-                    loop.run_until_complete(init_browser())
-                    # Keep loop running forever (for run_coroutine_threadsafe)
-                    loop.run_forever()
-                except Exception as e:
-                    print(f"  ❌ [Zendriver] Worker error: {e}")
-                    cls._zendriver_started = False
-                    cls._zendriver_browser = None
-                finally:
-                    loop.close()
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(0.5)
+                    result = sock.connect_ex(('127.0.0.1', try_port))
+                    sock.close()
+                    if result != 0:  # Port trống
+                        port = try_port
+                        break
+                except Exception:
+                    pass
+            cls._chrome_cdp_port = port
             
-            thread = threading.Thread(target=zendriver_loop, daemon=True, name="Zendriver-Worker")
-            cls._zendriver_thread = thread
-            thread.start()
+            chrome_args = [
+                chrome_path,
+                f"--remote-debugging-port={port}",
+                f"--user-data-dir={cls._chrome_cdp_user_data_dir}",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-default-apps",
+                "--disable-extensions",
+                "--disable-sync",
+                "--disable-translate",
+                "--disable-background-networking",
+                "--disable-popup-blocking",
+                "--metrics-recording-only",
+                "--no-service-autorun",
+                # Off-screen window
+                "--window-position=-3000,-3000",
+                "--window-size=400,300",
+            ]
             
-            # Đợi browser sẵn sàng
-            wait_start = time.time()
-            while cls._zendriver_browser is None and cls._zendriver_started:
-                if time.time() - wait_start > 20:
-                    print("  ⚠️ [Zendriver] Timeout khởi tạo browser")
-                    break
-                time.sleep(0.2)
+            try:
+                proc = subprocess.Popen(
+                    chrome_args,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                cls._chrome_cdp_process = proc
+                cls._chrome_cdp_started = True
+                print(f"  🚀 [Chrome CDP] Chrome launched (PID={proc.pid}, port={port})")
+                
+                # Đợi Chrome sẵn sàng (CDP endpoint)
+                wait_start = time.time()
+                while time.time() - wait_start < 15:
+                    try:
+                        resp = requests.get(f"http://127.0.0.1:{port}/json/version", timeout=2)
+                        if resp.status_code == 200:
+                            version_info = resp.json()
+                            print(f"  ✅ [Chrome CDP] Chrome sẵn sàng: {version_info.get('Browser', 'unknown')}")
+                            return
+                    except Exception:
+                        pass
+                    time.sleep(0.3)
+                
+                print("  ⚠️ [Chrome CDP] Timeout chờ Chrome khởi động")
+                
+            except Exception as e:
+                print(f"  ❌ [Chrome CDP] Lỗi launch Chrome: {e}")
+                cls._chrome_cdp_started = False
+                cls._chrome_cdp_process = None
     
     @classmethod
     def _zendriver_reset_page(cls, cookie_hash: str):
-        """Reset page cho cookie (khi cần re-inject cookies)."""
+        """Reset page/tab cho cookie (khi cần re-inject cookies)."""
+        # ✅ Close persistent WebSocket connection
+        old_ws = cls._chrome_cdp_ws_conns.pop(cookie_hash, None)
+        if old_ws:
+            try:
+                old_ws.close()
+            except Exception:
+                pass
+        cls._chrome_cdp_ws_msg_ids.pop(cookie_hash, None)
+        cls._chrome_cdp_page_ready.pop(cookie_hash, None)
+        
+        # ✅ Close CDP tab nếu có
+        tab_id = cls._chrome_cdp_tab_ids.pop(cookie_hash, None)
+        if tab_id and cls._chrome_cdp_started:
+            try:
+                requests.get(
+                    f"http://127.0.0.1:{cls._chrome_cdp_port}/json/close/{tab_id}",
+                    timeout=3,
+                )
+            except Exception:
+                pass
+        cls._chrome_cdp_pages.pop(cookie_hash, None)
+        cls._chrome_cdp_cookies_injected.pop(cookie_hash, None)
+        # Compat: clear zendriver caches too
         cls._zendriver_pages.pop(cookie_hash, None)
         cls._zendriver_cookies_injected.pop(cookie_hash, None)
     
@@ -2469,107 +3430,259 @@ class LabsFlowClient:
         recaptcha_action: str = "VIDEO_GENERATION",
     ) -> Optional[str]:
         """
-        Lấy reCAPTCHA token qua zendriver (headed, off-screen).
-        Sync wrapper → bridge vào asyncio event loop của zendriver worker.
-        """
-        import asyncio
+        Lấy reCAPTCHA token qua Chrome thật + CDP protocol.
+        Chrome thật cho trust score cao hơn zendriver/playwright.
         
+        ✅ Improvements:
+        - Persistent WebSocket connection (không open/close mỗi lần)
+        - Không reload page nếu đã load sẵn → execute grecaptcha trực tiếp
+        - Dùng GET thay PUT cho /json/new (đúng Chrome DevTools spec)
+        - Robust cdp_send với per-command timeout
+        - Auto-recovery khi WebSocket bị stale
+        """
         cookie_hash = self._cookie_hash
         
-        # Đảm bảo worker đã khởi động
-        LabsFlowClient._ensure_zendriver_worker()
+        # Đảm bảo Chrome đã khởi động - truyền profile_path nếu có
+        profile_path = self._get_profile_path_for_cookie()
+        LabsFlowClient._ensure_zendriver_worker(profile_path=profile_path)
         
-        if not LabsFlowClient._zendriver_browser or not LabsFlowClient._zendriver_loop:
-            print("  ⚠️ [Zendriver] Browser chưa sẵn sàng")
+        if not LabsFlowClient._chrome_cdp_started:
+            print("  ⚠️ [Chrome CDP] Chrome chưa sẵn sàng")
             return None
         
-        async def _fetch_token():
-            import zendriver as zd
-            import zendriver.cdp.runtime as cdp_runtime
+        port = LabsFlowClient._chrome_cdp_port
+        SITE_KEY = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV"
+        TARGET_URL = "https://labs.google/fx/tools/flow"
+        
+        def _create_new_tab() -> Optional[tuple]:
+            """Tạo tab mới, trả về (ws_url, tab_id) hoặc None."""
+            # Chrome DevTools Protocol dùng GET (hoặc PUT) cho /json/new
+            # Thử GET trước (phổ biến hơn), fallback PUT
+            for method_fn in [requests.get, requests.put]:
+                try:
+                    resp = method_fn(
+                        f"http://127.0.0.1:{port}/json/new?about:blank",
+                        timeout=5,
+                    )
+                    if resp.status_code == 200:
+                        tab_info = resp.json()
+                        ws = tab_info.get("webSocketDebuggerUrl")
+                        tid = tab_info.get("id")
+                        if ws:
+                            return (ws, tid)
+                except Exception:
+                    continue
+            return None
+        
+        def _get_or_create_ws(ws_url: str) -> Optional[Any]:
+            """Lấy persistent WS connection hoặc tạo mới."""
+            import websockets.sync.client as ws_sync
             
-            browser = LabsFlowClient._zendriver_browser
-            SITE_KEY = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV"
-            TARGET_URL = "https://labs.google/fx/tools/flow"
-            
-            # Lấy hoặc tạo page cho cookie này
-            page = LabsFlowClient._zendriver_pages.get(cookie_hash)
-            need_navigate = False
-            
-            if page is None:
-                # Tạo page mới
-                page = await browser.get("https://labs.google")
-                await page.sleep(1)
-                LabsFlowClient._zendriver_pages[cookie_hash] = page
-                LabsFlowClient._zendriver_cookies_injected[cookie_hash] = False
-                need_navigate = True
-            
-            # Inject cookies nếu chưa
-            if not LabsFlowClient._zendriver_cookies_injected.get(cookie_hash, False):
-                for name, value in self.cookies.items():
+            existing = LabsFlowClient._chrome_cdp_ws_conns.get(cookie_hash)
+            if existing is not None:
+                # Kiểm tra connection còn sống không
+                try:
+                    existing.ping()
+                    return existing
+                except Exception:
+                    # Connection đã chết, cleanup
                     try:
-                        await page.send(zd.cdp.network.set_cookie(
-                            name=name,
-                            value=value,
-                            domain="labs.google",
-                            path="/",
-                            secure=True,
-                            http_only=True,
-                        ))
+                        existing.close()
                     except Exception:
                         pass
-                LabsFlowClient._zendriver_cookies_injected[cookie_hash] = True
+                    LabsFlowClient._chrome_cdp_ws_conns.pop(cookie_hash, None)
+            
+            # Tạo connection mới
+            try:
+                conn = ws_sync.connect(ws_url, close_timeout=5, open_timeout=10)
+                LabsFlowClient._chrome_cdp_ws_conns[cookie_hash] = conn
+                LabsFlowClient._chrome_cdp_ws_msg_ids[cookie_hash] = 1
+                return conn
+            except Exception as e:
+                print(f"  ⚠️ [Chrome CDP] WS connect failed: {e}")
+                return None
+        
+        def _cdp_send(ws, method: str, params: dict = None, cmd_timeout: float = 30) -> dict:
+            """Gửi CDP command và nhận response. Per-command timeout."""
+            msg_id = LabsFlowClient._chrome_cdp_ws_msg_ids.get(cookie_hash, 1)
+            payload = {"id": msg_id, "method": method}
+            if params:
+                payload["params"] = params
+            LabsFlowClient._chrome_cdp_ws_msg_ids[cookie_hash] = msg_id + 1
+            
+            ws.send(json.dumps(payload))
+            
+            # Đọc response (bỏ qua CDP events, chỉ lấy response có id match)
+            deadline = time.time() + cmd_timeout
+            while time.time() < deadline:
+                remaining = max(0.1, deadline - time.time())
+                try:
+                    raw = ws.recv(timeout=remaining)
+                except TimeoutError:
+                    break
+                except Exception:
+                    break
+                data = json.loads(raw)
+                if data.get("id") == msg_id:
+                    if "error" in data:
+                        err = data["error"]
+                        print(f"  ⚠️ [CDP] {method} error: {err.get('message', err)}")
+                    return data
+            return {}
+        
+        try:
+            # ═══ Bước 1: Lấy hoặc tạo tab cho cookie này ═══
+            ws_url = LabsFlowClient._chrome_cdp_pages.get(cookie_hash)
+            need_navigate = False
+            page_ready = LabsFlowClient._chrome_cdp_page_ready.get(cookie_hash, False)
+            
+            if ws_url is None:
+                result = _create_new_tab()
+                if not result:
+                    print("  ⚠️ [Chrome CDP] Không tạo được tab mới")
+                    return None
+                ws_url, tab_id = result
+                LabsFlowClient._chrome_cdp_pages[cookie_hash] = ws_url
+                LabsFlowClient._chrome_cdp_tab_ids[cookie_hash] = tab_id
+                LabsFlowClient._chrome_cdp_cookies_injected[cookie_hash] = False
+                LabsFlowClient._chrome_cdp_page_ready[cookie_hash] = False
                 need_navigate = True
+                page_ready = False
+                print(f"  📄 [Chrome CDP] Tạo tab mới cho cookie {cookie_hash[:8]}...")
             
-            # Navigate hoặc reload
-            if need_navigate:
-                page = await browser.get(TARGET_URL)
-                LabsFlowClient._zendriver_pages[cookie_hash] = page
-                await page.sleep(3)
-            else:
-                # Reload để lấy token mới (không cần navigate lại)
-                try:
-                    await page.reload()
-                    await page.sleep(2)
-                except Exception:
-                    page = await browser.get(TARGET_URL)
-                    LabsFlowClient._zendriver_pages[cookie_hash] = page
-                    await page.sleep(3)
-            
-            # Check URL
-            current_url = page.url or ""
-            if "accounts.google" in current_url or "signin" in current_url.lower():
-                print(f"  ⚠️ [Zendriver] Redirected to login - cookie expired")
+            # ═══ Bước 2: Lấy persistent WebSocket connection ═══
+            ws = _get_or_create_ws(ws_url)
+            if ws is None:
+                # WS connection failed → tab có thể đã bị đóng, tạo lại
+                print("  🔄 [Chrome CDP] WS stale, tạo tab mới...")
                 LabsFlowClient._zendriver_reset_page(cookie_hash)
-                return None
+                LabsFlowClient._chrome_cdp_ws_conns.pop(cookie_hash, None)
+                
+                result = _create_new_tab()
+                if not result:
+                    print("  ⚠️ [Chrome CDP] Không tạo được tab mới (retry)")
+                    return None
+                ws_url, tab_id = result
+                LabsFlowClient._chrome_cdp_pages[cookie_hash] = ws_url
+                LabsFlowClient._chrome_cdp_tab_ids[cookie_hash] = tab_id
+                LabsFlowClient._chrome_cdp_cookies_injected[cookie_hash] = False
+                LabsFlowClient._chrome_cdp_page_ready[cookie_hash] = False
+                need_navigate = True
+                page_ready = False
+                
+                ws = _get_or_create_ws(ws_url)
+                if ws is None:
+                    return None
             
-            # Đợi grecaptcha load
-            start_wait = time.time()
-            gre_mode = None
-            while time.time() - start_wait < timeout_s:
-                try:
-                    resp = await page.send(cdp_runtime.evaluate(
-                        expression="""(() => {
-                            if (typeof window.grecaptcha !== 'undefined') {
-                                if (window.grecaptcha.enterprise && typeof window.grecaptcha.enterprise.execute === 'function') return 'enterprise';
-                                if (typeof window.grecaptcha.execute === 'function') return 'classic';
-                            }
-                            return null;
-                        })()""",
-                        await_promise=False,
-                        return_by_value=True,
-                    ))
-                    if resp and resp[0] and resp[0].value:
-                        gre_mode = resp[0].value
-                        break
-                except Exception:
-                    pass
-                await asyncio.sleep(0.5)
+            # ═══ Bước 3: Inject cookies nếu chưa ═══
+            if not LabsFlowClient._chrome_cdp_cookies_injected.get(cookie_hash, False):
+                _cdp_send(ws, "Network.enable", cmd_timeout=10)
+                
+                # ✅ Inject cookies cho cả .labs.google VÀ .google.com
+                # Google auth cookies (SID, HSID, SSID, etc.) thuộc .google.com
+                # Labs cookies thuộc .labs.google
+                # Cần cả 2 domain để tránh bị redirect to login
+                inject_domains = [".labs.google", ".google.com"]
+                for name, value in self.cookies.items():
+                    for domain in inject_domains:
+                        try:
+                            _cdp_send(ws, "Network.setCookie", {
+                                "name": name,
+                                "value": value,
+                                "domain": domain,
+                                "path": "/",
+                                "secure": True,
+                                "httpOnly": True,
+                            }, cmd_timeout=5)
+                        except Exception:
+                            pass
+                
+                LabsFlowClient._chrome_cdp_cookies_injected[cookie_hash] = True
+                need_navigate = True
+                page_ready = False
+                print(f"  🍪 [Chrome CDP] Đã inject {len(self.cookies)} cookies cho {len(inject_domains)} domains")
             
-            if not gre_mode:
-                print(f"  ⚠️ [Zendriver] grecaptcha not loaded after {time.time()-start_wait:.0f}s")
-                return None
+            # ═══ Bước 4: Navigate nếu cần, KHÔNG reload nếu page đã sẵn sàng ═══
+            if need_navigate:
+                print(f"  🌐 [Chrome CDP] Navigate đến {TARGET_URL}...")
+                _cdp_send(ws, "Page.enable", cmd_timeout=5)
+                _cdp_send(ws, "Page.navigate", {"url": TARGET_URL}, cmd_timeout=15)
+                # Đợi page load bằng cách poll document.readyState
+                start_load = time.time()
+                while time.time() - start_load < 15:
+                    try:
+                        rs = _cdp_send(ws, "Runtime.evaluate", {
+                            "expression": "document.readyState",
+                            "returnByValue": True,
+                        }, cmd_timeout=5)
+                        state = rs.get("result", {}).get("result", {}).get("value", "")
+                        if state in ("complete", "interactive"):
+                            break
+                    except Exception:
+                        pass
+                    time.sleep(0.5)
+                page_ready = False  # Cần check grecaptcha lại
+            elif page_ready:
+                # ✅ Page đã load sẵn, grecaptcha đã có → execute trực tiếp (NHANH)
+                print(f"  ⚡ [Chrome CDP] Page sẵn sàng, execute trực tiếp...")
+            else:
+                # Page chưa ready (lần đầu sau navigate) → cần check grecaptcha
+                pass
             
-            # Execute reCAPTCHA
+            # ═══ Bước 5: Check URL (redirect to login?) ═══
+            try:
+                loc_result = _cdp_send(ws, "Runtime.evaluate", {
+                    "expression": "window.location.href",
+                    "returnByValue": True,
+                }, cmd_timeout=5)
+                current_url = loc_result.get("result", {}).get("result", {}).get("value", "")
+                if "accounts.google" in current_url or "signin" in current_url.lower():
+                    print(f"  ⚠️ [Chrome CDP] Redirected to login - cookie expired")
+                    LabsFlowClient._zendriver_reset_page(cookie_hash)
+                    LabsFlowClient._chrome_cdp_page_ready.pop(cookie_hash, None)
+                    # Close WS connection
+                    LabsFlowClient._chrome_cdp_ws_conns.pop(cookie_hash, None)
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
+                    return None
+            except Exception:
+                pass
+            
+            # ═══ Bước 6: Đợi grecaptcha load (skip nếu page_ready) ═══
+            if not page_ready:
+                print("  ⏳ [Chrome CDP] Đợi grecaptcha load...")
+                start_wait = time.time()
+                gre_loaded = False
+                
+                while time.time() - start_wait < timeout_s:
+                    try:
+                        check_result = _cdp_send(ws, "Runtime.evaluate", {
+                            "expression": """(() => {
+                                if (typeof window.grecaptcha !== 'undefined') {
+                                    if (window.grecaptcha.enterprise && typeof window.grecaptcha.enterprise.execute === 'function') return 'enterprise';
+                                    if (typeof window.grecaptcha.execute === 'function') return 'classic';
+                                }
+                                return null;
+                            })()""",
+                            "returnByValue": True,
+                        }, cmd_timeout=10)
+                        val = check_result.get("result", {}).get("result", {}).get("value")
+                        if val:
+                            gre_loaded = True
+                            print(f"  ✓ [Chrome CDP] grecaptcha sẵn sàng (mode={val}, {time.time()-start_wait:.1f}s)")
+                            break
+                    except Exception:
+                        pass
+                    time.sleep(0.5)
+                
+                if not gre_loaded:
+                    print(f"  ⚠️ [Chrome CDP] grecaptcha not loaded after {time.time()-start_wait:.0f}s")
+                    LabsFlowClient._chrome_cdp_page_ready[cookie_hash] = False
+                    return None
+            
+            # ═══ Bước 7: Execute reCAPTCHA ═══
             exec_js = """(async () => {
                 try {
                     const siteKey = '%s';
@@ -2585,51 +3698,131 @@ class LabsFlowClient:
                 }
             })()""" % (SITE_KEY, recaptcha_action, recaptcha_action)
             
-            exec_resp = await page.send(cdp_runtime.evaluate(
-                expression=exec_js,
-                await_promise=True,
-                return_by_value=True,
-            ))
+            print(f"  🔑 [Chrome CDP] Executing reCAPTCHA (action={recaptcha_action})...")
+            exec_result = _cdp_send(ws, "Runtime.evaluate", {
+                "expression": exec_js,
+                "awaitPromise": True,
+                "returnByValue": True,
+            }, cmd_timeout=30)
             
-            if exec_resp and exec_resp[0]:
-                val = exec_resp[0].value
-                if isinstance(val, str) and not val.startswith("ERROR:") and len(val) > 20:
-                    return val
-                elif isinstance(val, str) and val.startswith("ERROR:"):
-                    print(f"  ⚠️ [Zendriver] reCAPTCHA error: {val[6:]}")
+            val = exec_result.get("result", {}).get("result", {}).get("value")
+            if isinstance(val, str) and not val.startswith("ERROR:") and len(val) > 20:
+                # ✅ Thành công → đánh dấu page_ready để lần sau không cần reload
+                LabsFlowClient._chrome_cdp_page_ready[cookie_hash] = True
+                print(f"  ✅ [Chrome CDP] Token OK (len={len(val)})")
+                return val
+            elif isinstance(val, str) and val.startswith("ERROR:"):
+                print(f"  ⚠️ [Chrome CDP] reCAPTCHA error: {val[6:]}")
+                # Error có thể do page state bị stale → reset page_ready
+                LabsFlowClient._chrome_cdp_page_ready[cookie_hash] = False
+            else:
+                print(f"  ⚠️ [Chrome CDP] Unexpected result: {val}")
+                LabsFlowClient._chrome_cdp_page_ready[cookie_hash] = False
             
             return None
         
-        # Bridge async → sync via zendriver's event loop
-        try:
-            future = asyncio.run_coroutine_threadsafe(
-                _fetch_token(),
-                LabsFlowClient._zendriver_loop,
-            )
-            token = future.result(timeout=timeout_s + 10)
-            if token:
-                print(f"  ✅ [Zendriver] Token OK (len={len(token)})")
-            return token
         except Exception as e:
-            print(f"  ⚠️ [Zendriver] Error: {e}")
+            print(f"  ⚠️ [Chrome CDP] Error: {e}")
+            import traceback
+            traceback.print_exc()
+            # Connection có thể bị hỏng → cleanup WS để lần sau tạo mới
+            old_ws = LabsFlowClient._chrome_cdp_ws_conns.pop(cookie_hash, None)
+            if old_ws:
+                try:
+                    old_ws.close()
+                except Exception:
+                    pass
+            LabsFlowClient._chrome_cdp_page_ready.pop(cookie_hash, None)
             return None
     
     def _record_token_source(self, source: str):
         """Ghi nhận nguồn token vừa dùng."""
         LabsFlowClient._last_token_source[self._cookie_hash] = source
+
+    @staticmethod
+    def calculate_retry_delay(
+        attempt: int,
+        error_code: int,
+        base_delay: float = 1.0,
+        max_delay: float = 60.0,
+        use_jitter: bool = True,
+    ) -> float:
+        """Tính toán retry delay với exponential backoff và jitter.
+        
+        Args:
+            attempt: Số attempt hiện tại (bắt đầu từ 0)
+            error_code: HTTP error code (403, 429, 500, etc.)
+            base_delay: Delay cơ bản (giây)
+            max_delay: Delay tối đa (giây)
+            use_jitter: Có thêm random jitter không
+            
+        Returns:
+            Số giây để đợi trước khi retry
+        """
+        import random
+        
+        # Exponential backoff: base_delay * 2^attempt
+        delay = base_delay * (2 ** attempt)
+        
+        # Điều chỉnh theo loại lỗi
+        if error_code == 429:
+            # Rate limit - đợi lâu hơn
+            delay *= 2
+        elif error_code == 403:
+            # 403 - đợi ngắn hơn vì cần refresh token nhanh
+            delay *= 0.5
+        elif error_code == 500:
+            # Server error - đợi vừa phải
+            delay *= 1.5
+        
+        # Cap at max_delay
+        delay = min(delay, max_delay)
+        
+        # Thêm jitter (random ±25%) để tránh thundering herd
+        if use_jitter:
+            jitter = delay * 0.25
+            delay = delay + random.uniform(-jitter, jitter)
+        
+        return max(0.1, delay)  # Minimum 0.1 giây
+
+    def _switch_token_source_on_error(self, current_source: str, error_code: int) -> str:
+        """Tự động chuyển đổi nguồn token khi gặp lỗi.
+        
+        Flow:
+        - Nếu đang dùng Chrome CDP mà bị 403 nhiều → chuyển sang playwright
+        - Nếu đang dùng playwright mà bị 403 nhiều → chuyển sang Chrome CDP
+        """
+        cookie_hash = self._cookie_hash
+        
+        if error_code == 403:
+            cdp_403 = LabsFlowClient._chrome_cdp_consecutive_403.get(cookie_hash, 0)
+            pw_403 = LabsFlowClient._playwright_consecutive_403.get(cookie_hash, 0)
+            
+            if current_source in ("chrome_cdp", "zendriver") and cdp_403 >= self.MAX_CHROME_CDP_403:
+                print(f"  🔄 [Token Source] Chrome CDP đạt ngưỡng {self.MAX_CHROME_CDP_403} lỗi 403 → Chuyển sang Playwright")
+                return "playwright"
+            elif current_source == "playwright" and pw_403 >= self.MAX_PLAYWRIGHT_403:
+                print(f"  🔄 [Token Source] Playwright đạt ngưỡng {self.MAX_PLAYWRIGHT_403} lỗi 403 → Chuyển sang Chrome CDP")
+                return "chrome_cdp"
+        
+        return current_source
     
     def _refresh_cookie_on_403(self) -> bool:
         """Refresh cookie khi bị 403 - xóa cookie cũ, reload trang để lấy cookie mới.
         
+        ✅ Dùng Chrome CDP thay vì zendriver.
+        ✅ Reset token timestamp để buộc lấy token mới.
+        
         Returns:
             True nếu refresh thành công, False nếu thất bại
         """
-        import asyncio
-        
         cookie_hash = self._cookie_hash
         print(f"  🔄 [403 Handler] Cookie {cookie_hash[:8]}... bị 403 - Đang reload trang để lấy cookie mới...")
         
-        # ✅ Reset zendriver page và reload để lấy cookie mới
+        # ✅ Reset token timestamp để buộc lấy token mới ở attempt tiếp theo
+        LabsFlowClient._token_timestamps.pop(cookie_hash, None)
+        
+        # ✅ Reset Chrome CDP page/tab
         LabsFlowClient._zendriver_reset_page(cookie_hash)
         
         # ✅ Reset playwright context để lấy cookie mới
@@ -2641,77 +3834,73 @@ class LabsFlowClient:
             LabsFlowClient._browser_contexts.pop(cookie_hash, None)
             LabsFlowClient._cookies_injected_contexts.pop(cookie_hash, None)
         
-        # ✅ Reload trang để lấy cookie mới qua zendriver
-        if LabsFlowClient._zendriver_browser and LabsFlowClient._zendriver_loop:
+        # ✅ Reset playwright recaptcha page để buộc tạo page mới với cookies mới
+        if hasattr(LabsFlowClient, '_recaptcha_page') and LabsFlowClient._recaptcha_page is not None:
             try:
-                async def _reload_page():
-                    import zendriver as zd
-                    browser = LabsFlowClient._zendriver_browser
-                    TARGET_URL = "https://labs.google/fx/tools/flow"
-                    
-                    # Tạo page mới và navigate đến trang
-                    page = await browser.get(TARGET_URL)
-                    await page.sleep(3)
-                    
-                    # ✅ Reload trang để tạo cookies mới (F5)
-                    await page.reload()
-                    await page.sleep(3)
-                    
-                    # Đánh dấu page đã được reset
-                    return True
-                
-                future = asyncio.run_coroutine_threadsafe(
-                    _reload_page(),
-                    LabsFlowClient._zendriver_loop,
-                )
-                result = future.result(timeout=30)
-                
-                if result:
-                    print(f"  ✅ [403 Handler] Đã reload trang - cookies mới sẽ được tạo tự động")
-                    
-            except Exception as e:
-                print(f"  ⚠️ [403 Handler] Lỗi khi reload trang: {e}")
+                LabsFlowClient._recaptcha_page.close()
+            except:
+                pass
+            LabsFlowClient._recaptcha_page = None
+        if hasattr(LabsFlowClient, '_recaptcha_context') and LabsFlowClient._recaptcha_context is not None:
+            try:
+                LabsFlowClient._recaptcha_context.close()
+            except:
+                pass
+            LabsFlowClient._recaptcha_context = None
         
         # ✅ Reset all error counters cho cookie này
         self._reset_all_error_counters()
         LabsFlowClient._zendriver_consecutive_403[cookie_hash] = 0
+        LabsFlowClient._chrome_cdp_consecutive_403[cookie_hash] = 0
         LabsFlowClient._playwright_consecutive_403[cookie_hash] = 0
         
-        print(f"  ✅ [403 Handler] Đã refresh cookie {cookie_hash[:8]}... - sẽ dùng cookie mới ở attempt tiếp theo")
+        print(f"  ✅ [403 Handler] Đã refresh cookie {cookie_hash[:8]}... - tab mới sẽ được tạo ở attempt tiếp theo")
         return True
     
     def _on_api_success(self):
         """Gọi khi API call thành công - reset counters."""
         cookie_hash = self._cookie_hash
         LabsFlowClient._zendriver_consecutive_403[cookie_hash] = 0
+        LabsFlowClient._chrome_cdp_consecutive_403[cookie_hash] = 0
         LabsFlowClient._playwright_consecutive_403[cookie_hash] = 0
         self._reset_all_error_counters()
+        # ✅ Reset 403 refresh retries khi thành công
+        if hasattr(self, '_403_refresh_retries'):
+            self._403_refresh_retries[cookie_hash] = 0
     
     def _on_api_403(self):
         """Gọi khi API trả về 403 - tăng counter cho source đã dùng."""
         cookie_hash = self._cookie_hash
         source = LabsFlowClient._last_token_source.get(cookie_hash, "playwright")
         
-        if source == "zendriver":
+        if source == "chrome_cdp":
+            count = LabsFlowClient._chrome_cdp_consecutive_403.get(cookie_hash, 0) + 1
+            LabsFlowClient._chrome_cdp_consecutive_403[cookie_hash] = count
+            # Compat: cũng update zendriver counter
+            LabsFlowClient._zendriver_consecutive_403[cookie_hash] = count
+            print(f"  📊 [Token Source] Chrome CDP 403 count: {count}/{self.MAX_CHROME_CDP_403}")
+        elif source == "zendriver":
+            # Backward compat
             count = LabsFlowClient._zendriver_consecutive_403.get(cookie_hash, 0) + 1
             LabsFlowClient._zendriver_consecutive_403[cookie_hash] = count
-            print(f"  📊 [Token Source] Zendriver 403 count: {count}/{self.MAX_ZENDRIVER_403}")
+            LabsFlowClient._chrome_cdp_consecutive_403[cookie_hash] = count
+            print(f"  📊 [Token Source] Chrome CDP 403 count: {count}/{self.MAX_CHROME_CDP_403}")
         else:
             count = LabsFlowClient._playwright_consecutive_403.get(cookie_hash, 0) + 1
             LabsFlowClient._playwright_consecutive_403[cookie_hash] = count
             print(f"  📊 [Token Source] Playwright 403 count: {count}/{self.MAX_PLAYWRIGHT_403}")
     
     def _should_use_zendriver(self) -> bool:
-        """Quyết định có nên dùng zendriver không."""
-        # Kiểm tra zendriver có cài đặt không (chỉ check 1 lần)
-        if not LabsFlowClient._zendriver_available:
+        """Quyết định có nên dùng Chrome CDP không (thay thế zendriver)."""
+        # Kiểm tra Chrome có sẵn không (chỉ check 1 lần)
+        if not LabsFlowClient._chrome_cdp_available:
             LabsFlowClient._check_zendriver_available()
-        if not LabsFlowClient._zendriver_available:
+        if not LabsFlowClient._chrome_cdp_available:
             return False
         cookie_hash = self._cookie_hash
-        # Nếu zendriver bị 403 quá nhiều → chuyển sang playwright
-        zd_403 = LabsFlowClient._zendriver_consecutive_403.get(cookie_hash, 0)
-        if zd_403 >= self.MAX_ZENDRIVER_403:
+        # Nếu Chrome CDP bị 403 quá nhiều → chuyển sang playwright
+        cdp_403 = LabsFlowClient._chrome_cdp_consecutive_403.get(cookie_hash, 0)
+        if cdp_403 >= self.MAX_CHROME_CDP_403:
             return False
         return True
 
@@ -2742,24 +3931,28 @@ class LabsFlowClient:
         print(f"  🔑 [reCAPTCHA] Cookie {cookie_hash[:8]}... đang yêu cầu token (action={recaptcha_action})...")
         
         token = None
+        token_generated_at = None
         
-        # ✅ SOURCE 1: Zendriver (ưu tiên - headed, undetected)
+        # ✅ SOURCE 1: Chrome CDP (ưu tiên - Chrome thật, trust score cao)
         if self._should_use_zendriver():
-            print(f"  🔵 [Token] Thử Zendriver trước (headed, off-screen)...")
+            print(f"  🔵 [Token] Thử Chrome CDP trước (Chrome thật, off-screen)...")
             try:
                 token = self._get_recaptcha_token_zendriver(
                     timeout_s=60,
                     recaptcha_action=recaptcha_action,
                 )
                 if token and len(token.strip()) > 0:
-                    self._record_token_source("zendriver")
+                    token_generated_at = time.time()
+                    self._record_token_source("chrome_cdp")
                     client_context["recaptchaToken"] = token
-                    print(f"  ✅ [Zendriver] Token injected (len={len(token)})")
+                    # ✅ Track token timestamp để kiểm tra freshness trước khi gọi API
+                    LabsFlowClient._token_timestamps[cookie_hash] = token_generated_at
+                    print(f"  ✅ [Chrome CDP] Token injected (len={len(token)}, ts={token_generated_at:.0f})")
                     return True
                 else:
-                    print(f"  ⚠️ [Zendriver] Không lấy được token, fallback Playwright...")
+                    print(f"  ⚠️ [Chrome CDP] Không lấy được token, fallback Playwright...")
             except Exception as e:
-                print(f"  ⚠️ [Zendriver] Error: {e}, fallback Playwright...")
+                print(f"  ⚠️ [Chrome CDP] Error: {e}, fallback Playwright...")
         
         # ✅ SOURCE 2: Playwright (fallback)
         print(f"  🟡 [Token] Dùng Playwright...")
@@ -2771,9 +3964,12 @@ class LabsFlowClient:
         )
         
         if token and len(token.strip()) > 0:
+            token_generated_at = time.time()
             self._record_token_source("playwright")
             client_context["recaptchaToken"] = token
-            print(f"  ✅ [Playwright] Token injected (len={len(token)})")
+            # ✅ Track token timestamp
+            LabsFlowClient._token_timestamps[cookie_hash] = token_generated_at
+            print(f"  ✅ [Playwright] Token injected (len={len(token)}, ts={token_generated_at:.0f})")
             return True
         
         # Cả 2 source đều fail
@@ -2832,6 +4028,116 @@ class LabsFlowClient:
         print(f"  ✅ Verified: Token có trong payload (length: {len(token)}) trước khi gọi API")
         return True
     
+    def _is_token_fresh(self) -> bool:
+        """Kiểm tra token hiện tại còn fresh không (< TOKEN_MAX_AGE_SECONDS).
+        
+        reCAPTCHA v3 token hết hạn sau 120s theo Google docs.
+        Trả về False nếu token đã quá cũ hoặc chưa có timestamp.
+        """
+        cookie_hash = self._cookie_hash
+        ts = LabsFlowClient._token_timestamps.get(cookie_hash)
+        if ts is None:
+            return False
+        age = time.time() - ts
+        is_fresh = age < self.TOKEN_MAX_AGE_SECONDS
+        if not is_fresh:
+            print(f"  ⏰ [Token Freshness] Token đã {age:.0f}s (max {self.TOKEN_MAX_AGE_SECONDS}s) → EXPIRED, cần lấy mới")
+        return is_fresh
+    
+    def _ensure_fresh_token(
+        self,
+        client_context: Dict[str, Any],
+        recaptcha_action: str = "VIDEO_GENERATION",
+        acquire_lock: bool = False,
+    ) -> bool:
+        """Đảm bảo token trong client_context còn fresh trước khi gọi API.
+        
+        Nếu token đã expired (> TOKEN_MAX_AGE_SECONDS), tự động lấy token mới.
+        Hàm này nên được gọi NGAY TRƯỚC khi gọi API (sau tất cả delay/rate-limit).
+        
+        Returns:
+            True nếu token fresh (hoặc đã lấy mới thành công), False nếu fail.
+        """
+        if not self.auto_recaptcha:
+            return True
+        
+        if self._is_token_fresh():
+            return True
+        
+        # Token expired → lấy mới
+        print(f"  🔄 [Token Freshness] Lấy token mới vì token cũ đã expired...")
+        # Xóa token cũ khỏi client_context
+        client_context.pop("recaptchaToken", None)
+        client_context.pop("recaptchaContext", None)
+        
+        try:
+            result = self._maybe_inject_recaptcha(
+                client_context,
+                raise_on_fail=True,
+                acquire_lock=acquire_lock,
+                recaptcha_action=recaptcha_action,
+            )
+            return result
+        except RuntimeError as e:
+            self.last_error_detail = f"Không thể lấy token mới (freshness check): {e}"
+            print(f"  ✗ {self.last_error_detail}")
+            return False
+    
+    def _generate_session_id(self) -> str:
+        """Generate sessionId theo format flow2api: ';{timestamp_ms}'.
+        
+        flow2api luôn gửi sessionId trong clientContext. Format: ";{unix_timestamp_ms}"
+        Điều này giúp Google Labs tracking session và có thể ảnh hưởng đến reCAPTCHA trust score.
+        """
+        return f";{int(time.time() * 1000)}"
+    
+    def _notify_captcha_error_self_heal(self, error_code: int, error_msg: str) -> None:
+        """Thông báo cho browser captcha service về lỗi để tự phục hồi.
+        
+        Tham khảo flow2api: _notify_browser_captcha_error - khi gặp 403/429,
+        thông báo cho browser captcha service để nó có thể:
+        - Reset browser context
+        - Xoay proxy
+        - Refresh cookies
+        
+        Trong implementation của chúng ta, trigger zendriver page reset khi gặp 403.
+        """
+        cookie_hash = self._cookie_hash
+        try:
+            if error_code == 403:
+                # Reset zendriver page cho cookie này để lần sau lấy token mới từ page sạch
+                if cookie_hash in LabsFlowClient._zendriver_pages:
+                    print(f"  🔄 [Self-Heal] Đánh dấu zendriver page cần reset cho cookie {cookie_hash[:8]}...")
+                    LabsFlowClient._zendriver_reset_page(cookie_hash)
+                
+                # Đánh dấu playwright context cần reset
+                with LabsFlowClient._contexts_need_reset_lock:
+                    LabsFlowClient._contexts_need_reset[cookie_hash] = True
+                    print(f"  🔄 [Self-Heal] Đánh dấu playwright context cần reset cho cookie {cookie_hash[:8]}...")
+            
+            elif error_code == 429:
+                # Xoay proxy nếu có proxy pool
+                if LabsFlowClient._use_proxy_pool:
+                    new_proxy = LabsFlowClient._rotate_proxy_for_cookie(cookie_hash)
+                    if new_proxy:
+                        self._apply_proxy_to_session(new_proxy)
+                        print(f"  🔄 [Self-Heal] Đã xoay proxy cho cookie {cookie_hash[:8]}... sau 429")
+        except Exception as e:
+            print(f"  ⚠️ [Self-Heal] Lỗi khi tự phục hồi: {e}")
+    
+    def _should_use_simple_prompt_format(self) -> bool:
+        """Kiểm tra xem có nên dùng format prompt đơn giản không.
+        
+        flow2api dùng format đơn giản: {"textInput": {"prompt": "..."}}
+        Chúng ta dùng format phức tạp: {"textInput": {"structuredPrompt": {"parts": [{"text": "..."}]}}}
+        
+        Khi gặp 403 liên tiếp, thử chuyển sang format đơn giản như flow2api.
+        """
+        cookie_hash = self._cookie_hash
+        counter_403 = LabsFlowClient._shared_403_counters.get(cookie_hash, 0)
+        # Sau 2 lần 403 liên tiếp, thử format đơn giản
+        return counter_403 >= 2
+    
     @staticmethod
     def _map_image_aspect(aspect: Optional[str]) -> str:
         """Map human aspect inputs to IMAGE_ASPECT_RATIO_* constants."""
@@ -2847,6 +4153,10 @@ class LabsFlowClient:
                 return "IMAGE_ASPECT_RATIO_PORTRAIT"
             if s in {"1:1", "1X1", "SQUARE"}:
                 return "IMAGE_ASPECT_RATIO_SQUARE"
+            if s in {"4:3", "4X3", "LANDSCAPE_FOUR_THREE", "FOUR_THREE"}:
+                return "IMAGE_ASPECT_RATIO_LANDSCAPE_FOUR_THREE"
+            if s in {"3:4", "3X4", "PORTRAIT_THREE_FOUR", "THREE_FOUR"}:
+                return "IMAGE_ASPECT_RATIO_PORTRAIT_THREE_FOUR"
         except Exception:
             pass
         return "IMAGE_ASPECT_RATIO_LANDSCAPE"
@@ -3037,47 +4347,9 @@ class LabsFlowClient:
             return False
     
     def set_video_model_key(self, model_key: str) -> bool:
-        """Set the last selected video model key with retry - KHÔNG retry khi gặp 429."""
-        import time
-        for attempt in range(5):  # Retry up to 5 times
-            try:
-                print(f"→ Setting video model key: {model_key} (attempt {attempt + 1}/3)")
-                url = "https://labs.google/fx/api/trpc/videoFx.setLastSelectedVideoModelKey"
-                payload = {"json": {"modelKey": model_key}}
-                resp = self.session.post(
-                    url,
-                    headers=self._labs_headers(),
-                    cookies=self.cookies,
-                    data=json.dumps(payload),
-                    timeout=60,
-                )
-                
-                # ✅ Check 429 ngay lập tức - KHÔNG retry, để GUI xử lý đổi cookie
-                if resp.status_code == 429:
-                    error_msg = f"429 Client Error: Too Many Requests for url: {url}"
-                    print(f"  ⚠️ 429 Rate Limit - Không retry, để GUI xử lý đổi cookie")
-                    self.last_error_detail = error_msg
-                    self.last_error = error_msg
-                    return False
-                
-                resp.raise_for_status()
-                print(f"  ✓ Model key set successfully")
-                return True
-            except Exception as e:
-                error_str = str(e)
-                # ✅ Check nếu exception chứa 429 - KHÔNG retry, để GUI xử lý đổi cookie
-                if "429" in error_str or "Too Many Requests" in error_str:
-                    print(f"  ⚠️ 429 Rate Limit trong exception - Không retry, để GUI xử lý đổi cookie")
-                    self.last_error_detail = error_str
-                    self.last_error = error_str
-                    return False
-                
-                print(f"  ✗ Failed to set model key (attempt {attempt + 1}): {e}")
-                if attempt < 2:  # Not the last attempt
-                    time.sleep(1)  # Wait 1 second before retry
-                    continue
-
-        return False
+        """Bỏ qua bước set model key - không cần gọi API setLastSelectedVideoModelKey nữa."""
+        print(f"  ✓ Skip setLastSelectedVideoModelKey (không cần thiết), model: {model_key}")
+        return True
     
     def submit_batch_log(self, tool: str) -> bool:
         """Submit batch log event."""
@@ -3191,14 +4463,17 @@ class LabsFlowClient:
                 "seed": seeds[i],
                 "textInput": {"structuredPrompt": {"parts": [{"text": prompt}]}},
                 "videoModelKey": effective_model,
-                "metadata": {"sceneId": scene_ids[i]},
+                "metadata": {},
             })
         
         # ✅ Payload khớp WebUI: thêm mediaGenerationContext và useV2ModelConfig
+        # ✅ FIX (flow2api fallback): Thêm sessionId vào clientContext - flow2api luôn gửi sessionId
         batch_id = str(uuid.uuid4())
+        session_id = self._generate_session_id()
         payload = {
             "mediaGenerationContext": {"batchId": batch_id},
             "clientContext": {
+                "sessionId": session_id,
                 "projectId": project_id,
                 "tool": tool,
                 "userPaygateTier": user_tier,
@@ -3265,6 +4540,13 @@ class LabsFlowClient:
                     
                     print(f"→ Generating {num_videos} videos (attempt {attempt + 1}/{max_retries}): '{prompt[:50]}...'")
                     
+                    # ✅ FIX: Freshness check ngay trước khi gọi API - nếu token expired thì lấy mới
+                    if not self._ensure_fresh_token(payload["clientContext"], recaptcha_action="VIDEO_GENERATION", acquire_lock=False):
+                        self.last_error_detail = "Token expired và không thể lấy mới trước khi gọi API"
+                        return None
+                    # ✅ Convert lại format nếu token mới được inject
+                    self._convert_to_recaptcha_context(payload["clientContext"])
+                    
                     resp = self.session.post(
                         url,
                         headers=self._aisandbox_headers(),
@@ -3274,9 +4556,19 @@ class LabsFlowClient:
                     
                     # ✅ Check 429/400/401 using unified error handler
                     if resp.status_code in [400, 401, 429]:
+                        if resp.status_code == 401:
+                            print(f"  ⚠️ Lỗi 401 Debug Payload: {json.dumps(payload)}")
+                            # ✅ FIX: Re-fetch access token khi gặp 401 (token expired)
+                            print(f"  🔄 [T2V] 401 - Re-fetch access token...")
+                            if self.fetch_access_token():
+                                print(f"  ✅ [T2V] Access token refreshed: {self.access_token[:20]}...")
+                            else:
+                                print(f"  ❌ [T2V] Không thể refresh access token")
                         # Set flag bị chặn cho 429 (rate limit/IP blocked)
                         if resp.status_code == 429:
                             cookie_hash = self._cookie_hash
+                            # ✅ FIX (flow2api): Thông báo cho captcha service tự phục hồi
+                            self._notify_captcha_error_self_heal(429, resp.text[:200])
                             with LabsFlowClient._recaptcha_cookie_blocked_lock:
                                 if not hasattr(LabsFlowClient, '_recaptcha_cookie_blocked_flags'):
                                     LabsFlowClient._recaptcha_cookie_blocked_flags = {}
@@ -3291,22 +4583,27 @@ class LabsFlowClient:
                             print(f"  🔄 [T2V] Đã reset BrowserContext, retry với context mới...")
                             continue  # Retry với context mới
                         
-                        # Chưa đến ngưỡng reset, retry bình thường
+                        # Chưa đến ngưỡng reset, retry với exponential backoff
                         if resp.status_code == 429:
-                            print(f"  ⚠️ 429 Rate Limit - Waiting before retry...")
-                            time.sleep(5 * (attempt + 1))
+                            wait_time = LabsFlowClient.calculate_retry_delay(attempt, 429, base_delay=5.0)
+                            print(f"  ⚠️ 429 Rate Limit - Waiting {wait_time:.1f}s before retry...")
+                            time.sleep(wait_time)
                             continue
                         
-                        # For 400/401, retry với backoff
+                        # For 400/401, retry với exponential backoff
                         print(f"  ⚠️ {resp.status_code} - Retry info: {resp.text[:100]}")
                         if attempt < max_retries - 1:
-                            time.sleep(2)
+                            wait_time = LabsFlowClient.calculate_retry_delay(attempt, resp.status_code, base_delay=2.0)
+                            time.sleep(wait_time)
                             continue
 
                     # ✅ Check 403 - Token score thấp, cần lấy token mới
                     if resp.status_code == 403:
                         # ✅ Track token source 403
                         self._on_api_403()
+                        
+                        # ✅ FIX (flow2api): Thông báo cho captcha service tự phục hồi
+                        self._notify_captcha_error_self_heal(403, resp.text[:200])
                         
                         # Set flag bị chặn để worker thread có thể renew cookie
                         cookie_hash = self._cookie_hash
@@ -3315,6 +4612,18 @@ class LabsFlowClient:
                                 LabsFlowClient._recaptcha_cookie_blocked_flags = {}
                             LabsFlowClient._recaptcha_cookie_blocked_flags[cookie_hash] = True
                             print(f"  ⚠️ [API] Đã set flag bị chặn cho cookie: {cookie_hash[:8]}... (403)")
+                        
+                        # ✅ FIX (flow2api fallback): Sau 2 lần 403, thử format prompt đơn giản
+                        if self._should_use_simple_prompt_format():
+                            print(f"  🔄 [T2V Fallback] Chuyển sang format prompt đơn giản (flow2api style)...")
+                            for req in payload.get("requests", []):
+                                text_input = req.get("textInput", {})
+                                # Lấy text từ structuredPrompt nếu có
+                                sp = text_input.get("structuredPrompt", {})
+                                parts = sp.get("parts", [])
+                                if parts and isinstance(parts[0], dict):
+                                    original_text = parts[0].get("text", prompt)
+                                    req["textInput"] = {"prompt": original_text}
                         
                         # ✅ XỬ LÝ 403: Refresh cookie - xóa cookie cũ, reload để lấy cookie mới
                         # Retry tối đa 3 lần như yêu cầu
@@ -3348,8 +4657,8 @@ class LabsFlowClient:
                             error_msg = json.dumps(error_data)
                             if "PUBLIC_ERROR_HIGH_TRAFFIC" in error_msg or "HIGH_TRAFFIC" in error_msg:
                                 if attempt < max_retries - 1:
-                                    wait_time = (attempt + 1) * 5  # 5s, 10s, 15s
-                                    print(f"  ⚠️ VEO 3 quá tải, chờ {wait_time}s và thử lại...")
+                                    wait_time = LabsFlowClient.calculate_retry_delay(attempt, 500, base_delay=5.0)
+                                    print(f"  ⚠️ VEO 3 quá tải, chờ {wait_time:.1f}s và thử lại...")
                                     time.sleep(wait_time)
                                     continue
                         except:
@@ -3397,8 +4706,8 @@ class LabsFlowClient:
 
                     # ✅ Các lỗi khác: retry như bình thường
                     if attempt < max_retries - 1:
-                        wait_time = (attempt + 1) * 5
-                        print(f"  ⚠️ Lỗi (attempt {attempt + 1}): {error_str[:100]}, retry sau {wait_time}s...")
+                        wait_time = LabsFlowClient.calculate_retry_delay(attempt, 0, base_delay=5.0)
+                        print(f"  ⚠️ Lỗi (attempt {attempt + 1}): {error_str[:100]}, retry sau {wait_time:.1f}s...")
                         time.sleep(wait_time)
                     else:
                         print(f"  ✗ Failed after {max_retries} attempts: {e}")
@@ -3421,6 +4730,19 @@ class LabsFlowClient:
                 data=json.dumps(payload),
                 timeout=120,
             )
+            
+            # ✅ FIX: Re-fetch access token khi gặp 401 và retry 1 lần
+            if resp.status_code == 401:
+                print(f"  ⚠️ [Poll] 401 - Re-fetch access token...")
+                if self.fetch_access_token():
+                    print(f"  ✅ [Poll] Access token refreshed, retry polling...")
+                    resp = self.session.post(
+                        url,
+                        headers=self._aisandbox_headers(),
+                        data=json.dumps(payload),
+                        timeout=120,
+                    )
+            
             resp.raise_for_status()
             return resp.json()
             
@@ -3510,6 +4832,17 @@ class LabsFlowClient:
                 
                 # ✅ Handle upload errors with retry and unified error handler
                 if resp.status_code != 200:
+                    # ✅ FIX: Re-fetch access token khi gặp 401 (token expired)
+                    if resp.status_code == 401:
+                        print(f"  🔄 [Upload] 401 - Re-fetch access token...")
+                        if self.fetch_access_token():
+                            print(f"  ✅ [Upload] Access token refreshed: {self.access_token[:20]}...")
+                        else:
+                            print(f"  ❌ [Upload] Không thể refresh access token")
+                        if attempt < max_retries - 1:
+                            time.sleep(1)
+                            continue
+                    
                     try:
                         err_json = resp.json()
                         error_detail = json.dumps(err_json, ensure_ascii=False)
@@ -3527,23 +4860,23 @@ class LabsFlowClient:
                     
                     # ✅ Retry on 5xx server errors or network errors
                     if resp.status_code >= 500 and attempt < max_retries - 1:
-                        wait_time = (attempt + 1) * 3
-                        print(f"  → Server error, retry sau {wait_time}s...")
+                        wait_time = LabsFlowClient.calculate_retry_delay(attempt, 500, base_delay=3.0)
+                        print(f"  → Server error, retry sau {wait_time:.1f}s...")
                         time.sleep(wait_time)
                         continue
                     elif resp.status_code == 429 and attempt < max_retries - 1:
-                        wait_time = (attempt + 1) * 5
-                        print(f"  → Rate limit, retry sau {wait_time}s...")
+                        wait_time = LabsFlowClient.calculate_retry_delay(attempt, 429, base_delay=5.0)
+                        print(f"  → Rate limit, retry sau {wait_time:.1f}s...")
                         time.sleep(wait_time)
                         continue
                     elif resp.status_code == 403 and attempt < max_retries - 1:
-                        wait_time = (attempt + 1) * 3
-                        print(f"  → 403 Forbidden, retry sau {wait_time}s...")
+                        wait_time = LabsFlowClient.calculate_retry_delay(attempt, 403, base_delay=3.0)
+                        print(f"  → 403 Forbidden, retry sau {wait_time:.1f}s...")
                         time.sleep(wait_time)
                         continue
                     elif attempt < max_retries - 1:
-                        wait_time = (attempt + 1) * 2
-                        print(f"  → Retry sau {wait_time}s...")
+                        wait_time = LabsFlowClient.calculate_retry_delay(attempt, resp.status_code, base_delay=2.0)
+                        print(f"  → Retry sau {wait_time:.1f}s...")
                         time.sleep(wait_time)
                         continue
                     else:
@@ -3701,14 +5034,11 @@ class LabsFlowClient:
                 # API I2V yêu cầu nested format, không phải flat format
                 self._convert_to_recaptcha_context(payload["clientContext"])
                 
-                # ✅ CRITICAL: Loại bỏ sessionId sau khi convert (vì đã inject token xong)
-                # SessionId không nên có trong payload cuối cùng
-                if "sessionId" in payload.get("clientContext", {}):
-                    payload["clientContext"].pop("sessionId", None)
-                if "sessionId" in payload.get("clientContext", {}):
-                    removed_session = payload["clientContext"].pop("sessionId", None)
-                    if removed_session:
-                        print(f"  🧹 [I2V] Đã loại bỏ sessionId khỏi payload: {removed_session[:30]}...")
+                # ✅ FIX (flow2api): GIỮ sessionId trong clientContext - flow2api luôn gửi sessionId
+                # sessionId giúp Google Labs tracking session và có thể ảnh hưởng đến reCAPTCHA trust score
+                # Nếu sessionId bị xóa, tạo mới
+                if "sessionId" not in payload.get("clientContext", {}):
+                    payload["clientContext"]["sessionId"] = self._generate_session_id()
 
                 try:
                     # 3) Rate limiting đơn giản dựa trên _min_api_call_interval
@@ -3722,6 +5052,13 @@ class LabsFlowClient:
                     self._last_api_call_time = time.time()
 
                     print(f"→ Generating {num_videos} videos from image (attempt {attempt + 1}/{max_retries})")
+                    
+                    # ✅ FIX: Freshness check ngay trước khi gọi API
+                    if not self._ensure_fresh_token(payload["clientContext"], recaptcha_action="VIDEO_GENERATION", acquire_lock=False):
+                        self.last_error_detail = "Token expired và không thể lấy mới trước khi gọi I2V API"
+                        self.last_error = self.last_error_detail
+                        return None
+                    self._convert_to_recaptcha_context(payload["clientContext"])
                     
                     # ✅ DEBUG: Log chi tiết payload trước khi gọi API - FULL VERSION
                     try:
@@ -3748,6 +5085,8 @@ class LabsFlowClient:
                     # 4) Xử lý nhanh các mã lỗi quan trọng với unified error handler
                     if resp.status_code == 429:
                         cookie_hash = self._cookie_hash
+                        # ✅ FIX (flow2api): Thông báo cho captcha service tự phục hồi
+                        self._notify_captcha_error_self_heal(429, "429 Rate Limit")
                         with LabsFlowClient._recaptcha_cookie_blocked_lock:
                             if not hasattr(LabsFlowClient, '_recaptcha_cookie_blocked_flags'):
                                 LabsFlowClient._recaptcha_cookie_blocked_flags = {}
@@ -3769,6 +5108,20 @@ class LabsFlowClient:
                     if resp.status_code == 403:
                         print("  ⚠️ 403 Forbidden từ I2V API, coi như cookie/token bị chặn.")
                         self._on_api_403()  # ✅ Track token source 403
+                        
+                        # ✅ FIX (flow2api): Thông báo cho captcha service tự phục hồi
+                        self._notify_captcha_error_self_heal(403, resp.text[:200])
+                        
+                        # ✅ FIX (flow2api fallback): Sau 2 lần 403, thử format prompt đơn giản
+                        if self._should_use_simple_prompt_format():
+                            print(f"  🔄 [I2V Fallback] Chuyển sang format prompt đơn giản (flow2api style)...")
+                            for req in payload.get("requests", []):
+                                text_input = req.get("textInput", {})
+                                sp = text_input.get("structuredPrompt", {})
+                                parts = sp.get("parts", [])
+                                if parts and isinstance(parts[0], dict):
+                                    original_text = parts[0].get("text", prompt)
+                                    req["textInput"] = {"prompt": original_text}
                         
                         # ✅ XỬ LÝ 403: Refresh cookie - xóa cookie cũ, reload để lấy cookie mới
                         # Retry tối đa 3 lần như yêu cầu
@@ -3810,6 +5163,14 @@ class LabsFlowClient:
                     if resp.status_code >= 400:
                         error_msg = f"{resp.status_code} Client Error: {resp.text[:200]}"
                         print(f"  ⚠️ {error_msg}")
+                        
+                        # ✅ FIX: Re-fetch access token khi gặp 401 (token expired)
+                        if resp.status_code == 401:
+                            print(f"  🔄 [I2V] 401 - Re-fetch access token...")
+                            if self.fetch_access_token():
+                                print(f"  ✅ [I2V] Access token refreshed: {self.access_token[:20]}...")
+                            else:
+                                print(f"  ❌ [I2V] Không thể refresh access token")
                         
                         # ✅ DEBUG chi tiết cho lỗi 400
                         if resp.status_code == 400:
@@ -3980,9 +5341,9 @@ class LabsFlowClient:
                 # ✅ CRITICAL: Chuyển recaptchaToken → recaptchaContext cho Start-End API
                 self._convert_to_recaptcha_context(payload["clientContext"])
                 
-                # ✅ CRITICAL: Loại bỏ sessionId sau khi convert (giống I2V)
-                if "sessionId" in payload.get("clientContext", {}):
-                    payload["clientContext"].pop("sessionId", None)
+                # ✅ FIX (flow2api): GIỮ sessionId trong clientContext - flow2api luôn gửi sessionId
+                if "sessionId" not in payload.get("clientContext", {}):
+                    payload["clientContext"]["sessionId"] = self._generate_session_id()
 
                 try:
                     # 3) Rate limit đơn giản
@@ -3996,6 +5357,13 @@ class LabsFlowClient:
                     self._last_api_call_time = time.time()
 
                     print(f"→ Generating {num_videos} videos from start-end (attempt {attempt + 1}/{max_retries})")
+                    
+                    # ✅ FIX: Freshness check ngay trước khi gọi API
+                    if not self._ensure_fresh_token(payload["clientContext"], recaptcha_action="VIDEO_GENERATION", acquire_lock=False):
+                        self.last_error_detail = "Token expired và không thể lấy mới trước khi gọi Start-End API"
+                        self.last_error = self.last_error_detail
+                        return None
+                    self._convert_to_recaptcha_context(payload["clientContext"])
                     
                     # ✅ LOG FULL PAYLOAD để debug lỗi 400
                     if attempt == 0:  # Chỉ log lần đầu
@@ -4013,6 +5381,8 @@ class LabsFlowClient:
                     # 4) Xử lý một số mã lỗi chính với unified error handler
                     if resp.status_code == 429:
                         cookie_hash = self._cookie_hash
+                        # ✅ FIX (flow2api): Thông báo cho captcha service tự phục hồi
+                        self._notify_captcha_error_self_heal(429, "429 Rate Limit (start-end)")
                         with LabsFlowClient._recaptcha_cookie_blocked_lock:
                             if not hasattr(LabsFlowClient, "_recaptcha_cookie_blocked_flags"):
                                 LabsFlowClient._recaptcha_cookie_blocked_flags = {}
@@ -4033,6 +5403,20 @@ class LabsFlowClient:
 
                     if resp.status_code == 403:
                         print("  ⚠️ 403 Forbidden từ I2V start-end API, coi như token/cookie bị chặn.")
+                        
+                        # ✅ FIX (flow2api): Thông báo cho captcha service tự phục hồi
+                        self._notify_captcha_error_self_heal(403, resp.text[:200])
+                        
+                        # ✅ FIX (flow2api fallback): Sau 2 lần 403, thử format prompt đơn giản
+                        if self._should_use_simple_prompt_format():
+                            print(f"  🔄 [Start-End Fallback] Chuyển sang format prompt đơn giản (flow2api style)...")
+                            for req in payload.get("requests", []):
+                                text_input = req.get("textInput", {})
+                                sp = text_input.get("structuredPrompt", {})
+                                parts = sp.get("parts", [])
+                                if parts and isinstance(parts[0], dict):
+                                    original_text = parts[0].get("text", prompt)
+                                    req["textInput"] = {"prompt": original_text}
                         
                         # ✅ XỬ LÝ 403: Refresh cookie - xóa cookie cũ, reload để lấy cookie mới
                         # Retry tối đa 3 lần như yêu cầu
@@ -4073,6 +5457,14 @@ class LabsFlowClient:
                     if resp.status_code >= 400:
                         err = f"{resp.status_code} Client Error: {resp.text[:200]}"
                         print(f"  ⚠️ {err}")
+                        
+                        # ✅ FIX: Re-fetch access token khi gặp 401 (token expired)
+                        if resp.status_code == 401:
+                            print(f"  🔄 [Start-End] 401 - Re-fetch access token...")
+                            if self.fetch_access_token():
+                                print(f"  ✅ [Start-End] Access token refreshed: {self.access_token[:20]}...")
+                            else:
+                                print(f"  ❌ [Start-End] Không thể refresh access token")
                         
                         # ✅ LOG CHI TIẾT CHO LỖI 400 INVALID_ARGUMENT
                         if resp.status_code == 400:
@@ -4223,9 +5615,9 @@ class LabsFlowClient:
             # ✅ CRITICAL: Chuyển recaptchaToken → recaptchaContext cho Upscale API
             self._convert_to_recaptcha_context(payload["clientContext"])
             
-            # ✅ CRITICAL: Loại bỏ sessionId sau khi convert
-            if "sessionId" in payload.get("clientContext", {}):
-                payload["clientContext"].pop("sessionId", None)
+            # ✅ FIX (flow2api): GIỮ sessionId trong clientContext - flow2api luôn gửi sessionId
+            if "sessionId" not in payload.get("clientContext", {}):
+                payload["clientContext"]["sessionId"] = self._generate_session_id()
 
             try:
                 # ✅ Rate limiting - delay trước khi gọi API để tránh 403
@@ -4235,6 +5627,13 @@ class LabsFlowClient:
                 print(f"→ Starting upscale for {len(media_ids)} media(s) (attempt {attempt + 1}/{max_retries})")
                 print(f"  🔗 URL: {url}")
                 print(f"  📦 Payload resolution: {resolution}, model: {model_key}")
+                
+                # ✅ FIX: Freshness check ngay trước khi gọi API
+                if not self._ensure_fresh_token(payload["clientContext"], recaptcha_action="VIDEO_GENERATION"):
+                    self.last_error_detail = "Token expired và không thể lấy mới trước khi gọi Upscale API"
+                    self.last_error = self.last_error_detail
+                    return None
+                self._convert_to_recaptcha_context(payload["clientContext"])
                 
                 # ✅ Lấy headers và có thể override content-type cho 4K endpoint
                 headers = self._aisandbox_headers()
@@ -4268,6 +5667,8 @@ class LabsFlowClient:
                 # ✅ Check 429 - Rate Limit với unified error handler
                 if resp.status_code == 429:
                     print(f"  ⚠️ [Upscale] 429 Rate Limit, thử lại...")
+                    # ✅ FIX (flow2api): Thông báo cho captcha service tự phục hồi
+                    self._notify_captcha_error_self_heal(429, "429 Rate Limit (upscale)")
                     
                     if self._handle_error_and_maybe_reset(429, "429 Rate Limit (upscale)"):
                         print(f"  🔄 [Upscale] Đã reset BrowserContext, retry với context mới...")
@@ -4282,6 +5683,8 @@ class LabsFlowClient:
                 # ✅ Check 403 - Forbidden với unified error handler
                 if resp.status_code == 403:
                     print(f"  ⚠️ [Upscale] 403 Forbidden, thử lại...")
+                    # ✅ FIX (flow2api): Thông báo cho captcha service tự phục hồi
+                    self._notify_captcha_error_self_heal(403, resp.text[:200])
                     
                     # ✅ XỬ LÝ 403: Refresh cookie - xóa cookie cũ, reload để lấy cookie mới
                     # Retry tối đa 3 lần như yêu cầu
@@ -4324,6 +5727,14 @@ class LabsFlowClient:
                 if resp.status_code in [400, 401]:
                     error_msg = f"{resp.status_code} Client Error (upscale): {resp.text[:200]}"
                     print(f"  ⚠️ {error_msg}")
+                    
+                    # ✅ FIX: Re-fetch access token khi gặp 401 (token expired)
+                    if resp.status_code == 401:
+                        print(f"  🔄 [Upscale] 401 - Re-fetch access token...")
+                        if self.fetch_access_token():
+                            print(f"  ✅ [Upscale] Access token refreshed: {self.access_token[:20]}...")
+                        else:
+                            print(f"  ❌ [Upscale] Không thể refresh access token")
                     
                     if self._handle_error_and_maybe_reset(resp.status_code, error_msg):
                         print(f"  🔄 [Upscale] Đã reset BrowserContext, retry với context mới...")
@@ -4375,8 +5786,8 @@ class LabsFlowClient:
                 
             except Exception as e:
                 if attempt < max_retries - 1:
-                    wait_time = (attempt + 1) * 5
-                    print(f"  ⚠️ Lỗi upscale (attempt {attempt + 1}): {str(e)[:100]}, retry sau {wait_time}s...")
+                    wait_time = LabsFlowClient.calculate_retry_delay(attempt, 0, base_delay=5.0)
+                    print(f"  ⚠️ Lỗi upscale (attempt {attempt + 1}): {str(e)[:100]}, retry sau {wait_time:.1f}s...")
                     time.sleep(wait_time)
                 else:
                     print(f"  ✗ Failed upscale after {max_retries} attempts: {e}")
@@ -4543,8 +5954,7 @@ class LabsFlowClient:
             # ✅ Inject reCAPTCHA token for Whisk image generation
             try:
                 self._maybe_inject_recaptcha(gen_payload["clientContext"], raise_on_fail=True, recaptcha_action="IMAGE_GENERATION")
-                # ✅ Delay nhỏ sau khi có token để Google Labs validate token (tránh 403 lần đầu)
-                time.sleep(0.5)
+                time.sleep(0.1)
             except RuntimeError as e:
                 self.last_error_detail = str(e)
                 print(f"  ✗ Không thể lấy reCAPTCHA token: {e}")
@@ -4562,8 +5972,7 @@ class LabsFlowClient:
                     # ✅ MỖI ATTEMPT LẤY TOKEN MỚI – tránh dùng lại token cũ dễ gây 403
                     try:
                         self._maybe_inject_recaptcha(gen_payload["clientContext"], raise_on_fail=True, recaptcha_action="IMAGE_GENERATION")
-                        # ✅ Delay nhỏ sau khi có token để Google Labs validate token
-                        time.sleep(0.5)
+                        time.sleep(0.1)
                     except RuntimeError as e:
                         self.last_error_detail = str(e)
                         print(f"  ✗ Không thể lấy reCAPTCHA token: {e}")
@@ -4609,8 +6018,8 @@ class LabsFlowClient:
                         error_msg = f"403 Client Error: Forbidden for url: {gen_url}"
                         self.last_error_detail = error_msg
                         if attempt < max_retries - 1:
-                            wait_time = (attempt + 1) * 5
-                            print(f"  ⚠️ 403 Forbidden, retry sau {wait_time}s...")
+                            wait_time = LabsFlowClient.calculate_retry_delay(attempt, 403, base_delay=5.0)
+                            print(f"  ⚠️ 403 Forbidden, retry sau {wait_time:.1f}s...")
                             time.sleep(wait_time)
                             continue
                         return None
@@ -4633,6 +6042,14 @@ class LabsFlowClient:
                     if resp.status_code in [400, 401]:
                         error_msg = f"{resp.status_code} Client Error (Whisk): {resp.text[:200]}"
                         print(f"  ⚠️ {error_msg}")
+                        
+                        # ✅ FIX: Re-fetch access token khi gặp 401 (token expired)
+                        if resp.status_code == 401:
+                            print(f"  🔄 [Whisk] 401 - Re-fetch access token...")
+                            if self.fetch_access_token():
+                                print(f"  ✅ [Whisk] Access token refreshed: {self.access_token[:20]}...")
+                            else:
+                                print(f"  ❌ [Whisk] Không thể refresh access token")
                         
                         if self._handle_error_and_maybe_reset(resp.status_code, error_msg):
                             print(f"  🔄 [Whisk] Đã reset BrowserContext, retry với context mới...")
@@ -4671,8 +6088,8 @@ class LabsFlowClient:
                     
                     # ✅ Các lỗi khác: retry như bình thường
                     if attempt < max_retries - 1:
-                        wait_time = (attempt + 1) * 5
-                        print(f"  ⚠️ Lỗi Whisk generate image (attempt {attempt + 1}): {error_str[:100]}, retry sau {wait_time}s...")
+                        wait_time = LabsFlowClient.calculate_retry_delay(attempt, 0, base_delay=5.0)
+                        print(f"  ⚠️ Lỗi Whisk generate image (attempt {attempt + 1}): {error_str[:100]}, retry sau {wait_time:.1f}s...")
                         time.sleep(wait_time)
                     else:
                         print(f"  ✗ Failed to generate image sau {max_retries} attempts: {e}")
@@ -4796,6 +6213,13 @@ class LabsFlowClient:
                 if attempt == 0:
                     self._rate_limit_api_call()
                 
+                # ✅ FIX: Freshness check ngay trước khi gọi API - nếu token expired thì lấy mới
+                if not self._ensure_fresh_token(payload["clientContext"], recaptcha_action="IMAGE_GENERATION", acquire_lock=False):
+                    self.last_error_detail = "Token expired và không thể lấy mới trước khi gọi Flow API"
+                    return None
+                # ✅ Convert lại format nếu token mới được inject
+                self._convert_to_recaptcha_context(payload["clientContext"])
+                
                 # ✅ LOG HEADERS VÀ PAYLOAD CHI TIẾT - FULL (KHÔNG TRUNCATE)
                 request_headers = self._aisandbox_headers()
                 payload_json = json.dumps(payload, indent=2, ensure_ascii=False)
@@ -4838,6 +6262,19 @@ class LabsFlowClient:
                     import traceback
                     print(traceback.format_exc())
                 
+                # ✅ Check 401 - Unauthorized (access token expired)
+                if resp.status_code == 401:
+                    print(f"  ⚠️ [Flow API] 401 Unauthorized - Re-fetch access token...")
+                    if self.fetch_access_token():
+                        print(f"  ✅ [Flow API] Access token refreshed: {self.access_token[:20]}...")
+                    else:
+                        print(f"  ❌ [Flow API] Không thể refresh access token")
+                    if attempt < max_retries - 1:
+                        time.sleep(2)
+                        continue
+                    self.last_error_detail = "401 Unauthorized - Access token expired"
+                    return None
+                
                 # ✅ Check 400 - Bad Request (log chi tiết - FULL)
                 if resp.status_code == 400:
                     try:
@@ -4855,32 +6292,48 @@ class LabsFlowClient:
                             if 'clientContext' in first_req:
                                 print(f"    - First request clientContext keys: {list(first_req['clientContext'].keys())}")
                         
-                        # ✅ Kiểm tra nếu là lỗi "invalid argument" (prompt không tuân thủ quy tắc cộng đồng)
+                        # ✅ Kiểm tra nếu là lỗi "invalid argument"
                         error_message = error_data.get('error', {}).get('message', '')
                         error_status = error_data.get('error', {}).get('status', '')
+                        error_details_list = error_data.get('error', {}).get('details', [])
+                        # Trích xuất reason từ details nếu có
+                        error_reason = ''
+                        for d in error_details_list:
+                            if isinstance(d, dict) and d.get('reason'):
+                                error_reason = d['reason']
+                                break
+                        
                         if 'invalid argument' in error_message.lower() or 'INVALID_ARGUMENT' in error_status:
-                            print(f"  ⚠️ [Flow API] Prompt không tuân thủ quy tắc cộng đồng của Google (attempt {attempt + 1}/{max_retries})")
-                            # ✅ Luôn lưu thông báo lỗi chi tiết để GUI hiển thị cho người dùng
-                            self.last_error_detail = "Prompt không tuân thủ quy tắc cộng đồng của Google (400 INVALID_ARGUMENT - PUBLIC_ERROR_UNSAFE_GENERATION)"
-                            # ✅ Chỉ dừng hẳn khi đã retry hết, còn không thì tiếp tục retry
-                            if attempt >= max_retries - 1:
-                                print(f"  ⚠️ [Flow API] Đã retry {max_retries} lần, hiển thị thông báo lỗi cho GUI")
-                                return None
-                            # ✅ Nếu chưa retry hết, tiếp tục retry
-                            print(f"  ⚠️ [Flow API] Sẽ retry lại...")
+                            # ✅ Phân biệt: chỉ khi có PUBLIC_ERROR_UNSAFE_GENERATION mới là vi phạm nội dung
+                            is_unsafe = ('public_error_unsafe_generation' in error_message.lower()
+                                         or 'PUBLIC_ERROR_UNSAFE_GENERATION' in error_reason
+                                         or 'unsafe' in error_message.lower())
+                            if is_unsafe:
+                                print(f"  ⚠️ [Flow API] Prompt vi phạm quy tắc nội dung của Google (attempt {attempt + 1}/{max_retries})")
+                                self.last_error_detail = "Prompt vi phạm quy tắc nội dung của Google (400 INVALID_ARGUMENT - PUBLIC_ERROR_UNSAFE_GENERATION). Vui lòng chỉnh sửa nội dung prompt."
+                            else:
+                                # Lỗi INVALID_ARGUMENT nhưng KHÔNG phải unsafe → có thể do prompt sai format, quá dài, ký tự không hợp lệ...
+                                short_msg = error_message[:200] if error_message else "Không rõ chi tiết"
+                                print(f"  ⚠️ [Flow API] Prompt bị từ chối (400 INVALID_ARGUMENT): {short_msg} (attempt {attempt + 1}/{max_retries})")
+                                self.last_error_detail = f"Prompt bị từ chối bởi Google (400 INVALID_ARGUMENT): {short_msg}. Vui lòng kiểm tra lại nội dung prompt (có thể quá dài, chứa ký tự đặc biệt, hoặc format không hợp lệ)."
+                            # ✅ Không retry cho lỗi INVALID_ARGUMENT - prompt sai thì retry cũng sai
+                            return None
                     except Exception as e:
                         print(f"  ❌ [Flow API] 400 Bad Request Error (text) FULL:")
                         print(resp.text)
                         print(f"  🔍 [DEBUG] Error parsing response: {e}")
-                        # ✅ Nếu không parse được JSON, kiểm tra text và retry nếu chưa hết
+                        # ✅ Nếu không parse được JSON, kiểm tra text
                         if 'invalid argument' in resp.text.lower() or 'INVALID_ARGUMENT' in resp.text:
-                            # ✅ Luôn lưu thông báo lỗi chi tiết để GUI hiển thị cho người dùng
-                            self.last_error_detail = "Prompt không tuân thủ quy tắc cộng đồng của Google (400 INVALID_ARGUMENT)"
-                            if attempt >= max_retries - 1:
-                                return None
+                            if 'unsafe' in resp.text.lower() or 'PUBLIC_ERROR_UNSAFE_GENERATION' in resp.text:
+                                self.last_error_detail = "Prompt vi phạm quy tắc nội dung của Google (400 INVALID_ARGUMENT - PUBLIC_ERROR_UNSAFE_GENERATION). Vui lòng chỉnh sửa nội dung prompt."
+                            else:
+                                self.last_error_detail = f"Prompt bị từ chối bởi Google (400 INVALID_ARGUMENT). Vui lòng kiểm tra lại nội dung prompt (có thể quá dài, chứa ký tự đặc biệt, hoặc format không hợp lệ)."
+                            return None
                 
                 # ✅ Check 429 - Rate Limit (log chi tiết - FULL)
                 if resp.status_code == 429:
+                    # ✅ FIX (flow2api): Thông báo cho captcha service tự phục hồi
+                    self._notify_captcha_error_self_heal(429, "429 Rate Limit (flow images)")
                     try:
                         error_data = resp.json()
                         error_json_str = json.dumps(error_data, indent=2, ensure_ascii=False)
@@ -4895,10 +6348,10 @@ class LabsFlowClient:
                         print(f"  🔄 [Flow API] Đã reset BrowserContext, retry với context mới...")
                         continue  # Retry với context mới
                     
-                    # Chưa đến ngưỡng reset, retry bình thường
+                    # Chưa đến ngưỡng reset, retry với exponential backoff
                     if attempt < max_retries - 1:
-                        wait_time = (attempt + 1) * 5
-                        print(f"  ⚠️ [Flow API] 429 Rate Limit, retry sau {wait_time}s...")
+                        wait_time = LabsFlowClient.calculate_retry_delay(attempt, 429, base_delay=5.0)
+                        print(f"  ⚠️ [Flow API] 429 Rate Limit, retry sau {wait_time:.1f}s...")
                         time.sleep(wait_time)
                         continue
                     
@@ -4907,11 +6360,20 @@ class LabsFlowClient:
                 
                 # ✅ Check 403 - Token score thấp, cần lấy token mới (log FULL)
                 if resp.status_code == 403:
+                    # ✅ FIX (flow2api): Thông báo cho captcha service tự phục hồi
+                    self._notify_captcha_error_self_heal(403, resp.text[:200])
                     try:
                         error_data = resp.json()
                         error_msg = json.dumps(error_data, indent=2, ensure_ascii=False)
                         print(f"  ❌ [Flow API] 403 Forbidden Error FULL:")
                         print(error_msg)
+                        
+                        # ✅ Parse chi tiết error từ Google API
+                        error_details = LabsFlowClient._parse_google_error_details(resp.text)
+                        if error_details['reason']:
+                            print(f"  📋 [Error Reason] {error_details['reason']}")
+                        if error_details['is_recaptcha_error']:
+                            print(f"  🔐 [Error Type] Đây là reCAPTCHA error!")
                         
                         # ✅ Dùng unified error handler để xử lý 403
                         if self._handle_error_and_maybe_reset(403, error_msg):
@@ -4919,7 +6381,7 @@ class LabsFlowClient:
                             continue  # Retry với context mới
                         
                         # Chưa đến ngưỡng reset, thử lấy token mới
-                        if "reCAPTCHA" in error_msg or "recaptcha" in error_msg.lower():
+                        if error_details['is_recaptcha_error'] or "reCAPTCHA" in error_msg or "recaptcha" in error_msg.lower():
                             if self._handle_403_recaptcha_error(payload, attempt, max_retries):
                                 # ✅ Convert lại recaptchaToken → recaptchaContext sau khi _handle_403 inject token mới
                                 self._convert_to_recaptcha_context(payload["clientContext"])
@@ -4975,27 +6437,37 @@ class LabsFlowClient:
                 print(f"  ❌ Traceback FULL:")
                 print(traceback.format_exc())
                 
-                # ✅ Check nếu exception chứa 400 - invalid argument (prompt không tuân thủ quy tắc)
+                # ✅ Check nếu exception chứa 400 - invalid argument
                 if resp is not None and resp.status_code == 400:
                     try:
                         error_data = resp.json()
                         error_message = error_data.get('error', {}).get('message', '')
                         error_status = error_data.get('error', {}).get('status', '')
+                        error_details_list = error_data.get('error', {}).get('details', [])
+                        error_reason = ''
+                        for d in error_details_list:
+                            if isinstance(d, dict) and d.get('reason'):
+                                error_reason = d['reason']
+                                break
+                        
                         if 'invalid argument' in error_message.lower() or 'INVALID_ARGUMENT' in error_status:
-                            print(f"  ⚠️ [Flow API] Prompt không tuân thủ quy tắc cộng đồng của Google (attempt {attempt + 1}/{max_retries})")
-                            # ✅ Chỉ set error message khi đã retry hết, còn không thì tiếp tục retry
-                            if attempt >= max_retries - 1:
-                                self.last_error_detail = "Không tạo được hình ảnh"
-                                print(f"  ⚠️ [Flow API] Đã retry {max_retries} lần, hiển thị thông báo: Không tạo được hình ảnh")
-                                return None
-                            # ✅ Nếu chưa retry hết, tiếp tục retry (không return None)
-                            print(f"  ⚠️ [Flow API] Sẽ retry lại...")
+                            is_unsafe = ('public_error_unsafe_generation' in error_message.lower()
+                                         or 'PUBLIC_ERROR_UNSAFE_GENERATION' in error_reason
+                                         or 'unsafe' in error_message.lower())
+                            if is_unsafe:
+                                self.last_error_detail = "Prompt vi phạm quy tắc nội dung của Google (400 INVALID_ARGUMENT - PUBLIC_ERROR_UNSAFE_GENERATION). Vui lòng chỉnh sửa nội dung prompt."
+                            else:
+                                short_msg = error_message[:200] if error_message else "Không rõ chi tiết"
+                                self.last_error_detail = f"Prompt bị từ chối bởi Google (400 INVALID_ARGUMENT): {short_msg}. Vui lòng kiểm tra lại nội dung prompt (có thể quá dài, chứa ký tự đặc biệt, hoặc format không hợp lệ)."
+                            # Không retry cho INVALID_ARGUMENT
+                            return None
                     except Exception:
-                        # Nếu không parse được JSON, kiểm tra text
                         if 'invalid argument' in resp.text.lower() or 'INVALID_ARGUMENT' in resp.text:
-                            if attempt >= max_retries - 1:
-                                self.last_error_detail = "Không tạo được hình ảnh"
-                                return None
+                            if 'unsafe' in resp.text.lower() or 'PUBLIC_ERROR_UNSAFE_GENERATION' in resp.text:
+                                self.last_error_detail = "Prompt vi phạm quy tắc nội dung của Google (400 INVALID_ARGUMENT - PUBLIC_ERROR_UNSAFE_GENERATION). Vui lòng chỉnh sửa nội dung prompt."
+                            else:
+                                self.last_error_detail = f"Prompt bị từ chối bởi Google (400 INVALID_ARGUMENT). Vui lòng kiểm tra lại nội dung prompt (có thể quá dài, chứa ký tự đặc biệt, hoặc format không hợp lệ)."
+                            return None
                 
                 # ✅ Check nếu exception chứa 403 - xử lý tương tự
                 if "403" in error_str or "Forbidden" in error_str:
@@ -5019,9 +6491,9 @@ class LabsFlowClient:
                     self.last_error_detail = error_msg_500
                     
                     if attempt < max_retries - 1:
-                        wait_time = (attempt + 1) * 10  # Đợi lâu hơn cho lỗi 500
+                        wait_time = LabsFlowClient.calculate_retry_delay(attempt, 500, base_delay=10.0, max_delay=120.0)
                         print(f"  ⚠️ [Flow API] {error_msg_500}")
-                        print(f"  ⚠️ Retry sau {wait_time}s... (attempt {attempt + 1}/{max_retries})")
+                        print(f"  ⚠️ Retry sau {wait_time:.1f}s... (attempt {attempt + 1}/{max_retries})")
                         time.sleep(wait_time)
                         
                         # ✅ Lấy token mới trước khi retry (có thể giúp)
@@ -5042,10 +6514,10 @@ class LabsFlowClient:
                         
                         continue  # Retry
                 
-                # ✅ Các lỗi khác: retry như bình thường
+                # ✅ Các lỗi khác: retry với exponential backoff
                 if attempt < max_retries - 1:
-                    wait_time = (attempt + 1) * 5
-                    print(f"  ⚠️ Lỗi Flow images (attempt {attempt + 1}): {error_str[:100]}, retry sau {wait_time}s...")
+                    wait_time = LabsFlowClient.calculate_retry_delay(attempt, 0, base_delay=5.0)
+                    print(f"  ⚠️ Lỗi Flow images (attempt {attempt + 1}): {error_str[:100]}, retry sau {wait_time:.1f}s...")
                     time.sleep(wait_time)
                 else:
                     detail = error_str
@@ -5432,6 +6904,15 @@ class LabsFlowClient:
                         headers=self._aisandbox_headers(),
                         timeout=60,
                     )
+                    # ✅ FIX: Re-fetch access token khi gặp 401 và retry 1 lần
+                    if resp.status_code == 401:
+                        print(f"  ⚠️ [Flow Poll] 401 - Re-fetch access token...")
+                        if self.fetch_access_token():
+                            resp = self.session.get(
+                                op_url,
+                                headers=self._aisandbox_headers(),
+                                timeout=60,
+                            )
                     resp.raise_for_status()
                     data = resp.json()
                     if data.get("done") or "response" in data:
@@ -5538,8 +7019,7 @@ class LabsFlowClient:
             # ✅ Inject reCAPTCHA token for Whisk image recipe run
             try:
                 self._maybe_inject_recaptcha(payload["clientContext"], raise_on_fail=True, recaptcha_action="IMAGE_GENERATION")
-                # ✅ Delay nhỏ sau khi có token để Google Labs validate token (tránh 403 lần đầu)
-                time.sleep(0.5)
+                time.sleep(0.1)
             except RuntimeError as e:
                 self.last_error_detail = str(e)
                 print(f"  ✗ Không thể lấy reCAPTCHA token: {e}")
@@ -5569,8 +7049,7 @@ class LabsFlowClient:
                     # ✅ MỖI ATTEMPT LẤY TOKEN MỚI – tránh dùng lại token cũ dễ gây 403
                     try:
                         self._maybe_inject_recaptcha(payload["clientContext"], raise_on_fail=True, recaptcha_action="IMAGE_GENERATION")
-                        # ✅ Delay nhỏ sau khi có token để Google Labs validate token
-                        time.sleep(0.5)
+                        time.sleep(0.1)
                     except RuntimeError as e:
                         self.last_error_detail = str(e)
                         print(f"  ✗ Không thể lấy reCAPTCHA token: {e}")
@@ -5611,8 +7090,8 @@ class LabsFlowClient:
                         error_msg = f"403 Client Error: Forbidden for url: {url}"
                         self.last_error_detail = error_msg
                         if attempt < max_retries - 1:
-                            wait_time = (attempt + 1) * 5
-                            print(f"  ⚠️ 403 Forbidden, retry sau {wait_time}s...")
+                            wait_time = LabsFlowClient.calculate_retry_delay(attempt, 403, base_delay=5.0)
+                            print(f"  ⚠️ 403 Forbidden, retry sau {wait_time:.1f}s...")
                             time.sleep(wait_time)
                             continue
                         return None
@@ -5672,8 +7151,8 @@ class LabsFlowClient:
                     
                     # ✅ Các lỗi khác: retry như bình thường
                     if attempt < max_retries - 1:
-                        wait_time = (attempt + 1) * 5
-                        print(f"  ⚠️ Lỗi Whisk image recipe (attempt {attempt + 1}): {error_str[:100]}, retry sau {wait_time}s...")
+                        wait_time = LabsFlowClient.calculate_retry_delay(attempt, 0, base_delay=5.0)
+                        print(f"  ⚠️ Lỗi Whisk image recipe (attempt {attempt + 1}): {error_str[:100]}, retry sau {wait_time:.1f}s...")
                         time.sleep(wait_time)
                     else:
                         print(f"  ✗ Failed to run image recipe sau {max_retries} attempts: {e}")

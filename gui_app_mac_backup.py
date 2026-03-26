@@ -327,7 +327,6 @@ class WorkerSignals(QObject):
     subscription_warning = Signal(str, int)  # (message, days_remaining) - cảnh báo gần hết hạn
     sync_log_message = Signal(str)  # Signal cho sync tab logs
     update_prompts_table = Signal(list)  # Signal để update prompts_table với list of video files
-    wrap_cli_rotate_needed = Signal(int)  # (job_idx) - khi cần rotate IP bằng WRAP CLI
     update_character_tree = Signal()  # Signal để update character tree
     update_progress_bar = Signal(int, int)  # Signal để update progress bar: (row_index, percent)
     refresh_video_preview = Signal()  # Signal để refresh video preview  
@@ -2842,8 +2841,6 @@ class GoogleLabsFlowQt6(QMainWindow):
         
         # Cookie storage (hỗ trợ NHIỀU cookies)
         self.cookies_list = []  # List of cookie strings
-        self.cookie_profile_paths = []  # ✅ List of profile paths song song với cookies_list
-        self.cookie_emails = []  # ✅ List of emails song song với cookies_list (cho proxy per-account)
         self.cookie_value = ""  # Backward compatibility
         
         # Gemini API Keys storage (dùng chung cho toàn app)
@@ -3025,18 +3022,10 @@ class GoogleLabsFlowQt6(QMainWindow):
         
         # ✅ Đăng ký signal handlers để bắt khi app bị tắt đột ngột
         self._register_signal_handlers()
-
-        # ✅ WRAP CLI 403 tracking
-        self._403_count = 0
-        self._403_last_reset_time = time.time()
-        self._wrap_cli_dismissed = False  # Đã bị dismiss bởi user rồi
-        self._warp_auto_recover_in_progress = False  # Đang chạy auto recover
-        self._warp_auto_recover_lock = threading.Lock()  # Lock để tránh chạy đồng thời
-        self._warp_recover_count = 0  # Số lần đã recover thành công
-
+    
     def init_ui(self):
         """Initialize UI theo layout ảnh"""
-        self.setWindowTitle(f"Google Labs Flow v{APP_VERSION}")
+        self.setWindowTitle("Google Labs Flow")
         
         # Auto-scale theo màn hình thiết bị
         screen = QApplication.primaryScreen()
@@ -3650,12 +3639,6 @@ class GoogleLabsFlowQt6(QMainWindow):
         
         self.video_modes[0].setChecked(True)
         
-        # ✅ Ẩn tab "Mở rộng Video" và "Mở rộng + Tham chiếu"
-        hidden_video_mode_indices = [4, 5]  # ⏩ Mở rộng Video, 🔗 Mở rộng + Tham chiếu
-        for idx in hidden_video_mode_indices:
-            if idx < len(self.video_modes):
-                self.video_modes[idx].setVisible(False)
-        
         layout.addStretch()
         
         # Xuất Log button
@@ -3812,9 +3795,6 @@ class GoogleLabsFlowQt6(QMainWindow):
         self.flow_aspect_combo = QComboBox()
         self.flow_aspect_combo.addItem("16:9 Ngang", "IMAGE_ASPECT_RATIO_LANDSCAPE")
         self.flow_aspect_combo.addItem("9:16 Dọc", "IMAGE_ASPECT_RATIO_PORTRAIT")
-        self.flow_aspect_combo.addItem("4:3 Ngang", "IMAGE_ASPECT_RATIO_LANDSCAPE_FOUR_THREE")
-        self.flow_aspect_combo.addItem("3:4 Dọc", "IMAGE_ASPECT_RATIO_PORTRAIT_THREE_FOUR")
-        self.flow_aspect_combo.addItem("1:1 Vuông", "IMAGE_ASPECT_RATIO_SQUARE")
         self.flow_aspect_combo.setCurrentIndex(0)
         config_form.addWidget(aspect_label, 2, 0)
         config_form.addWidget(self.flow_aspect_combo, 2, 1)
@@ -4363,8 +4343,8 @@ class GoogleLabsFlowQt6(QMainWindow):
 
         # ==================== TASK GRID (QTableWidget) ====================
         self.flow_task_grid = QTableWidget()
-        self.flow_task_grid.setColumnCount(6)
-        self.flow_task_grid.setHorizontalHeaderLabels(["#", "Trạng thái", "Ảnh tham chiếu", "Preview", "Prompt", "Status"])
+        self.flow_task_grid.setColumnCount(5)
+        self.flow_task_grid.setHorizontalHeaderLabels(["#", "Trạng thái", "Ảnh tham chiếu", "Preview", "Prompt"])
         self.flow_task_grid.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.flow_task_grid.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.flow_task_grid.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -4421,21 +4401,18 @@ class GoogleLabsFlowQt6(QMainWindow):
         header = self.flow_task_grid.horizontalHeader()
         # Col 0: STT
         header.setSectionResizeMode(0, QHeaderView.Fixed)
-        self.flow_task_grid.setColumnWidth(0, 40)
+        self.flow_task_grid.setColumnWidth(0, 45)
         # Col 1: Trạng thái
         header.setSectionResizeMode(1, QHeaderView.Fixed)
-        self.flow_task_grid.setColumnWidth(1, 160)
+        self.flow_task_grid.setColumnWidth(1, 180)
         # Col 2: Ảnh tham chiếu
         header.setSectionResizeMode(2, QHeaderView.Fixed)
-        self.flow_task_grid.setColumnWidth(2, 150)
+        self.flow_task_grid.setColumnWidth(2, 170)
         # Col 3: Preview (nhỏ, cố định)
         header.setSectionResizeMode(3, QHeaderView.Fixed)
-        self.flow_task_grid.setColumnWidth(3, 100)
-        # Col 4: Prompt
+        self.flow_task_grid.setColumnWidth(3, 110)
+        # Col 4: Prompt (chiếm phần còn lại)
         header.setSectionResizeMode(4, QHeaderView.Stretch)
-        # Col 5: Status (hiển thị trạng thái chi tiết + lỗi dễ hiểu)
-        header.setSectionResizeMode(5, QHeaderView.Fixed)
-        self.flow_task_grid.setColumnWidth(5, 220)
 
         layout.addWidget(self.flow_task_grid, 1)
 
@@ -5869,69 +5846,6 @@ class GoogleLabsFlowQt6(QMainWindow):
             text = f"{success}/{self.flow_results_total or 1} success" if self.flow_results_total else f"{success} success"
             self.flow_result_success_label.setText(text)
 
-    @staticmethod
-    def _parse_friendly_error(error_msg: str) -> str:
-        """Parse lỗi từ Google API thành thông báo dễ hiểu cho người dùng Việt Nam."""
-        if not error_msg:
-            return "Lỗi không xác định"
-        msg_lower = error_msg.lower()
-        
-        # Prompt vi phạm nội dung
-        if "vi phạm" in msg_lower or "unsafe" in msg_lower or "public_error_unsafe" in msg_lower:
-            return "Prompt vi phạm nội dung"
-        # Prompt không hợp lệ (400)
-        if "invalid_argument" in msg_lower or "invalid argument" in msg_lower:
-            if "unsafe" in msg_lower:
-                return "Prompt vi phạm nội dung"
-            return "Prompt không hợp lệ (sai format/quá dài)"
-        if "không hợp lệ" in msg_lower or "bị từ chối" in msg_lower:
-            return "Prompt không hợp lệ"
-        # Rate limit
-        if "429" in error_msg or "rate limit" in msg_lower or "high traffic" in msg_lower or "resource_exhausted" in msg_lower:
-            return "Quá tải, thử lại sau"
-        # Server errors
-        if "500" in error_msg and ("internal" in msg_lower or "server" in msg_lower):
-            return "Google đang lỗi (500)"
-        if "502" in error_msg or "bad gateway" in msg_lower:
-            return "Lỗi kết nối Google (502)"
-        if "503" in error_msg or "unavailable" in msg_lower:
-            return "Google tạm ngưng (503)"
-        if "504" in error_msg or "gateway timeout" in msg_lower:
-            return "Hết thời gian chờ (504)"
-        # Cookie/Auth
-        if ("cookie" in msg_lower and ("die" in msg_lower or "expired" in msg_lower or "hết hạn" in msg_lower)):
-            return "Cookie hết hạn"
-        if "403" in error_msg or "forbidden" in msg_lower:
-            if "recaptcha" in msg_lower or "captcha" in msg_lower:
-                return "Lỗi xác thực reCAPTCHA"
-            return "Bị chặn truy cập (403)"
-        if "401" in error_msg or "unauthorized" in msg_lower:
-            return "Phiên đăng nhập hết hạn"
-        # Token
-        if "access token" in msg_lower or "token" in msg_lower and "expired" in msg_lower:
-            return "Token hết hạn, đang làm mới"
-        if "recaptcha" in msg_lower or "captcha" in msg_lower:
-            return "Lỗi xác thực reCAPTCHA"
-        # Network
-        if "timeout" in msg_lower or "timed out" in msg_lower:
-            return "Hết thời gian chờ kết nối"
-        if "connection" in msg_lower and ("refused" in msg_lower or "error" in msg_lower or "reset" in msg_lower):
-            return "Lỗi kết nối mạng"
-        # Tất cả cookie die
-        if "tất cả" in msg_lower and "cookie" in msg_lower and "die" in msg_lower:
-            return "Tất cả cookie đã hết hạn"
-        # Không nhận được ảnh
-        if "không nhận được" in msg_lower or "no image" in msg_lower:
-            return "Không nhận được ảnh từ Google"
-        # Proxy
-        if "proxy" in msg_lower:
-            return "Lỗi kết nối proxy"
-        # Fallback: cắt ngắn
-        clean = error_msg.strip()
-        if len(clean) > 50:
-            clean = clean[:47] + "…"
-        return clean
-
     def _flow_update_task_grid_status_slot(self, task_index: int, status: str, error_msg: str):
         """Slot handler: update Task_Grid row background + FlowTaskData status (main thread)."""
         STATUS_COLORS = {
@@ -5961,7 +5875,7 @@ class GoogleLabsFlowQt6(QMainWindow):
                     item = self.flow_task_grid.item(row, col)
                     if item:
                         item.setBackground(bg)
-                # Update Task column (col 1) with status icon - giữ nguyên model info
+                # Update Task column with status icon
                 task_item = self.flow_task_grid.item(row, 1)
                 if task_item:
                     base_text = task_item.text()
@@ -5971,39 +5885,8 @@ class GoogleLabsFlowQt6(QMainWindow):
                             base_text = base_text[len(ic) + 1:]
                             break
                     task_item.setText(f"{icon} {base_text}" if icon else base_text)
-
-                # ✅ CỘT STATUS (col 5) - hiển thị trạng thái chi tiết + lỗi dễ hiểu
-                status_item = self.flow_task_grid.item(row, 5)
-                if not status_item:
-                    status_item = QTableWidgetItem("")
-                    self.flow_task_grid.setItem(row, 5, status_item)
-                    status_item.setBackground(bg)
-
-                if status == "pending":
-                    status_item.setText("⏸ Chờ chạy")
-                    status_item.setForeground(QColor("#94a3b8"))
-                    status_item.setToolTip("")
-                elif status == "running":
-                    status_item.setText("🔄 Đang tạo ảnh…")
-                    status_item.setForeground(QColor("#2563eb"))
-                    status_item.setToolTip("Task đang được xử lý")
-                elif status == "success":
-                    status_item.setText("✅ Thành công")
-                    status_item.setForeground(QColor("#16a34a"))
-                    status_item.setToolTip("")
-                elif status == "error":
-                    friendly = self._parse_friendly_error(error_msg or "")
-                    status_item.setText(f"❌ {friendly}")
-                    status_item.setForeground(QColor("#dc2626"))
-                    # Tooltip hiển thị lỗi gốc đầy đủ
-                    full_error = error_msg or "Không rõ lỗi"
-                    if len(full_error) > 500:
-                        full_error = full_error[:500] + "…"
-                    status_item.setToolTip(f"Chi tiết lỗi:\n{full_error}")
-                else:
-                    status_item.setText(status)
-                    status_item.setForeground(QColor("#475569"))
-
+                    if status == "error" and error_msg:
+                        task_item.setToolTip(f"Lỗi: {error_msg}")
                 # Lock/unlock thumbnail widget while running
                 thumb = self.flow_task_grid.cellWidget(row, 2)
                 if isinstance(thumb, ThumbnailGridWidget):
@@ -8172,31 +8055,17 @@ class GoogleLabsFlowQt6(QMainWindow):
                             error_detail = job_client.last_error_detail or job_client.last_error or "API trả về lỗi"
                             error_str = str(error_detail).lower()
 
-                            # ✅ Nếu là lỗi prompt vi phạm quy tắc / INVALID_ARGUMENT → phân biệt rõ nguyên nhân
+                            # ✅ Nếu là lỗi prompt vi phạm quy tắc cộng đồng / INVALID_ARGUMENT → báo lỗi rõ ràng cho user và bỏ qua task
                             if ("invalid_argument" in error_str
                                 or "public_error_unsafe_generation" in error_str
-                                or "prompt vi phạm quy tắc" in error_str
-                                or "prompt bị từ chối" in error_str):
-                                # Phân biệt: unsafe content vs lỗi format/cú pháp prompt
-                                is_unsafe = ("public_error_unsafe_generation" in error_str
-                                             or "unsafe" in error_str
-                                             or "vi phạm quy tắc nội dung" in error_str)
-                                if is_unsafe:
-                                    user_msg = (
-                                        "Prompt vi phạm quy tắc nội dung của Google "
-                                        "(400 INVALID_ARGUMENT - PUBLIC_ERROR_UNSAFE_GENERATION). "
-                                        "Vui lòng chỉnh sửa nội dung prompt cho phù hợp rồi chạy lại."
-                                    )
-                                    tile_msg = "❌ Prompt vi phạm nội dung"
-                                else:
-                                    user_msg = (
-                                        "Prompt bị từ chối bởi Google (400 INVALID_ARGUMENT). "
-                                        "Có thể do prompt quá dài, chứa ký tự đặc biệt, hoặc format không hợp lệ. "
-                                        "Vui lòng kiểm tra và chỉnh sửa prompt rồi chạy lại."
-                                    )
-                                    tile_msg = "❌ Prompt không hợp lệ"
+                                or "prompt không tuân thủ quy tắc cộng đồng" in error_str):
+                                user_msg = (
+                                    "Prompt không tuân thủ quy tắc cộng đồng của Google "
+                                    "(400 INVALID_ARGUMENT - PUBLIC_ERROR_UNSAFE_GENERATION). "
+                                    "Vui lòng chỉnh sửa nội dung prompt rồi chạy lại."
+                                )
                                 self.log(f"⚠️ Flow job {job_idx}: {user_msg}")
-                                self._flow_update_tile_status(job_idx, tile_msg)
+                                self._flow_update_tile_status(job_idx, "❌ Prompt vi phạm quy tắc cộng đồng")
                                 return {
                                     "job": job,
                                     "image_path": None,
@@ -8271,13 +8140,12 @@ class GoogleLabsFlowQt6(QMainWindow):
                                     return None
                                 
                                 continue  # Thử lại với cookie khác
-                            elif ("403" in error_str or "401" in error_str or
+                            elif ("403" in error_str or "401" in error_str or 
                                   "forbidden" in error_str or "unauthorized" in error_str or
                                   "cookie" in error_str and ("die" in error_str or "expired" in error_str or "invalid" in error_str)):
                                 # ✅ Cookie die (403, 401, forbidden, unauthorized, cookie expired/invalid)
                                 failed_cookies_die.add(cookie_index)
                                 self.log(f"💀 Flow job {job_idx}: Cookie {cookie_index+1} DIE ({error_detail[:100]}) → đổi cookie khác")
-                                self._on_403_detected(job_idx)
                                 
                                 # Kiểm tra xem còn cookie nào sống không
                                 alive_count = len(available_cookies) - len(failed_cookies_die)
@@ -8832,13 +8700,12 @@ class GoogleLabsFlowQt6(QMainWindow):
                             
                             # ✅ KHÔNG reset retry_non_429 khi đổi cookie - giữ nguyên để tránh vòng lặp vô hạn
                             continue
-                        elif ("403" in err_lower or "401" in err_lower or
+                        elif ("403" in err_lower or "401" in err_lower or 
                               "forbidden" in err_lower or "unauthorized" in err_lower or
                               "cookie" in err_lower and ("die" in err_lower or "expired" in err_lower or "invalid" in err_lower)):
                             # ✅ Cookie die từ exception → đánh dấu và đổi cookie ngay
                             failed_cookies_die.add(cookie_index)
                             self.log(f"💀 Flow job {job_idx}: Cookie {cookie_index+1} DIE từ exception ({err_str[:100]}) → đổi cookie khác")
-                            self._on_403_detected(job_idx)
                             
                             # Kiểm tra xem còn cookie nào sống không
                             alive_count = len(available_cookies) - len(failed_cookies_die)
@@ -9725,14 +9592,7 @@ class GoogleLabsFlowQt6(QMainWindow):
         model_display = model_names.get(model_code, model_code)
 
         # Aspect display
-        aspect_names = {
-            "IMAGE_ASPECT_RATIO_LANDSCAPE": "16:9",
-            "IMAGE_ASPECT_RATIO_PORTRAIT": "9:16",
-            "IMAGE_ASPECT_RATIO_LANDSCAPE_FOUR_THREE": "4:3",
-            "IMAGE_ASPECT_RATIO_PORTRAIT_THREE_FOUR": "3:4",
-            "IMAGE_ASPECT_RATIO_SQUARE": "1:1"
-        }
-        aspect_display = aspect_names.get(aspect_ratio, "16:9")
+        aspect_display = "16:9" if "LANDSCAPE" in aspect_ratio else "9:16"
 
         for i, prompt in enumerate(prompts):
             prompt = prompt.strip()
@@ -9798,11 +9658,6 @@ class GoogleLabsFlowQt6(QMainWindow):
             prompt_item = QTableWidgetItem(prompt)
             prompt_item.setToolTip(prompt)
             self.flow_task_grid.setItem(row, 4, prompt_item)
-
-            # Col 5: Status (trạng thái chi tiết)
-            status_detail_item = QTableWidgetItem("⏸ Chờ chạy")
-            status_detail_item.setForeground(QColor("#94a3b8"))
-            self.flow_task_grid.setItem(row, 5, status_detail_item)
 
         self._flow_update_summary_bar()
 
@@ -16524,7 +16379,20 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
             QPushButton:hover { background-color: #d63384; }
         """)
         action_row_2.addWidget(btn_check_live_all)
-
+        
+        # Thêm Proxy Pool button
+        btn_add_proxy = QPushButton("🌐 Thêm Proxy")
+        btn_add_proxy.setStyleSheet("""
+            QPushButton {
+                background-color: #6f42c1; color: white; font-weight: bold;
+                padding: 6px 10px; border-radius: 4px; font-size: 11px;
+                min-width: 100px;
+            }
+            QPushButton:hover { background-color: #5a32a3; }
+        """)
+        btn_add_proxy.setToolTip("Quản lý proxy pool (dùng khi gặp lỗi 403)")
+        action_row_2.addWidget(btn_add_proxy)
+        
         # Moved Copy/Clean from here to Row 1
 
         
@@ -17122,6 +16990,1185 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
             t = threading.Thread(target=run_checks, daemon=True)
             t.start()
         
+        def _on_manage_proxy_pool():
+            """Quản lý proxy pool - dùng khi gặp lỗi 403"""
+            from complete_flow import LabsFlowClient
+            import json
+            
+            proxy_dialog = QDialog(dialog)
+            proxy_dialog.setWindowTitle("🌐 Quản Lý Proxy Pool")
+            proxy_dialog.setMinimumSize(600, 400)
+            
+            layout = QVBoxLayout(proxy_dialog)
+            layout.setSpacing(10)
+            layout.setContentsMargins(15, 15, 15, 15)
+            
+            # Header
+            header = QLabel("🌐 Proxy Pool (dùng khi gặp lỗi 403)")
+            header.setFont(QFont("Segoe UI", 14, QFont.Bold))
+            header.setStyleSheet("color: #6f42c1; padding: 5px;")
+            layout.addWidget(header)
+            
+            # Info
+            info = QLabel("Khi gặp lỗi 403 liên tục, hệ thống sẽ tự động:\n"
+                         "1. Lấy cookie mới từ profile (headless)\n"
+                         "2. Xoay sang proxy tiếp theo trong pool\n"
+                         "3. Restart BrowserContext với cookie + proxy mới")
+            info.setStyleSheet("color: #666; font-size: 11px; padding: 5px;")
+            layout.addWidget(info)
+            
+            # Proxy list
+            proxy_list = QTextEdit()
+            proxy_list.setPlaceholderText("Nhập proxy (mỗi dòng 1 proxy):\n\n"
+                                          "Format 1 - HTTP URL:\n"
+                                          "http://user:pass@host:port\n\n"
+                                          "Format 2 - ip:port:user:pass:\n"
+                                          "166.0.152.176:48033:NXNJUD:MjROuJ\n\n"
+                                          "Format 3 - ip:port (no auth):\n"
+                                          "192.168.1.1:8080")
+            proxy_list.setStyleSheet("""
+                QTextEdit {
+                    font-family: Consolas; font-size: 12px;
+                    background-color: #1e1e1e; color: #d4d4d4;
+                    border: 1px solid #444; border-radius: 5px;
+                    padding: 10px;
+                }
+            """)
+            
+            # Load existing proxy pool
+            existing_proxies = []
+            if hasattr(LabsFlowClient, '_proxy_pool') and LabsFlowClient._proxy_pool:
+                for p in LabsFlowClient._proxy_pool:
+                    server = p.get('server', '')
+                    username = p.get('username', '')
+                    password = p.get('password', '')
+                    # Parse server to get ip:port
+                    if server.startswith('http://'):
+                        server = server[7:]
+                    elif server.startswith('https://'):
+                        server = server[8:]
+                    if username and password:
+                        existing_proxies.append(f"{server}:{username}:{password}")
+                    else:
+                        existing_proxies.append(server)
+            
+            if existing_proxies:
+                proxy_list.setPlainText("\n".join(existing_proxies))
+            
+            layout.addWidget(proxy_list)
+            
+            # Buttons
+            btn_layout = QHBoxLayout()
+            
+            btn_save = QPushButton("💾 Lưu Proxy Pool")
+            btn_save.setStyleSheet("""
+                QPushButton {
+                    background-color: #28a745; color: white; font-weight: bold;
+                    padding: 10px 20px; border-radius: 5px; font-size: 12px;
+                }
+                QPushButton:hover { background-color: #218838; }
+            """)
+            
+            btn_cancel = QPushButton("❌ Hủy")
+            btn_cancel.setStyleSheet("""
+                QPushButton {
+                    background-color: #6c757d; color: white; font-weight: bold;
+                    padding: 10px 20px; border-radius: 5px; font-size: 12px;
+                }
+                QPushButton:hover { background-color: #5a6268; }
+            """)
+            
+            def _save_proxy_pool():
+                text = proxy_list.toPlainText().strip()
+                if not text:
+                    # Clear proxy pool
+                    LabsFlowClient._proxy_pool = []
+                    LabsFlowClient._use_proxy_pool = False
+                    self.log("🌐 Đã xóa proxy pool")
+                    # ✅ Persist to file
+                    self._save_recaptcha_settings()
+                    QMessageBox.information(proxy_dialog, "Thành công", "Đã xóa proxy pool")
+                    proxy_dialog.accept()
+                    return
+                
+                lines = text.strip().split("\n")
+                new_pool = []
+                
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    
+                    # ✅ Format 1: HTTP URL - http://user:pass@host:port
+                    if line.startswith("http://") or line.startswith("https://"):
+                        try:
+                            from urllib.parse import urlparse
+                            parsed = urlparse(line)
+                            host = parsed.hostname or ""
+                            port = parsed.port or 80
+                            username = parsed.username or ""
+                            password = parsed.password or ""
+                            if host:
+                                new_pool.append({
+                                    'server': f'http://{host}:{port}',
+                                    'username': username,
+                                    'password': password
+                                })
+                            else:
+                                self.log(f"⚠️ Proxy URL không hợp lệ: {line[:50]}...")
+                        except Exception as e:
+                            self.log(f"⚠️ Lỗi parse proxy URL: {line[:50]}... - {e}")
+                        continue
+                    
+                    # ✅ Format 2: ip:port:username:password
+                    parts = line.split(":")
+                    if len(parts) >= 4:
+                        ip, port, username, password = parts[0], parts[1], parts[2], ":".join(parts[3:])
+                        new_pool.append({
+                            'server': f'http://{ip}:{port}',
+                            'username': username,
+                            'password': password
+                        })
+                    elif len(parts) == 2:
+                        # ip:port (no auth)
+                        ip, port = parts[0], parts[1]
+                        new_pool.append({
+                            'server': f'http://{ip}:{port}',
+                            'username': '',
+                            'password': ''
+                        })
+                    else:
+                        self.log(f"⚠️ Proxy không hợp lệ: {line}")
+                
+                if new_pool:
+                    LabsFlowClient._proxy_pool = new_pool
+                    LabsFlowClient._use_proxy_pool = True
+                    LabsFlowClient._proxy_pool_index = 0
+                    self.log(f"🌐 Đã lưu {len(new_pool)} proxy vào pool")
+                    # ✅ Persist to file
+                    self._save_recaptcha_settings()
+                    QMessageBox.information(proxy_dialog, "Thành công", f"Đã lưu {len(new_pool)} proxy vào pool")
+                    proxy_dialog.accept()
+                else:
+                    QMessageBox.warning(proxy_dialog, "Lỗi", "Không có proxy hợp lệ nào!")
+            
+            btn_save.clicked.connect(_save_proxy_pool)
+            btn_cancel.clicked.connect(proxy_dialog.reject)
+            
+            btn_layout.addWidget(btn_save)
+            btn_layout.addWidget(btn_cancel)
+            layout.addLayout(btn_layout)
+            
+            proxy_dialog.exec()
+        
+        def _refresh_table():
+            """Refresh table with accounts data"""
+            table.blockSignals(True)
+            table.clearContents()  # ✅ Clear old content/widgets to prevent artifacts
+            table.setRowCount(0)   # Reset row count
+            table.setRowCount(len(accounts))
+            
+            for row, account in enumerate(accounts):
+                email = account.get('email', '')
+                password = account.get('password', '')
+                profile_path = account.get('profile_path', '')
+                selected = account.get('selected', True)
+                credits_value = account.get('credits', None)
+                
+                # 0. Checkbox
+                checkbox_item = QTableWidgetItem()
+                checkbox_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+                checkbox_item.setCheckState(Qt.Checked if selected else Qt.Unchecked)
+                table.setItem(row, 0, checkbox_item)
+            
+                # 1. Email
+                table.setItem(row, 1, QTableWidgetItem(email))
+            
+                # 2. Password (masked)
+                if password:
+                    pwd_display = '*' * min(len(password), 8)
+                    pwd_item = QTableWidgetItem(pwd_display)
+                    pwd_item.setForeground(QColor("#00FF7F"))
+                else:
+                    pwd_item = QTableWidgetItem("N/A")
+                    pwd_item.setForeground(QColor("#6c757d"))
+                table.setItem(row, 2, pwd_item)
+            
+                # 3. Cookies (was Profile Path)
+                # ✅ Check if email exists in cookies_result (case-insensitive)
+                cookies_list = None
+                for k in cookies_result.keys():
+                    if k.strip().lower() == email.strip().lower():
+                        cookies_list = cookies_result.get(k)
+                        break
+                
+                # If not found, try direct lookup
+                if cookies_list is None:
+                    cookies_list = cookies_result.get(email, None)
+                
+                # Convert to list if it's a string or other format
+                if cookies_list and not isinstance(cookies_list, list):
+                    if isinstance(cookies_list, str):
+                        try:
+                            import json
+                            cookies_list = json.loads(cookies_list)
+                        except:
+                            cookies_list = None
+                    else:
+                        cookies_list = None
+                
+                # Display cookies
+                if cookies_list and len(cookies_list) > 0:
+                    # ⚠️ Filter đang giữ 3 cookie nhưng UI chỉ hiển thị 1 theo yêu cầu
+                    cookies_item = QTableWidgetItem("🍪 1")
+                    cookies_item.setForeground(QColor("#00FF7F"))
+                else:
+                    cookies_item = QTableWidgetItem("N/A")
+                    cookies_item.setForeground(QColor("#6c757d"))
+                table.setItem(row, 3, cookies_item)
+            
+                # 4. Status
+                # ✅ Clear status if cookies are deleted
+                if cookies_list and len(cookies_list) > 0:
+                    status_item = QTableWidgetItem("✅ OK")
+                    status_item.setForeground(QColor("#00FF7F"))
+                elif not profile_path or not Path(profile_path).exists() if profile_path else True:
+                    status_item = QTableWidgetItem("⏳ Chờ login")
+                    status_item.setForeground(QColor("#FFD700"))
+                else:
+                    status_item = QTableWidgetItem("⏳ Chưa lấy")
+                    status_item.setForeground(QColor("#00BFFF"))
+                table.setItem(row, 4, status_item)
+                
+                # 5. Credits
+                if credits_value is not None:
+                    credits_item = QTableWidgetItem(f"💰 {credits_value:,}")
+                    if credits_value > 0:
+                        credits_item.setForeground(QColor("#00FF7F"))
+                    else:
+                        credits_item.setForeground(QColor("#FF6B6B")) # Red if 0 or less
+                else:
+                    credits_item = QTableWidgetItem("N/A") # Initialize if unavailable
+                    credits_item.setForeground(QColor("#6c757d"))
+                
+                # Set credits item to table
+                table.setItem(row, 5, credits_item)
+
+                # 6. Actions (Buttons)
+
+                # 6. Actions (Buttons)
+                # Create a specific widget for this cell
+                actions_widget = QWidget()
+                actions_layout = QHBoxLayout(actions_widget)
+                actions_layout.setContentsMargins(2, 2, 2, 2)
+                actions_layout.setSpacing(5)
+                
+                # Btn Edit Profile (Renamed from Profile)
+                btn_edit = QPushButton("✏️ Sửa Profile")
+                btn_edit.setStyleSheet("background-color: #17a2b8; color: white; padding: 3px; font-size: 11px;")
+                btn_edit.setToolTip("Mở Chrome để sửa lỗi/đăng nhập lại")
+                if not profile_path:
+                     btn_edit.setEnabled(False)
+                else:
+                     btn_edit.clicked.connect(lambda checked=False, e=email: _edit_profile(e))
+                
+
+                
+                # Btn Get Credits
+                btn_credits = QPushButton("💰 Credits")
+                btn_credits.setStyleSheet("background-color: #ffc107; color: black; padding: 3px; font-size: 11px;")
+                btn_credits.clicked.connect(lambda checked=False, e=email: _fetch_credits_for_account(e, force=True))
+                
+                # Btn Delete Profile (New)
+                btn_del_prof = QPushButton("🗑️ Xóa Profile")
+                btn_del_prof.setStyleSheet("background-color: #dc3545; color: white; padding: 3px; font-size: 11px;")
+                btn_del_prof.setToolTip("Xóa thư mục profile (Đăng xuất)")
+                btn_del_prof.clicked.connect(lambda checked=False, e=email: _delete_profile_folder(e))
+                
+                actions_layout.addWidget(btn_edit)
+
+                actions_layout.addWidget(btn_credits)
+                actions_layout.addWidget(btn_del_prof)
+                
+                table.setCellWidget(row, 6, actions_widget)
+            
+            table.blockSignals(False)
+        
+        def _on_item_changed(item):
+            """Update account selection state when checkbox changes"""
+            if item.column() == 0:
+                row = item.row()
+                if 0 <= row < len(accounts):
+                    accounts[row]['selected'] = (item.checkState() == Qt.Checked)
+        
+        table.itemChanged.connect(_on_item_changed)
+        
+        # Refresh table after loading accounts
+        _refresh_table()
+        _update_status()
+        
+        # Convert cookies helper function
+        def convert_cookies_to_json_string(cookies_list: List[dict]) -> str:
+            """Convert list of Playwright cookie dicts to JSON string format
+            CHỈ LẤY 3 COOKIE CẦN THIẾT CHO SELENIUM:
+            - __Host-next-auth.csrf-token
+            - __Secure-next-auth.callback-url
+            - __Secure-next-auth.session-token
+            """
+            import json  # Import json inside function to ensure it's accessible
+            import time
+            
+            # ✅ CHỈ LẤY 3 COOKIE CẦN THIẾT
+            REQUIRED_COOKIE_NAMES = {
+                "__Host-next-auth.csrf-token",
+                "__Secure-next-auth.callback-url",
+                "__Secure-next-auth.session-token"
+            }
+            
+            def to_cookiedemo_format(raw: dict) -> dict:
+                """Convert Playwright cookie -> Cookiedemo-like dict"""
+                name = raw.get("name", "")
+                expires = raw.get("expires", -1)
+                
+                if name == "__Secure-next-auth.session-token":
+                    if expires is None or expires == -1:
+                        expires = time.time() + (365 * 24 * 3600)
+                
+                is_session = (expires is None) or (expires == -1)
+                
+                out = {}
+                out["domain"] = "labs.google"
+                if not is_session:
+                    out["expirationDate"] = float(expires)
+                out["hostOnly"] = True
+                out["httpOnly"] = bool(raw.get("httpOnly", False))
+                out["name"] = name
+                out["path"] = raw.get("path", "/")
+                out["sameSite"] = (raw.get("sameSite") or "lax").lower()
+                out["secure"] = bool(raw.get("secure", False))
+                out["session"] = is_session
+                out["storeId"] = None
+                out["value"] = raw.get("value", "")
+                return out
+            
+            # ✅ FILTER CHỈ LẤY 3 COOKIE CẦN THIẾT (domain phải là labs.google)
+            filtered_cookies = []
+            for c in cookies_list:
+                cookie_name = c.get("name", "")
+                cookie_domain = c.get("domain", "").lower()
+                # Chỉ lấy cookie có tên trong danh sách và domain là labs.google (có thể là .labs.google hoặc labs.google)
+                if cookie_name in REQUIRED_COOKIE_NAMES and ("labs.google" in cookie_domain or cookie_domain == ""):
+                    filtered_cookies.append(c)
+            
+            if not filtered_cookies:
+                # Nếu không tìm thấy cookie nào, log warning
+                _log_ui("⚠️ Không tìm thấy cookie cần thiết trong cookies đã lấy!")
+                available_names = [c.get("name", "") for c in cookies_list]
+                self.log(f"⚠️ Không tìm thấy cookie cần thiết. Cookies có sẵn: {available_names}")
+                return "[]"  # Trả về empty array nếu không có cookie
+            
+            converted_cookies = []
+            for c in filtered_cookies:
+                converted = to_cookiedemo_format(c)
+                converted_cookies.append(converted)
+            
+            # Log số lượng cookie đã filter
+            cookie_names = [c['name'] for c in converted_cookies]
+            _log_ui(f"✅ Đã filter {len(converted_cookies)}/3 cookie cần thiết: {', '.join(cookie_names)}")
+            self.log(f"✅ Đã filter {len(converted_cookies)}/3 cookie cần thiết cho Selenium: {', '.join(cookie_names)}")
+            
+            return json.dumps(converted_cookies, indent=4, ensure_ascii=False)
+        
+        # === Event Handlers ===
+        def _on_import_excel():
+            """Import accounts from Excel"""
+            file_path, _ = QFileDialog.getOpenFileName(
+                dialog, "Chọn file Excel",
+                str(Path.home()),
+                "Excel Files (*.xlsx *.xls);;All Files (*)"
+            )
+            
+            if not file_path:
+                    return
+                
+            try:
+                import openpyxl
+                from cookiauto import PROFILES_DIR, db_add_account
+                
+                wb = openpyxl.load_workbook(file_path, read_only=True)
+                sheet = wb.active
+                
+                accounts.clear()
+                saved_count = 0
+                
+                for row_idx, row in enumerate(sheet.iter_rows(min_row=1, values_only=True), start=1):
+                    if not row or not row[0]:
+                            continue
+                        
+                    email = str(row[0]).strip() if row[0] else ''
+                    password = str(row[1]).strip() if len(row) > 1 and row[1] else ''
+                    
+                    if not email:
+                            continue
+                        
+                    safe_email = email.replace("@", "_at_").replace(".", "_")
+                    profile_path = str(PROFILES_DIR / safe_email)
+                    Path(profile_path).mkdir(exist_ok=True)
+            
+                    # ✅ Lưu vào database
+                    try:
+                        db_add_account(email, password, profile_path)
+                        saved_count += 1
+                    except Exception as db_err:
+                        self.log(f"⚠️ Lỗi lưu account {email} vào DB: {db_err}")
+                    
+                    accounts.append({
+                        'email': email,
+                        'password': password,
+                        'profile_path': profile_path,
+                        'selected': True
+                    })
+                
+                wb.close()
+                
+                _log_ui(f"✅ Import {len(accounts)} accounts ({saved_count} đã lưu vào DB)")
+                self.log(f"✅ Đã import {len(accounts)} accounts từ Excel ({saved_count} đã lưu vào DB)")
+                _refresh_table()
+                _update_status()
+                
+            except ImportError:
+                QMessageBox.warning(dialog, "Lỗi", "Cần cài đặt openpyxl:\npip install openpyxl")
+            except Exception as e:
+                self.log(f"❌ Lỗi import Excel: {e}")
+                QMessageBox.warning(dialog, "Lỗi", f"Không thể import Excel:\n{e}")
+        
+        def _on_import_csv():
+            """Import accounts from CSV file"""
+            file_path, _ = QFileDialog.getOpenFileName(
+                dialog, "Chọn file CSV",
+                str(Path.home()),
+                "CSV Files (*.csv);;All Files (*)"
+            )
+            
+            if not file_path:
+                return
+            
+            try:
+                import csv
+                from cookiauto import PROFILES_DIR, db_add_account
+                
+                accounts.clear()
+                saved_count = 0
+                
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    # Try to detect delimiter
+                    sample = f.read(1024)
+                    f.seek(0)
+        
+                    # Check for common delimiters
+                    if '|' in sample:
+                        delimiter = '|'
+                    elif ';' in sample:
+                        delimiter = ';'
+                    else:
+                        delimiter = ','
+                    
+                    reader = csv.reader(f, delimiter=delimiter)
+        
+                    # Skip header if first row looks like header (contains 'email', 'username', etc.)
+                    first_row = next(reader, None)
+                    if first_row:
+                        first_row_lower = [cell.lower().strip() for cell in first_row]
+                        is_header = any(keyword in first_row_lower for keyword in ['email', 'username', 'user', 'account'])
+                        
+                        if not is_header:
+                            # First row is data, process it
+                            email = first_row[0].strip() if len(first_row) > 0 and first_row[0] else ''
+                            password = first_row[1].strip() if len(first_row) > 1 and first_row[1] else ''
+                            
+                            if email:
+                                safe_email = email.replace("@", "_at_").replace(".", "_")
+                                profile_path = str(PROFILES_DIR / safe_email)
+                                Path(profile_path).mkdir(exist_ok=True)
+                                
+                                # ✅ Lưu vào database
+                                try:
+                                    db_add_account(email, password, profile_path)
+                                    saved_count += 1
+                                except Exception as db_err:
+                                    self.log(f"⚠️ Lỗi lưu account {email} vào DB: {db_err}")
+                                
+                                accounts.append({
+                                    'email': email,
+                                    'password': password,
+                                    'profile_path': profile_path,
+                                    'selected': True
+                                })
+                    
+                    # Process remaining rows
+                    for row in reader:
+                        if not row or not row[0]:
+                                continue
+                            
+                        email = row[0].strip() if len(row) > 0 and row[0] else ''
+                        password = row[1].strip() if len(row) > 1 and row[1] else ''
+                        
+                        if not email:
+                            continue
+                        
+                        safe_email = email.replace("@", "_at_").replace(".", "_")
+                        profile_path = str(PROFILES_DIR / safe_email)
+                        Path(profile_path).mkdir(exist_ok=True)
+                        
+                        # ✅ Lưu vào database
+                        try:
+                            db_add_account(email, password, profile_path)
+                            saved_count += 1
+                        except Exception as db_err:
+                            self.log(f"⚠️ Lỗi lưu account {email} vào DB: {db_err}")
+                        
+                        accounts.append({
+                            'email': email,
+                            'password': password,
+                            'profile_path': profile_path,
+                            'selected': True
+                        })
+                
+                _log_ui(f"✅ Import {len(accounts)} accounts từ CSV ({saved_count} đã lưu vào DB)")
+                self.log(f"✅ Đã import {len(accounts)} accounts từ CSV ({saved_count} đã lưu vào DB)")
+                _refresh_table()
+                _update_status()
+                
+            except Exception as e:
+                self.log(f"❌ Lỗi import CSV: {e}")
+                import traceback
+                self.log(traceback.format_exc())
+                QMessageBox.warning(dialog, "Lỗi", f"Không thể import CSV:\n{e}")
+        
+        def _on_import_txt():
+            """Import accounts from TXT file (format: username | password)"""
+            file_path, _ = QFileDialog.getOpenFileName(
+                dialog, "Chọn file TXT",
+                str(Path.home()),
+                "Text Files (*.txt);;All Files (*)"
+            )
+            
+            if not file_path:
+                return
+                
+            try:
+                from cookiauto import PROFILES_DIR, db_add_account
+                
+                accounts.clear()
+                saved_count = 0
+                
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    for line_num, line in enumerate(f, start=1):
+                        line = line.strip()
+                        
+                        # Skip empty lines and comments
+                        if not line or line.startswith('#'):
+                            continue
+                        
+                        # Parse format: username | password
+                        # Support multiple separators: |, :, tab, space
+                        if '|' in line:
+                            parts = [p.strip() for p in line.split('|', 1)]
+                        elif ':' in line:
+                            parts = [p.strip() for p in line.split(':', 1)]
+                        elif '\t' in line:
+                            parts = [p.strip() for p in line.split('\t', 1)]
+                        else:
+                            # Try space as separator (but be careful with emails that might have spaces)
+                            parts = line.split(None, 1)  # Split on whitespace, max 1 split
+                        
+                        if len(parts) < 1:
+                            continue
+                        
+                        email = parts[0].strip()
+                        password = parts[1].strip() if len(parts) > 1 else ''
+                        
+                        if not email:
+                            continue
+                        
+                        # Validate email format (basic check)
+                        if '@' not in email:
+                            self.log(f"⚠️ Dòng {line_num}: '{email}' không phải email hợp lệ, bỏ qua")
+                            continue
+                        
+                        safe_email = email.replace("@", "_at_").replace(".", "_")
+                        profile_path = str(PROFILES_DIR / safe_email)
+                        Path(profile_path).mkdir(exist_ok=True)
+                        
+                        # ✅ Lưu vào database
+                        try:
+                            db_add_account(email, password, profile_path)
+                            saved_count += 1
+                        except Exception as db_err:
+                            self.log(f"⚠️ Lỗi lưu account {email} vào DB: {db_err}")
+                        
+                        accounts.append({
+                            'email': email,
+                            'password': password,
+                            'profile_path': profile_path,
+                            'selected': True
+                        })
+                
+                _log_ui(f"✅ Import {len(accounts)} accounts từ TXT ({saved_count} đã lưu vào DB)")
+                self.log(f"✅ Đã import {len(accounts)} accounts từ TXT ({saved_count} đã lưu vào DB)")
+                _refresh_table()
+                _update_status()
+                
+            except Exception as e:
+                self.log(f"❌ Lỗi import TXT: {e}")
+                import traceback
+                self.log(traceback.format_exc())
+                QMessageBox.warning(dialog, "Lỗi", f"Không thể import TXT:\n{e}")
+        
+        def _on_add_account():
+            """Add new account"""
+            account_dialog = AddAccountDialog(dialog)
+            if account_dialog.exec() != QDialog.Accepted:
+                            return
+            
+            email, password = account_dialog.get_data()
+            if not email:
+                QMessageBox.warning(dialog, "Lỗi", "Email không được để trống!")
+                return
+            
+            from cookiauto import PROFILES_DIR, db_add_account
+            safe_email = email.replace("@", "_at_").replace(".", "_")
+            profile_path = str(PROFILES_DIR / safe_email)
+            Path(profile_path).mkdir(exist_ok=True)
+            
+            # ✅ Lưu account vào database
+            try:
+                db_add_account(email, password, profile_path)
+                self.log(f"💾 Đã lưu account vào DB: {email}")
+            except Exception as db_err:
+                self.log(f"⚠️ Lỗi lưu account vào DB: {db_err}")
+                import traceback
+                self.log(traceback.format_exc())
+            
+            new_account = {
+                'email': email,
+                'password': password,
+                'profile_path': profile_path,
+                'selected': True
+            }
+            
+            # Check duplicate
+            exists = False
+            for i, acc in enumerate(accounts):
+                if acc.get('email') == email:
+                    accounts[i] = new_account
+                    exists = True
+                    break
+            if not exists:
+                accounts.append(new_account)
+            
+            _log_ui(f"➕ Thêm TK: {email}")
+            self.log(f"➕ Đã thêm tài khoản: {email}")
+            _refresh_table()
+            _update_status()
+        
+        def _on_get_cookies():
+            """Get cookies for selected accounts - Bỏ qua accounts thủ công (không có password)"""
+            if not accounts:
+                QMessageBox.warning(dialog, "Lỗi", "Chưa import file Excel hoặc thêm account!")
+                return
+            
+            if cookie_worker_ref[0] and cookie_worker_ref[0].isRunning():
+                cookie_worker_ref[0].stop()
+                _log_ui("⏹️ Dừng")
+                self.log("⏹️ Đã dừng...")
+                return
+            
+            # Get selected accounts
+            all_selected_accounts = []
+            for row in range(table.rowCount()):
+                checkbox = table.item(row, 0)
+                if checkbox and checkbox.checkState() == Qt.Checked:
+                    if row < len(accounts):
+                        all_selected_accounts.append(accounts[row])
+            
+            if not all_selected_accounts:
+                QMessageBox.warning(dialog, "Lỗi", "Chưa chọn tài khoản nào!\nHãy tích chọn ít nhất 1 tài khoản.")
+                return
+            
+            # ✅ Filter: Bỏ qua các account thủ công (không có password)
+            selected_accounts = []
+            skipped_manual_accounts = []
+            
+            for acc in all_selected_accounts:
+                email = acc.get('email', '')
+                password = acc.get('password', '')
+                
+                # Check nếu là account thủ công (không có password hoặc password rỗng)
+                if not password or password.strip() == '':
+                    skipped_manual_accounts.append(email)
+                    self.log(f"⏭️ Bỏ qua account thủ công (không có password): {email}")
+                else:
+                    selected_accounts.append(acc)
+            
+            # ✅ Thông báo nếu có account thủ công bị bỏ qua
+            if skipped_manual_accounts:
+                skipped_count = len(skipped_manual_accounts)
+                skipped_list = ', '.join(skipped_manual_accounts[:3])
+                if skipped_count > 3:
+                    skipped_list += f" ... (+{skipped_count - 3} nữa)"
+                
+                _log_ui(f"⚠️ Đã bỏ qua {skipped_count} account(s) thủ công (không có password): {skipped_list}")
+                self.log(f"⚠️ Đã bỏ qua {skipped_count} account(s) thủ công: {skipped_list}")
+            
+            if not selected_accounts:
+                QMessageBox.warning(
+                    dialog, 
+                    "Không có account hợp lệ", 
+                    f"Tất cả {len(all_selected_accounts)} account(s) đã chọn đều là account thủ công (không có password).\n\n"
+                    f"Chỉ các account có password mới có thể lấy cookies tự động.\n"
+                    f"Account thủ công đã có cookies sẵn, không cần lấy lại."
+                )
+                return
+            
+            _log_ui(f"🚀 Bắt đầu lấy cookies cho {len(selected_accounts)} tài khoản (đã bỏ qua {len(skipped_manual_accounts)} account thủ công)...")
+            self.log(f"🚀 Bắt đầu lấy cookies cho {len(selected_accounts)} tài khoản (đã bỏ qua {len(skipped_manual_accounts)} account thủ công)...")
+            progress.setVisible(True)
+            progress.setMaximum(len(selected_accounts))
+            progress.setValue(0)
+            
+            force_login = chk_force_login.isChecked()
+            threads = spin_threads.value()
+            delay = spin_delay.value()
+            
+            if force_login:
+                self.log("⚠️ Force Login: Bật - sẽ login lại tất cả")
+            self.log(f"⚡ Chạy với {threads} luồng, delay {delay}s")
+            
+            screen = QApplication.primaryScreen().size()
+            screen_size = (screen.width(), screen.height())
+            
+            cookie_worker_ref[0] = CookieWorker(
+                selected_accounts,
+                force_login=force_login,
+                threads=threads,
+                delay=delay,
+                screen_size=screen_size
+            )
+            
+            def on_worker_progress(current: int, total: int, email: str):
+                progress.setValue(current)
+                progress.setFormat(f"{current}/{total} - {email}")
+            
+            def on_worker_finished(results: dict):
+                cookies_result.update(results)
+                progress.setVisible(False)
+                _refresh_table()
+                _update_status()
+                
+                # ✅ Lưu 3 cookie vào SQLite cho mỗi account thành công
+                try:
+                    from cookiauto import db_update_account_cookies
+                    saved_count = 0
+                    for email_key, cookies_list in results.items():
+                        if cookies_list:
+                            try:
+                                # Filter chỉ lấy 3 cookie cần thiết
+                                REQUIRED_COOKIE_NAMES = {
+                                    "__Host-next-auth.csrf-token",
+                                    "__Secure-next-auth.callback-url",
+                                    "__Secure-next-auth.session-token"
+                                }
+                                
+                                filtered_cookies = [
+                                    c for c in cookies_list 
+                                    if c.get("name", "") in REQUIRED_COOKIE_NAMES 
+                                    and ("labs.google" in c.get("domain", "").lower() or c.get("domain", "") == "")
+                                ]
+                                
+                                if filtered_cookies:
+                                    # Convert thành format JSON string
+                                    cookie_json_str = convert_cookies_to_json_string(filtered_cookies)
+                                    
+                                    # Lưu vào database
+                                    if db_update_account_cookies(email_key, cookie_json_str):
+                                        saved_count += 1
+                                        self.log(f"✅ Đã lưu 3 cookies vào DB cho {email_key}")
+                                    else:
+                                        self.log(f"⚠️ Không lưu được cookies vào DB cho {email_key}")
+                            except Exception as e:
+                                self.log(f"⚠️ Lỗi khi lưu cookies cho {email_key}: {e}")
+                                import traceback
+                                self.log(traceback.format_exc())
+                    
+                    if saved_count > 0:
+                        _log_ui(f"💾 Đã lưu cookies cho {saved_count} accounts vào DB")
+                except Exception as e:
+                    self.log(f"⚠️ Lỗi khi lưu cookies vào database: {e}")
+                    import traceback
+                    self.log(traceback.format_exc())
+                
+                success_count = len(results)
+                fail_count = len(failed_accounts)
+                total_count = len(selected_accounts)
+                
+                if fail_count > 0:
+                    _log_ui(f"⚠️ Hoàn tất! Done: {success_count}/{total_count}, Fail: {fail_count}")
+                    self.log(f"⚠️ Hoàn tất! Thành công: {success_count}/{total_count}, THẤT BẠI: {fail_count}")
+                    QMessageBox.warning(dialog, "Có Lỗi!",
+                        f"Tổng: {total_count} accounts\n"
+                        f"✅ Thành công: {success_count}\n"
+                        f"❌ THẤT BẠI: {fail_count}\n\n"
+                        f"Các account FAIL cần BẬT LOGIN để lấy lại cookie!")
+                elif results:
+                    _log_ui(f"✅ Hoàn tất! Done: {success_count}/{total_count} accounts")
+                    self.log(f"✅ Hoàn tất! Lấy được cookies từ {success_count}/{total_count} accounts")
+                    QMessageBox.information(dialog, "Hoàn tất",
+                    f"✅ Đã lấy cookies từ {success_count}/{total_count} accounts.")
+                else:
+                    _log_ui(f"❌ Hoàn tất! Không lấy được cookie nào (0/{total_count})")
+                    self.log(f"❌ Hoàn tất! Không lấy được cookie nào (0/{total_count})")
+            
+            def on_account_failed(email_key: str):
+                failed_accounts.add(email_key)
+                _refresh_table()
+            
+            def on_account_done(email_key: str, cookies: list):
+                cookies_result[email_key] = cookies
+                _refresh_table()
+                try:
+                    _fetch_credits_for_account(email_key)
+                except Exception as e:
+                    self.log(f"⚠️ Error triggering credit fetch: {e}")
+            
+            cookie_worker_ref[0].progress.connect(on_worker_progress)
+            cookie_worker_ref[0].log.connect(self.log)
+            cookie_worker_ref[0].ui_log.connect(_log_ui)
+            cookie_worker_ref[0].finished_signal.connect(on_worker_finished)
+            cookie_worker_ref[0].account_failed.connect(on_account_failed)
+            cookie_worker_ref[0].account_done.connect(on_account_done)
+            failed_accounts.clear()
+            cookie_worker_ref[0].start()
+        
+        def _on_export_txt():
+            """Export cookies to TXT file"""
+            if not cookies_result:
+                QMessageBox.warning(dialog, "Lỗi", "Chưa có cookies để xuất!\nHãy nhấn 'Lấy Cookies' trước.")
+                return
+            
+            from datetime import datetime
+            default_name = f"cookies_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+            desktop_path = Path(os.path.expanduser("~")) / "Desktop"
+            file_path, _ = QFileDialog.getSaveFileName(
+                dialog, "Lưu file cookies",
+                str(desktop_path / default_name),
+                "Text Files (*.txt);;All Files (*)"
+            )
+            
+            if not file_path:
+                return
+            
+            try:
+                import subprocess
+                import platform
+                
+                def to_cookiedemo_format(raw: dict) -> dict:
+                    name = raw.get("name", "")
+                    expires = raw.get("expires", -1)
+                    
+                    if name == "__Secure-next-auth.session-token":
+                        if expires is None or expires == -1:
+                            expires = time.time() + (365 * 24 * 3600)
+                    
+                    is_session = (expires is None) or (expires == -1)
+                    
+                    out = {}
+                    out["domain"] = "labs.google"
+                    if not is_session:
+                        out["expirationDate"] = float(expires)
+                    out["hostOnly"] = True
+                    out["httpOnly"] = bool(raw.get("httpOnly", False))
+                    out["name"] = name
+                    out["path"] = raw.get("path", "/")
+                    out["sameSite"] = (raw.get("sameSite") or "lax").lower()
+                    out["secure"] = bool(raw.get("secure", False))
+                    out["session"] = is_session
+                    out["storeId"] = None
+                    out["value"] = raw.get("value", "")
+                    return out
+                
+                # ✅ CHỈ LẤY 3 COOKIE CẦN THIẾT
+                REQUIRED_COOKIE_NAMES = {
+                    "__Host-next-auth.csrf-token",
+                    "__Secure-next-auth.callback-url",
+                    "__Secure-next-auth.session-token"
+                }
+                
+                all_output_str = ""
+                for email, cookies in cookies_result.items():
+                    # Filter chỉ lấy 3 cookie cần thiết
+                    filtered_cookies = [
+                        c for c in cookies 
+                        if c.get("name", "") in REQUIRED_COOKIE_NAMES 
+                        and ("labs.google" in c.get("domain", "").lower() or c.get("domain", "") == "")
+                    ]
+                    
+                    if not filtered_cookies:
+                        continue  # Bỏ qua account không có cookie cần thiết
+                    
+                    filtered_cookies.sort(key=lambda x: x.get("name", ""))
+                    converted_cookies = []
+                    for c in filtered_cookies:
+                        converted = to_cookiedemo_format(c)
+                        converted_cookies.append(converted)
+                    json_block = json.dumps(converted_cookies, indent=4, ensure_ascii=False)
+                    all_output_str += json_block + "\n\n"
+                
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(all_output_str)
+                
+                _log_ui(f"💾 Xuất Cookie Done - {len(cookies_result)} accounts")
+                self.log(f"✅ Đã xuất vào: {file_path}")
+                QMessageBox.information(dialog, "Thành công",
+                    f"Đã xuất cookies vào:\n{file_path}\n(Mỗi account cách nhau 2 dòng)")
+                
+                folder_path = Path(file_path).parent
+                if platform.system() == "Darwin":  # macOS
+                    subprocess.run(['open', str(folder_path)])
+                elif platform.system() == "Windows":
+                    os.startfile(folder_path)
+                else:
+                    subprocess.run(['xdg-open', str(folder_path)])
+                        
+            except Exception as e:
+                import traceback
+                _log_ui(f"💾 Xuất Cookie Fail")
+                self.log(f"❌ Lỗi xuất file: {e}")
+                self.log(traceback.format_exc())
+                QMessageBox.warning(dialog, "Lỗi", f"Không thể xuất file:\n{e}")
+        
+        def _on_copy_cookie():
+            """Copy cookies to clipboard"""
+            if not cookies_result:
+                QMessageBox.warning(dialog, "Lỗi", "Chưa có cookies để copy!\nHãy nhấn 'Lấy Cookies' trước.")
+                return
+            
+            try:
+                def to_cookiedemo_format(raw: dict) -> dict:
+                    name = raw.get("name", "")
+                    expires = raw.get("expires", -1)
+                    
+                    if name == "__Secure-next-auth.session-token":
+                        if expires is None or expires == -1:
+                            expires = time.time() + (365 * 24 * 3600)
+                    
+                    is_session = (expires is None) or (expires == -1)
+                    
+                    out = {}
+                    out["domain"] = "labs.google"
+                    if not is_session:
+                        out["expirationDate"] = float(expires)
+                    out["hostOnly"] = True
+                    out["httpOnly"] = bool(raw.get("httpOnly", False))
+                    out["name"] = name
+                    out["path"] = raw.get("path", "/")
+                    out["sameSite"] = (raw.get("sameSite") or "lax").lower()
+                    out["secure"] = bool(raw.get("secure", False))
+                    out["session"] = is_session
+                    out["storeId"] = None
+                    out["value"] = raw.get("value", "")
+                    return out
+                
+                # ✅ CHỈ LẤY 3 COOKIE CẦN THIẾT
+                REQUIRED_COOKIE_NAMES = {
+                    "__Host-next-auth.csrf-token",
+                    "__Secure-next-auth.callback-url",
+                    "__Secure-next-auth.session-token"
+                }
+                
+                all_output_str = ""
+                for email, cookies in cookies_result.items():
+                    # Filter chỉ lấy 3 cookie cần thiết
+                    filtered_cookies = [
+                        c for c in cookies 
+                        if c.get("name", "") in REQUIRED_COOKIE_NAMES 
+                        and ("labs.google" in c.get("domain", "").lower() or c.get("domain", "") == "")
+                    ]
+                    
+                    if not filtered_cookies:
+                        continue  # Bỏ qua account không có cookie cần thiết
+                    
+                    filtered_cookies.sort(key=lambda x: x.get("name", ""))
+                    converted_cookies = []
+                    for c in filtered_cookies:
+                        converted = to_cookiedemo_format(c)
+                        converted_cookies.append(converted)
+                    json_block = json.dumps(converted_cookies, indent=4, ensure_ascii=False)
+                    all_output_str += json_block + "\n\n"
+                
+                clipboard = QApplication.clipboard()
+                clipboard.setText(all_output_str.strip())
+                
+                _log_ui(f"📋 Đã copy Cookie - {len(cookies_result)} accounts")
+                self.log(f"✅ Đã copy {len(cookies_result)} accounts vào clipboard")
+                QMessageBox.information(dialog, "Thành công",
+                    f"Đã copy cookies của {len(cookies_result)} accounts vào clipboard!\n(Mỗi account cách nhau 2 dòng)")
+                    
+            except Exception as e:
+                import traceback
+                _log_ui(f"📋 Copy Cookie Fail")
+                self.log(f"❌ Lỗi copy: {e}")
+                self.log(traceback.format_exc())
+                QMessageBox.warning(dialog, "Lỗi", f"Không thể copy:\n{e}")
+        
+        def _on_clean_profiles():
+            """Delete profiles of selected accounts"""
+            import shutil
+            
+            selected_profiles = []
+            for row in range(table.rowCount()):
+                checkbox = table.item(row, 0)
+                if checkbox and checkbox.checkState() == Qt.Checked:
+                    if row < len(accounts):
+                        profile_path = accounts[row].get('profile_path', '')
+                        email = accounts[row].get('email', '')
+                        if email:  # ✅ Chỉ cần có email là đủ, không cần profile_path tồn tại
+                            # ✅ Cho phép xóa account ngay cả khi không có profile_path (để xóa khỏi database)
+                            profile_path_obj = None
+                            if profile_path and Path(profile_path).exists():
+                                profile_path_obj = Path(profile_path)
+                            selected_profiles.append((email, profile_path_obj))
+            
+            if not selected_profiles:
+                QMessageBox.information(dialog, "Thông báo", "Chưa chọn account nào!")
+                return
+            
+            emails_preview = "\n".join([f"• {email}" for email, _ in selected_profiles[:5]])
+            if len(selected_profiles) > 5:
+                emails_preview += f"\n... và {len(selected_profiles) - 5} profiles khác"
+            
+            reply = QMessageBox.question(dialog, "Xác nhận xóa",
+                f"Bạn có chắc muốn XÓA {len(selected_profiles)} profiles?\n\n"
+                f"{emails_preview}\n\n"
+                "⚠️ Hành động này không thể hoàn tác!",
+                QMessageBox.Yes | QMessageBox.No)
+            
+            if reply != QMessageBox.Yes:
+                return
+            
+            deleted = 0
+            # Move imports to top
+            try:
+                from cookiauto import db_delete_account, db_update_account_cookies, db_update_account_credits
+            except ImportError as ie:
+                self.log(f"❌ Critical Import Error: {ie}")
+                QMessageBox.critical(dialog, "Lỗi Import", f"Không thể import functions: {ie}")
+                return
+
+            deleted = 0
+            for email, profile_path in selected_profiles:
+                try:
+                    # 1. Clean Profile Folder
+                    if profile_path and profile_path.is_dir():
+                        shutil.rmtree(profile_path)
+                        deleted += 1
+                        self.log(f"🗑️ Đã xóa folder profile: {email} -> {profile_path.name}")
+                    elif profile_path is None:
+                        self.log(f"🗑️ Account {email} không có profile folder (đã xóa)")
+                        deleted += 1 # Count as deleted from view
+
+                    # 2. Clean Database
+                    clean_email = email.strip()
+                    try:
+                        self.log(f"⚡ Start DB cleaning for: '{clean_email}'")
+                        
+                        # Reset data
+                        db_update_account_cookies(clean_email, "")
+                        # Explicitly set credits to 0
+                        db_update_account_credits(clean_email, 0)
+                        
+                        # Delete row
+                        db_delete_account(clean_email)
+                        
+                        self.log(f"✅ DB Cleaned for: {clean_email}")
+                    except Exception as db_err:
+                        self.log(f"⚠️ Check DB Error for {email}: {db_err}")
+                        import traceback
+                        self.log(traceback.format_exc())
+                    
+                    # 3. Xóa trên Server (nếu có API)
+                    try:
+                        # TODO: Thêm logic xóa trên server nếu có API
+                        # Ví dụ: requests.delete(f"{API_URL}/accounts/{clean_email}")
+                        self.log(f"✅ Đã xóa trên server cho: {clean_email}")
+                    except Exception as server_err:
+                        self.log(f"⚠️ Lỗi xóa trên server cho {email}: {server_err}")
+                        
+                except Exception as e:
+                     self.log(f"❌ General Error deleting {email}: {e}")
+                
+                # ✅ Update UI Data (In-Memory)
+                
+                # 1. Clean cookies_result (Memory) - Remove ALL matching keys
+                # Find all keys matching this email (case-insensitive, striped)
+                keys_to_remove = []
+                for k in list(cookies_result.keys()):  # Use list() to avoid modification during iteration
+                    if k.strip().lower() == clean_email.lower():
+                        keys_to_remove.append(k)
+                
+                for k in keys_to_remove:
+                    del cookies_result[k]
+                    self.log(f"🧹 Removed cookies from memory for: {k}")
+                
+                # ✅ Also try direct key match (exact email)
+                if clean_email in cookies_result:
+                    del cookies_result[clean_email]
+                    self.log(f"🧹 Removed cookies (direct key) for: {clean_email}")
+
+                # 2. Xóa Account khỏi danh sách accounts (xóa hàng khỏi bảng)
+                found_acc = False
+                accounts_to_remove = []
+                for acc in accounts:
+                    acc_email = acc.get('email', '').strip()
+                    if acc_email.lower() == clean_email.lower():
+                        accounts_to_remove.append(acc)
+                        found_acc = True
+                        self.log(f"🗑️ Đã đánh dấu xóa account khỏi danh sách: {acc_email}")
+                
+                # Xóa các account đã đánh dấu
+                for acc in accounts_to_remove:
+                    if acc in accounts:
+                        accounts.remove(acc)
+                        self.log(f"🗑️ Đã xóa account khỏi danh sách: {acc.get('email', '')}")
+                
+                status_msg = "đã xóa khỏi danh sách" if found_acc else "đã xử lý"
+                self.log(f"✅ Account {email} {status_msg}")
+
+            _log_ui(f"✅ Đã reset dữ liệu {deleted}/{len(selected_profiles)} profiles")
+            self.log(f"✅ Đã xử lý {deleted}/{len(selected_profiles)} profiles")
+            
+            # ✅ Refresh UI ngay lập tức
+            _refresh_table()
+            _update_status()
+            
+            QMessageBox.information(dialog, "Hoàn tất", f"Đã reset dữ liệu cho {deleted} accounts thành công!\nCookies và Credits đã được xóa.")
+        
+        def _on_select_all():
+            """Select all accounts"""
+            for row in range(table.rowCount()):
+                checkbox = table.item(row, 0)
+                if checkbox:
+                    checkbox.setCheckState(Qt.Checked)
+            self.log("✓ Đã chọn tất cả")
+        
+        def _on_deselect_all():
+            """Deselect all accounts"""
+            for row in range(table.rowCount()):
+                checkbox = table.item(row, 0)
+                if checkbox:
+                    checkbox.setCheckState(Qt.Unchecked)
+            self.log("✗ Đã bỏ chọn tất cả")
+        
         # Dictionary to store last fetch time to prevent spam
         fetch_timestamps = {}
 
@@ -17144,10 +18191,9 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                                 break
                         
                         if proxy_config:
-                            ptype = proxy_config.get('proxy_type', proxy_config.get('server', 'N/A'))
-                            log_area.append(f"✅ Đã lưu proxy cho {email}: {ptype}")
+                            log_area.append(f"✅ Đã lưu proxy cho {email}: {proxy_config.get('server', 'N/A')}")
                         else:
-                            log_area.append(f"✅ Đã xóa proxy cho {email} (Không dùng)")
+                            log_area.append(f"✅ Đã xóa proxy cho {email} (dùng None)")
                     else:
                         QMessageBox.warning(dialog, "Lỗi", "Không thể lưu proxy config!")
             except Exception as e:
@@ -17412,908 +18458,6 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                     _log_ui(f"❌ Lỗi tổng quát: {e}")
                     QMessageBox.warning(dialog, "Lỗi", f"Không thể lưu cookies: {e}")
 
-        def _on_manage_proxy_pool():
-            """Quản lý proxy pool - dùng khi gặp lỗi 403"""
-            from complete_flow import LabsFlowClient
-            import json
-
-            proxy_dialog = QDialog(dialog)
-            proxy_dialog.setWindowTitle("🌐 Quản Lý Proxy Pool")
-            proxy_dialog.setMinimumSize(600, 400)
-
-            layout = QVBoxLayout(proxy_dialog)
-            layout.setSpacing(10)
-            layout.setContentsMargins(15, 15, 15, 15)
-
-            header = QLabel("🌐 Proxy Pool (dùng khi gặp lỗi 403)")
-            header.setFont(QFont("Segoe UI", 14, QFont.Bold))
-            header.setStyleSheet("color: #6f42c1; padding: 5px;")
-            layout.addWidget(header)
-
-            info = QLabel("Khi gặp lỗi 403 liên tục, hệ thống sẽ tự động:\n"
-                         "1. Lấy cookie mới từ profile (headless)\n"
-                         "2. Xoay sang proxy tiếp theo trong pool\n"
-                         "3. Restart BrowserContext với cookie + proxy mới")
-            info.setStyleSheet("color: #666; font-size: 11px; padding: 5px;")
-            layout.addWidget(info)
-
-            proxy_list = QTextEdit()
-            proxy_list.setPlaceholderText("Nhập proxy (mỗi dòng 1 proxy):\n\n"
-                                          "Format 1 - HTTP URL:\n"
-                                          "http://user:pass@host:port\n\n"
-                                          "Format 2 - ip:port:user:pass:\n"
-                                          "166.0.152.176:48033:NXNJUD:MjROuJ\n\n"
-                                          "Format 3 - ip:port (no auth):\n"
-                                          "192.168.1.1:8080")
-            proxy_list.setStyleSheet("""
-                QTextEdit {
-                    font-family: Consolas; font-size: 12px;
-                    background-color: #1e1e1e; color: #d4d4d4;
-                    border: 1px solid #444; border-radius: 5px;
-                    padding: 10px;
-                }
-            """)
-
-            existing_proxies = []
-            if hasattr(LabsFlowClient, '_proxy_pool') and LabsFlowClient._proxy_pool:
-                for p in LabsFlowClient._proxy_pool:
-                    server = p.get('server', '')
-                    username = p.get('username', '')
-                    password = p.get('password', '')
-                    if server.startswith('http://'):
-                        server = server[7:]
-                    elif server.startswith('https://'):
-                        server = server[8:]
-                    if username and password:
-                        existing_proxies.append(f"{server}:{username}:{password}")
-                    else:
-                        existing_proxies.append(server)
-
-            if existing_proxies:
-                proxy_list.setPlainText("\n".join(existing_proxies))
-
-            layout.addWidget(proxy_list)
-
-            btn_layout = QHBoxLayout()
-
-            btn_save = QPushButton("💾 Lưu Proxy Pool")
-            btn_save.setStyleSheet("""
-                QPushButton {
-                    background-color: #28a745; color: white; font-weight: bold;
-                    padding: 10px 20px; border-radius: 5px; font-size: 12px;
-                }
-                QPushButton:hover { background-color: #218838; }
-            """)
-
-            btn_cancel = QPushButton("❌ Hủy")
-            btn_cancel.setStyleSheet("""
-                QPushButton {
-                    background-color: #6c757d; color: white; font-weight: bold;
-                    padding: 10px 20px; border-radius: 5px; font-size: 12px;
-                }
-                QPushButton:hover { background-color: #5a6268; }
-            """)
-
-            def _save_proxy_pool():
-                text = proxy_list.toPlainText().strip()
-                if not text:
-                    LabsFlowClient._proxy_pool = []
-                    LabsFlowClient._use_proxy_pool = False
-                    self.log("🌐 Đã xóa proxy pool")
-                    self._save_recaptcha_settings()
-                    QMessageBox.information(proxy_dialog, "Thành công", "Đã xóa proxy pool")
-                    proxy_dialog.accept()
-                    return
-
-                lines = text.strip().split("\n")
-                new_pool = []
-
-                for line in lines:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    if line.startswith("http://") or line.startswith("https://"):
-                        try:
-                            from urllib.parse import urlparse
-                            parsed = urlparse(line)
-                            host = parsed.hostname or ""
-                            port = parsed.port or 80
-                            username = parsed.username or ""
-                            password = parsed.password or ""
-                            if host:
-                                new_pool.append({
-                                    'server': f'http://{host}:{port}',
-                                    'username': username,
-                                    'password': password
-                                })
-                        except Exception as e:
-                            self.log(f"⚠️ Lỗi parse proxy URL: {line[:50]}... - {e}")
-                        continue
-                    parts = line.split(":")
-                    if len(parts) >= 4:
-                        ip, port, username, password = parts[0], parts[1], parts[2], ":".join(parts[3:])
-                        new_pool.append({
-                            'server': f'http://{ip}:{port}',
-                            'username': username,
-                            'password': password
-                        })
-                    elif len(parts) == 2:
-                        ip, port = parts[0], parts[1]
-                        new_pool.append({
-                            'server': f'http://{ip}:{port}',
-                            'username': '',
-                            'password': ''
-                        })
-                    else:
-                        self.log(f"⚠️ Proxy không hợp lệ: {line}")
-
-                if new_pool:
-                    LabsFlowClient._proxy_pool = new_pool
-                    LabsFlowClient._use_proxy_pool = True
-                    LabsFlowClient._proxy_pool_index = 0
-                    self.log(f"🌐 Đã lưu {len(new_pool)} proxy vào pool")
-                    self._save_recaptcha_settings()
-                    QMessageBox.information(proxy_dialog, "Thành công", f"Đã lưu {len(new_pool)} proxy vào pool")
-                    proxy_dialog.accept()
-                else:
-                    QMessageBox.warning(proxy_dialog, "Lỗi", "Không có proxy hợp lệ nào!")
-
-            btn_save.clicked.connect(_save_proxy_pool)
-            btn_cancel.clicked.connect(proxy_dialog.reject)
-
-            btn_layout.addWidget(btn_save)
-            btn_layout.addWidget(btn_cancel)
-            layout.addLayout(btn_layout)
-
-            proxy_dialog.exec()
-
-        def _on_item_changed(item):
-            """Update account selection state when checkbox changes"""
-            if item.column() == 0:
-                row = item.row()
-                if 0 <= row < len(accounts):
-                    accounts[row]['selected'] = (item.checkState() == Qt.Checked)
-
-        def _on_import_excel():
-            """Import accounts from Excel"""
-            file_path, _ = QFileDialog.getOpenFileName(
-                dialog, "Chọn file Excel",
-                str(Path.home()),
-                "Excel Files (*.xlsx *.xls);;All Files (*)"
-            )
-            if not file_path:
-                return
-            try:
-                import openpyxl
-                from cookiauto import PROFILES_DIR, db_add_account
-                wb = openpyxl.load_workbook(file_path, read_only=True)
-                sheet = wb.active
-                accounts.clear()
-                saved_count = 0
-                for row_idx, row in enumerate(sheet.iter_rows(min_row=1, values_only=True), start=1):
-                    if not row or not row[0]:
-                        continue
-                    email = str(row[0]).strip() if row[0] else ''
-                    password = str(row[1]).strip() if len(row) > 1 and row[1] else ''
-                    if not email:
-                        continue
-                    safe_email = email.replace("@", "_at_").replace(".", "_")
-                    profile_path = str(PROFILES_DIR / safe_email)
-                    Path(profile_path).mkdir(exist_ok=True)
-                    try:
-                        db_add_account(email, password, profile_path)
-                        saved_count += 1
-                    except Exception as db_err:
-                        self.log(f"⚠️ Lỗi lưu account {email} vào DB: {db_err}")
-                    accounts.append({
-                        'email': email,
-                        'password': password,
-                        'profile_path': profile_path,
-                        'selected': True
-                    })
-                wb.close()
-                _log_ui(f"✅ Import {len(accounts)} accounts ({saved_count} đã lưu vào DB)")
-                self.log(f"✅ Đã import {len(accounts)} accounts từ Excel ({saved_count} đã lưu vào DB)")
-                _refresh_table()
-                _update_status()
-            except ImportError:
-                QMessageBox.warning(dialog, "Lỗi", "Cần cài đặt openpyxl:\npip install openpyxl")
-            except Exception as e:
-                self.log(f"❌ Lỗi import Excel: {e}")
-                QMessageBox.warning(dialog, "Lỗi", f"Không thể import Excel:\n{e}")
-
-        def _on_import_csv():
-            """Import accounts from CSV file"""
-            file_path, _ = QFileDialog.getOpenFileName(
-                dialog, "Chọn file CSV",
-                str(Path.home()),
-                "CSV Files (*.csv);;All Files (*)"
-            )
-            if not file_path:
-                return
-            try:
-                import csv
-                from cookiauto import PROFILES_DIR, db_add_account
-                accounts.clear()
-                saved_count = 0
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    sample = f.read(1024)
-                    f.seek(0)
-                    if '|' in sample:
-                        delimiter = '|'
-                    elif ';' in sample:
-                        delimiter = ';'
-                    else:
-                        delimiter = ','
-                    reader = csv.reader(f, delimiter=delimiter)
-                    first_row = next(reader, None)
-                    if first_row:
-                        first_row_lower = [cell.lower().strip() for cell in first_row]
-                        is_header = any(keyword in first_row_lower for keyword in ['email', 'username', 'user', 'account'])
-                        if not is_header:
-                            email = first_row[0].strip() if len(first_row) > 0 and first_row[0] else ''
-                            password = first_row[1].strip() if len(first_row) > 1 and first_row[1] else ''
-                            if email:
-                                safe_email = email.replace("@", "_at_").replace(".", "_")
-                                profile_path = str(PROFILES_DIR / safe_email)
-                                Path(profile_path).mkdir(exist_ok=True)
-                                try:
-                                    db_add_account(email, password, profile_path)
-                                    saved_count += 1
-                                except Exception as db_err:
-                                    self.log(f"⚠️ Lỗi lưu account {email} vào DB: {db_err}")
-                                accounts.append({
-                                    'email': email,
-                                    'password': password,
-                                    'profile_path': profile_path,
-                                    'selected': True
-                                })
-                    for row in reader:
-                        if not row or not row[0]:
-                            continue
-                        email = row[0].strip() if len(row) > 0 and row[0] else ''
-                        password = row[1].strip() if len(row) > 1 and row[1] else ''
-                        if not email:
-                            continue
-                        safe_email = email.replace("@", "_at_").replace(".", "_")
-                        profile_path = str(PROFILES_DIR / safe_email)
-                        Path(profile_path).mkdir(exist_ok=True)
-                        try:
-                            db_add_account(email, password, profile_path)
-                            saved_count += 1
-                        except Exception as db_err:
-                            self.log(f"⚠️ Lỗi lưu account {email} vào DB: {db_err}")
-                        accounts.append({
-                            'email': email,
-                            'password': password,
-                            'profile_path': profile_path,
-                            'selected': True
-                        })
-                _log_ui(f"✅ Import {len(accounts)} accounts từ CSV ({saved_count} đã lưu vào DB)")
-                self.log(f"✅ Đã import {len(accounts)} accounts từ CSV ({saved_count} đã lưu vào DB)")
-                _refresh_table()
-                _update_status()
-            except Exception as e:
-                self.log(f"❌ Lỗi import CSV: {e}")
-                import traceback
-                self.log(traceback.format_exc())
-                QMessageBox.warning(dialog, "Lỗi", f"Không thể import CSV:\n{e}")
-
-        def _on_import_txt():
-            """Import accounts from TXT file (format: username | password)"""
-            file_path, _ = QFileDialog.getOpenFileName(
-                dialog, "Chọn file TXT",
-                str(Path.home()),
-                "Text Files (*.txt);;All Files (*)"
-            )
-            if not file_path:
-                return
-            try:
-                from cookiauto import PROFILES_DIR, db_add_account
-                accounts.clear()
-                saved_count = 0
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    for line_num, line in enumerate(f, start=1):
-                        line = line.strip()
-                        if not line or line.startswith('#'):
-                            continue
-                        if '|' in line:
-                            parts = [p.strip() for p in line.split('|', 1)]
-                        elif ':' in line:
-                            parts = [p.strip() for p in line.split(':', 1)]
-                        elif '\t' in line:
-                            parts = [p.strip() for p in line.split('\t', 1)]
-                        else:
-                            parts = line.split(None, 1)
-                        if len(parts) < 1:
-                            continue
-                        email = parts[0].strip()
-                        password = parts[1].strip() if len(parts) > 1 else ''
-                        if not email:
-                            continue
-                        if '@' not in email:
-                            self.log(f"⚠️ Dòng {line_num}: '{email}' không phải email hợp lệ, bỏ qua")
-                            continue
-                        safe_email = email.replace("@", "_at_").replace(".", "_")
-                        profile_path = str(PROFILES_DIR / safe_email)
-                        Path(profile_path).mkdir(exist_ok=True)
-                        try:
-                            db_add_account(email, password, profile_path)
-                            saved_count += 1
-                        except Exception as db_err:
-                            self.log(f"⚠️ Lỗi lưu account {email} vào DB: {db_err}")
-                        accounts.append({
-                            'email': email,
-                            'password': password,
-                            'profile_path': profile_path,
-                            'selected': True
-                        })
-                _log_ui(f"✅ Import {len(accounts)} accounts từ TXT ({saved_count} đã lưu vào DB)")
-                self.log(f"✅ Đã import {len(accounts)} accounts từ TXT ({saved_count} đã lưu vào DB)")
-                _refresh_table()
-                _update_status()
-            except Exception as e:
-                self.log(f"❌ Lỗi import TXT: {e}")
-                import traceback
-                self.log(traceback.format_exc())
-                QMessageBox.warning(dialog, "Lỗi", f"Không thể import TXT:\n{e}")
-
-        def _on_add_account():
-            """Add new account"""
-            account_dialog = AddAccountDialog(dialog)
-            if account_dialog.exec() != QDialog.Accepted:
-                return
-            email, password = account_dialog.get_data()
-            if not email:
-                QMessageBox.warning(dialog, "Lỗi", "Email không được để trống!")
-                return
-            from cookiauto import PROFILES_DIR, db_add_account
-            safe_email = email.replace("@", "_at_").replace(".", "_")
-            profile_path = str(PROFILES_DIR / safe_email)
-            Path(profile_path).mkdir(exist_ok=True)
-            try:
-                db_add_account(email, password, profile_path)
-                self.log(f"💾 Đã lưu account vào DB: {email}")
-            except Exception as db_err:
-                self.log(f"⚠️ Lỗi lưu account vào DB: {db_err}")
-                import traceback
-                self.log(traceback.format_exc())
-            new_account = {
-                'email': email,
-                'password': password,
-                'profile_path': profile_path,
-                'selected': True
-            }
-            exists = False
-            for i, acc in enumerate(accounts):
-                if acc.get('email') == email:
-                    accounts[i] = new_account
-                    exists = True
-                    break
-            if not exists:
-                accounts.append(new_account)
-            _log_ui(f"➕ Thêm TK: {email}")
-            self.log(f"➕ Đã thêm tài khoản: {email}")
-            _refresh_table()
-            _update_status()
-
-        def _on_get_cookies():
-            """Get cookies for selected accounts"""
-            if not accounts:
-                QMessageBox.warning(dialog, "Lỗi", "Chưa import file Excel hoặc thêm account!")
-                return
-            if cookie_worker_ref[0] and cookie_worker_ref[0].isRunning():
-                cookie_worker_ref[0].stop()
-                _log_ui("⏹️ Dừng")
-                self.log("⏹️ Đã dừng...")
-                return
-            all_selected_accounts = []
-            for row in range(table.rowCount()):
-                checkbox = table.item(row, 0)
-                if checkbox and checkbox.checkState() == Qt.Checked:
-                    if row < len(accounts):
-                        all_selected_accounts.append(accounts[row])
-            if not all_selected_accounts:
-                QMessageBox.warning(dialog, "Lỗi", "Chưa chọn tài khoản nào!\nHãy tích chọn ít nhất 1 tài khoản.")
-                return
-            selected_accounts = []
-            skipped_manual_accounts = []
-            for acc in all_selected_accounts:
-                email = acc.get('email', '')
-                password = acc.get('password', '')
-                if not password or password.strip() == '':
-                    skipped_manual_accounts.append(email)
-                    self.log(f"⏭️ Bỏ qua account thủ công: {email}")
-                else:
-                    selected_accounts.append(acc)
-            if skipped_manual_accounts:
-                skipped_count = len(skipped_manual_accounts)
-                skipped_list = ', '.join(skipped_manual_accounts[:3])
-                if skipped_count > 3:
-                    skipped_list += f" ... (+{skipped_count - 3} nữa)"
-                _log_ui(f"⚠️ Đã bỏ qua {skipped_count} account(s) thủ công: {skipped_list}")
-                self.log(f"⚠️ Đã bỏ qua {skipped_count} account(s) thủ công: {skipped_list}")
-            if not selected_accounts:
-                QMessageBox.warning(dialog, "Không có account hợp lệ",
-                    f"Tất cả {len(all_selected_accounts)} account(s) đã chọn đều là account thủ công.")
-                return
-            _log_ui(f"🚀 Bắt đầu lấy cookies cho {len(selected_accounts)} tài khoản...")
-            self.log(f"🚀 Bắt đầu lấy cookies cho {len(selected_accounts)} tài khoản...")
-            progress.setVisible(True)
-            progress.setMaximum(len(selected_accounts))
-            progress.setValue(0)
-            force_login = chk_force_login.isChecked()
-            threads = spin_threads.value()
-            delay = spin_delay.value()
-            if force_login:
-                self.log("⚠️ Force Login: Bật")
-            self.log(f"⚡ Chạy với {threads} luồng, delay {delay}s")
-            screen = QApplication.primaryScreen().size()
-            screen_size = (screen.width(), screen.height())
-            cookie_worker_ref[0] = CookieWorker(
-                selected_accounts,
-                force_login=force_login,
-                threads=threads,
-                delay=delay,
-                screen_size=screen_size
-            )
-            def on_worker_progress(current: int, total: int, email: str):
-                progress.setValue(current)
-                progress.setFormat(f"{current}/{total} - {email}")
-            def on_worker_finished(results: dict):
-                cookies_result.update(results)
-                progress.setVisible(False)
-                _refresh_table()
-                _update_status()
-                success_count = len(results)
-                fail_count = len(failed_accounts)
-                total_count = len(selected_accounts)
-                if fail_count > 0:
-                    _log_ui(f"⚠️ Hoàn tất! Done: {success_count}/{total_count}, Fail: {fail_count}")
-                    self.log(f"⚠️ Hoàn tất! Thành công: {success_count}/{total_count}, THẤT BẠI: {fail_count}")
-                    QMessageBox.warning(dialog, "Có Lỗi!",
-                        f"Tổng: {total_count} accounts\n✅ Thành công: {success_count}\n❌ THẤT BẠI: {fail_count}")
-                elif results:
-                    _log_ui(f"✅ Hoàn tất! Done: {success_count}/{total_count} accounts")
-                    self.log(f"✅ Hoàn tất! Lấy được cookies từ {success_count}/{total_count} accounts")
-                    QMessageBox.information(dialog, "Hoàn tất",
-                        f"✅ Đã lấy cookies từ {success_count}/{total_count} accounts.")
-                else:
-                    _log_ui(f"❌ Hoàn tất! Không lấy được cookie nào")
-                    self.log(f"❌ Hoàn tất! Không lấy được cookie nào (0/{total_count})")
-            def on_account_failed(email_key: str):
-                failed_accounts.add(email_key)
-                _refresh_table()
-            def on_account_done(email_key: str, cookies: list):
-                cookies_result[email_key] = cookies
-                _refresh_table()
-                try:
-                    _fetch_credits_for_account(email_key)
-                except Exception as e:
-                    self.log(f"⚠️ Error triggering credit fetch: {e}")
-            cookie_worker_ref[0].progress.connect(on_worker_progress)
-            cookie_worker_ref[0].log.connect(self.log)
-            cookie_worker_ref[0].ui_log.connect(_log_ui)
-            cookie_worker_ref[0].finished_signal.connect(on_worker_finished)
-            cookie_worker_ref[0].account_failed.connect(on_account_failed)
-            cookie_worker_ref[0].account_done.connect(on_account_done)
-            failed_accounts.clear()
-            cookie_worker_ref[0].start()
-
-        def _on_export_txt():
-            """Export cookies to TXT file"""
-            if not cookies_result:
-                QMessageBox.warning(dialog, "Lỗi", "Chưa có cookies để xuất!\nHãy nhấn 'Lấy Cookies' trước.")
-                return
-            from datetime import datetime
-            default_name = f"cookies_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-            desktop_path = Path(os.path.expanduser("~")) / "Desktop"
-            file_path, _ = QFileDialog.getSaveFileName(
-                dialog, "Lưu file cookies",
-                str(desktop_path / default_name),
-                "Text Files (*.txt);;All Files (*)"
-            )
-            if not file_path:
-                return
-            try:
-                import subprocess
-                import platform
-                def to_cookiedemo_format(raw: dict) -> dict:
-                    name = raw.get("name", "")
-                    expires = raw.get("expires", -1)
-                    if name == "__Secure-next-auth.session-token":
-                        if expires is None or expires == -1:
-                            expires = time.time() + (365 * 24 * 3600)
-                    is_session = (expires is None) or (expires == -1)
-                    out = {}
-                    out["domain"] = "labs.google"
-                    if not is_session:
-                        out["expirationDate"] = float(expires)
-                    out["hostOnly"] = True
-                    out["httpOnly"] = bool(raw.get("httpOnly", False))
-                    out["name"] = name
-                    out["path"] = raw.get("path", "/")
-                    out["sameSite"] = (raw.get("sameSite") or "lax").lower()
-                    out["secure"] = bool(raw.get("secure", False))
-                    out["session"] = is_session
-                    out["storeId"] = None
-                    out["value"] = raw.get("value", "")
-                    return out
-                REQUIRED_COOKIE_NAMES = {
-                    "__Host-next-auth.csrf-token",
-                    "__Secure-next-auth.callback-url",
-                    "__Secure-next-auth.session-token"
-                }
-                all_output_str = ""
-                for email, cookies in cookies_result.items():
-                    filtered_cookies = [
-                        c for c in cookies
-                        if c.get("name", "") in REQUIRED_COOKIE_NAMES
-                        and ("labs.google" in c.get("domain", "").lower() or c.get("domain", "") == "")
-                    ]
-                    if not filtered_cookies:
-                        continue
-                    filtered_cookies.sort(key=lambda x: x.get("name", ""))
-                    converted_cookies = [to_cookiedemo_format(c) for c in filtered_cookies]
-                    json_block = json.dumps(converted_cookies, indent=4, ensure_ascii=False)
-                    all_output_str += json_block + "\n\n"
-                with open(file_path, 'w', encoding='utf-8') as f:
-                    f.write(all_output_str)
-                _log_ui(f"💾 Xuất Cookie Done - {len(cookies_result)} accounts")
-                self.log(f"✅ Đã xuất vào: {file_path}")
-                QMessageBox.information(dialog, "Thành công",
-                    f"Đã xuất cookies vào:\n{file_path}\n(Mỗi account cách nhau 2 dòng)")
-                folder_path = Path(file_path).parent
-                if platform.system() == "Darwin":
-                    subprocess.run(['open', str(folder_path)])
-                elif platform.system() == "Windows":
-                    os.startfile(folder_path)
-                else:
-                    subprocess.run(['xdg-open', str(folder_path)])
-            except Exception as e:
-                import traceback
-                _log_ui(f"💾 Xuất Cookie Fail")
-                self.log(f"❌ Lỗi xuất file: {e}")
-                self.log(traceback.format_exc())
-                QMessageBox.warning(dialog, "Lỗi", f"Không thể xuất file:\n{e}")
-
-        def _on_copy_cookie():
-            """Copy cookies to clipboard"""
-            if not cookies_result:
-                QMessageBox.warning(dialog, "Lỗi", "Chưa có cookies để copy!\nHãy nhấn 'Lấy Cookies' trước.")
-                return
-            try:
-                def to_cookiedemo_format(raw: dict) -> dict:
-                    name = raw.get("name", "")
-                    expires = raw.get("expires", -1)
-                    if name == "__Secure-next-auth.session-token":
-                        if expires is None or expires == -1:
-                            expires = time.time() + (365 * 24 * 3600)
-                    is_session = (expires is None) or (expires == -1)
-                    out = {}
-                    out["domain"] = "labs.google"
-                    if not is_session:
-                        out["expirationDate"] = float(expires)
-                    out["hostOnly"] = True
-                    out["httpOnly"] = bool(raw.get("httpOnly", False))
-                    out["name"] = name
-                    out["path"] = raw.get("path", "/")
-                    out["sameSite"] = (raw.get("sameSite") or "lax").lower()
-                    out["secure"] = bool(raw.get("secure", False))
-                    out["session"] = is_session
-                    out["storeId"] = None
-                    out["value"] = raw.get("value", "")
-                    return out
-                REQUIRED_COOKIE_NAMES = {
-                    "__Host-next-auth.csrf-token",
-                    "__Secure-next-auth.callback-url",
-                    "__Secure-next-auth.session-token"
-                }
-                all_output_str = ""
-                for email, cookies in cookies_result.items():
-                    filtered_cookies = [
-                        c for c in cookies
-                        if c.get("name", "") in REQUIRED_COOKIE_NAMES
-                        and ("labs.google" in c.get("domain", "").lower() or c.get("domain", "") == "")
-                    ]
-                    if not filtered_cookies:
-                        continue
-                    filtered_cookies.sort(key=lambda x: x.get("name", ""))
-                    converted_cookies = [to_cookiedemo_format(c) for c in filtered_cookies]
-                    json_block = json.dumps(converted_cookies, indent=4, ensure_ascii=False)
-                    all_output_str += json_block + "\n\n"
-                clipboard = QApplication.clipboard()
-                clipboard.setText(all_output_str.strip())
-                _log_ui(f"📋 Đã copy Cookie - {len(cookies_result)} accounts")
-                self.log(f"✅ Đã copy {len(cookies_result)} accounts vào clipboard")
-                QMessageBox.information(dialog, "Thành công",
-                    f"Đã copy cookies của {len(cookies_result)} accounts vào clipboard!")
-            except Exception as e:
-                import traceback
-                _log_ui(f"📋 Copy Cookie Fail")
-                self.log(f"❌ Lỗi copy: {e}")
-                self.log(traceback.format_exc())
-                QMessageBox.warning(dialog, "Lỗi", f"Không thể copy:\n{e}")
-
-        def _on_clean_profiles():
-            """Delete profiles of selected accounts"""
-            import shutil
-            selected_profiles = []
-            for row in range(table.rowCount()):
-                checkbox = table.item(row, 0)
-                if checkbox and checkbox.checkState() == Qt.Checked:
-                    if row < len(accounts):
-                        profile_path = accounts[row].get('profile_path', '')
-                        email = accounts[row].get('email', '')
-                        if email:
-                            profile_path_obj = None
-                            if profile_path and Path(profile_path).exists():
-                                profile_path_obj = Path(profile_path)
-                            selected_profiles.append((email, profile_path_obj))
-            if not selected_profiles:
-                QMessageBox.information(dialog, "Thông báo", "Chưa chọn account nào!")
-                return
-            emails_preview = "\n".join([f"• {email}" for email, _ in selected_profiles[:5]])
-            if len(selected_profiles) > 5:
-                emails_preview += f"\n... và {len(selected_profiles) - 5} profiles khác"
-            reply = QMessageBox.question(dialog, "Xác nhận xóa",
-                f"Bạn có chắc muốn XÓA {len(selected_profiles)} profiles?\n\n"
-                f"{emails_preview}\n\n"
-                "⚠️ Hành động này không thể hoàn tác!",
-                QMessageBox.Yes | QMessageBox.No)
-            if reply != QMessageBox.Yes:
-                return
-            deleted = 0
-            try:
-                from cookiauto import db_delete_account, db_update_account_cookies, db_update_account_credits
-            except ImportError as ie:
-                self.log(f"❌ Critical Import Error: {ie}")
-                QMessageBox.critical(dialog, "Lỗi Import", f"Không thể import functions: {ie}")
-                return
-            for email, profile_path in selected_profiles:
-                try:
-                    if profile_path and profile_path.is_dir():
-                        shutil.rmtree(profile_path)
-                        deleted += 1
-                        self.log(f"🗑️ Đã xóa folder profile: {email}")
-                    elif profile_path is None:
-                        self.log(f"🗑️ Account {email} không có profile folder")
-                        deleted += 1
-                    clean_email = email.strip()
-                    try:
-                        self.log(f"⚡ Start DB cleaning for: '{clean_email}'")
-                        db_update_account_cookies(clean_email, "")
-                        db_update_account_credits(clean_email, 0)
-                        db_delete_account(clean_email)
-                        self.log(f"✅ DB Cleaned for: {clean_email}")
-                    except Exception as db_err:
-                        self.log(f"⚠️ Check DB Error for {email}: {db_err}")
-                        import traceback
-                        self.log(traceback.format_exc())
-                    try:
-                        self.log(f"✅ Đã xóa trên server cho: {clean_email}")
-                    except Exception as server_err:
-                        self.log(f"⚠️ Lỗi xóa trên server cho {email}: {server_err}")
-                except Exception as e:
-                    self.log(f"❌ General Error deleting {email}: {e}")
-                keys_to_remove = []
-                for k in list(cookies_result.keys()):
-                    if k.strip().lower() == clean_email.lower():
-                        keys_to_remove.append(k)
-                for k in keys_to_remove:
-                    del cookies_result[k]
-                    self.log(f"🧹 Removed cookies from memory for: {k}")
-                if clean_email in cookies_result:
-                    del cookies_result[clean_email]
-                    self.log(f"🧹 Removed cookies (direct key) for: {clean_email}")
-                found_acc = False
-                accounts_to_remove = []
-                for acc in accounts:
-                    acc_email = acc.get('email', '').strip()
-                    if acc_email.lower() == clean_email.lower():
-                        accounts_to_remove.append(acc)
-                        found_acc = True
-                        self.log(f"🗑️ Đã đánh dấu xóa account: {acc_email}")
-                for acc in accounts_to_remove:
-                    if acc in accounts:
-                        accounts.remove(acc)
-                        self.log(f"🗑️ Đã xóa account: {acc.get('email', '')}")
-                status_msg = "đã xóa khỏi danh sách" if found_acc else "đã xử lý"
-                self.log(f"✅ Account {email} {status_msg}")
-            _log_ui(f"✅ Đã reset dữ liệu {deleted}/{len(selected_profiles)} profiles")
-            self.log(f"✅ Đã xử lý {deleted}/{len(selected_profiles)} profiles")
-            _refresh_table()
-            _update_status()
-            QMessageBox.information(dialog, "Hoàn tất", f"Đã reset dữ liệu cho {deleted} accounts thành công!")
-
-        def _on_select_all():
-            """Select all accounts"""
-            for row in range(table.rowCount()):
-                checkbox = table.item(row, 0)
-                if checkbox:
-                    checkbox.setCheckState(Qt.Checked)
-            self.log("✓ Đã chọn tất cả")
-
-        def _on_deselect_all():
-            """Deselect all accounts"""
-            for row in range(table.rowCount()):
-                checkbox = table.item(row, 0)
-                if checkbox:
-                    checkbox.setCheckState(Qt.Unchecked)
-            self.log("✗ Đã bỏ chọn tất cả")
-
-        def _refresh_table():
-            """Refresh table with accounts data"""
-            table.blockSignals(True)
-            table.clearContents()
-            table.setRowCount(0)
-            table.setRowCount(len(accounts))
-
-            for row, account in enumerate(accounts):
-                email = account.get('email', '')
-                password = account.get('password', '')
-                profile_path = account.get('profile_path', '')
-                selected = account.get('selected', True)
-                credits_value = account.get('credits', None)
-
-                # 0. Checkbox
-                checkbox_item = QTableWidgetItem()
-                checkbox_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
-                checkbox_item.setCheckState(Qt.Checked if selected else Qt.Unchecked)
-                table.setItem(row, 0, checkbox_item)
-
-                # 1. Email
-                table.setItem(row, 1, QTableWidgetItem(email))
-
-                # 2. Password (masked)
-                if password:
-                    pwd_display = '*' * min(len(password), 8)
-                    pwd_item = QTableWidgetItem(pwd_display)
-                    pwd_item.setForeground(QColor("#00FF7F"))
-                else:
-                    pwd_item = QTableWidgetItem("N/A")
-                    pwd_item.setForeground(QColor("#6c757d"))
-                table.setItem(row, 2, pwd_item)
-
-                # 3. Cookies
-                cookies_list = None
-                for k in cookies_result.keys():
-                    if k.strip().lower() == email.strip().lower():
-                        cookies_list = cookies_result.get(k)
-                        break
-                if cookies_list is None:
-                    cookies_list = cookies_result.get(email, None)
-                if cookies_list and not isinstance(cookies_list, list):
-                    if isinstance(cookies_list, str):
-                        try:
-                            import json
-                            cookies_list = json.loads(cookies_list)
-                        except:
-                            cookies_list = None
-                    else:
-                        cookies_list = None
-
-                if cookies_list and len(cookies_list) > 0:
-                    cookies_item = QTableWidgetItem("🍪 1")
-                    cookies_item.setForeground(QColor("#00FF7F"))
-                else:
-                    cookies_item = QTableWidgetItem("N/A")
-                    cookies_item.setForeground(QColor("#6c757d"))
-                table.setItem(row, 3, cookies_item)
-
-                # 4. Status
-                if cookies_list and len(cookies_list) > 0:
-                    status_item = QTableWidgetItem("✅ OK")
-                    status_item.setForeground(QColor("#00FF7F"))
-                elif not profile_path or not Path(profile_path).exists() if profile_path else True:
-                    status_item = QTableWidgetItem("⏳ Chờ login")
-                    status_item.setForeground(QColor("#FFD700"))
-                else:
-                    status_item = QTableWidgetItem("⏳ Chưa lấy")
-                    status_item.setForeground(QColor("#00BFFF"))
-                table.setItem(row, 4, status_item)
-
-                # 5. Credits
-                if credits_value is not None:
-                    credits_item = QTableWidgetItem(f"💰 {credits_value:,}")
-                    if credits_value > 0:
-                        credits_item.setForeground(QColor("#00FF7F"))
-                    else:
-                        credits_item.setForeground(QColor("#FF6B6B"))
-                else:
-                    credits_item = QTableWidgetItem("N/A")
-                    credits_item.setForeground(QColor("#6c757d"))
-                table.setItem(row, 5, credits_item)
-
-                # 6. Actions
-                actions_widget = QWidget()
-                actions_layout = QHBoxLayout(actions_widget)
-                actions_layout.setContentsMargins(2, 2, 2, 2)
-                actions_layout.setSpacing(5)
-
-                btn_edit = QPushButton("✏️ Sửa Profile")
-                btn_edit.setStyleSheet("background-color: #17a2b8; color: white; padding: 3px; font-size: 11px;")
-                btn_edit.setToolTip("Mở Chrome để sửa lỗi/đăng nhập lại")
-                if not profile_path:
-                    btn_edit.setEnabled(False)
-                else:
-                    btn_edit.clicked.connect(lambda checked=False, e=email: _edit_profile(e))
-
-                btn_credits = QPushButton("💰 Credits")
-                btn_credits.setStyleSheet("background-color: #ffc107; color: black; padding: 3px; font-size: 11px;")
-                btn_credits.clicked.connect(lambda checked=False, e=email: _fetch_credits_for_account(e, force=True))
-
-                btn_del_prof = QPushButton("🗑️ Xóa Profile")
-                btn_del_prof.setStyleSheet("background-color: #dc3545; color: white; padding: 3px; font-size: 11px;")
-                btn_del_prof.setToolTip("Xóa thư mục profile")
-                btn_del_prof.clicked.connect(lambda checked=False, e=email: _delete_profile_folder(e))
-
-                actions_layout.addWidget(btn_edit)
-                actions_layout.addWidget(btn_credits)
-                actions_layout.addWidget(btn_del_prof)
-                table.setCellWidget(row, 6, actions_widget)
-
-            table.blockSignals(False)
-
-        def _on_item_changed(item):
-            """Update account selection state when checkbox changes"""
-            if item.column() == 0:
-                row = item.row()
-                if 0 <= row < len(accounts):
-                    accounts[row]['selected'] = (item.checkState() == Qt.Checked)
-
-        table.itemChanged.connect(_on_item_changed)
-
-        _refresh_table()
-        _update_status()
-
-        def convert_cookies_to_json_string(cookies_list: List[dict]) -> str:
-            """Convert list of Playwright cookie dicts to JSON string format"""
-            import json
-            import time
-            REQUIRED_COOKIE_NAMES = {
-                "__Host-next-auth.csrf-token",
-                "__Secure-next-auth.callback-url",
-                "__Secure-next-auth.session-token"
-            }
-            def to_cookiedemo_format(raw: dict) -> dict:
-                name = raw.get("name", "")
-                expires = raw.get("expires", -1)
-                if name == "__Secure-next-auth.session-token":
-                    if expires is None or expires == -1:
-                        expires = time.time() + (365 * 24 * 3600)
-                is_session = (expires is None) or (expires == -1)
-                out = {}
-                out["domain"] = "labs.google"
-                if not is_session:
-                    out["expirationDate"] = float(expires)
-                out["hostOnly"] = True
-                out["httpOnly"] = bool(raw.get("httpOnly", False))
-                out["name"] = name
-                out["path"] = raw.get("path", "/")
-                out["sameSite"] = (raw.get("sameSite") or "lax").lower()
-                out["secure"] = bool(raw.get("secure", False))
-                out["session"] = is_session
-                out["storeId"] = None
-                out["value"] = raw.get("value", "")
-                return out
-            filtered_cookies = []
-            for c in cookies_list:
-                cookie_name = c.get("name", "")
-                cookie_domain = c.get("domain", "").lower()
-                if cookie_name in REQUIRED_COOKIE_NAMES and ("labs.google" in cookie_domain or cookie_domain == ""):
-                    filtered_cookies.append(c)
-            if not filtered_cookies:
-                _log_ui("⚠️ Không tìm thấy cookie cần thiết trong cookies đã lấy!")
-                available_names = [c.get("name", "") for c in cookies_list]
-                self.log(f"⚠️ Không tìm thấy cookie cần thiết. Cookies có sẵn: {available_names}")
-                return "[]"
-            converted_cookies = [to_cookiedemo_format(c) for c in filtered_cookies]
-            cookie_names = [c['name'] for c in converted_cookies]
-            _log_ui(f"✅ Đã filter {len(converted_cookies)}/3 cookie cần thiết: {', '.join(cookie_names)}")
-            self.log(f"✅ Đã filter {len(converted_cookies)}/3 cookie cần thiết: {', '.join(cookie_names)}")
-            return json.dumps(converted_cookies, indent=4, ensure_ascii=False)
-
         btn_import_excel.clicked.connect(_on_import_excel)
         btn_import_csv.clicked.connect(_on_import_csv)
         btn_import_txt.clicked.connect(_on_import_txt)
@@ -18327,6 +18471,9 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
         btn_clean.clicked.connect(_on_clean_profiles)
         btn_select_all.clicked.connect(_on_select_all)
         btn_deselect_all.clicked.connect(_on_deselect_all)
+        btn_add_proxy.clicked.connect(_on_manage_proxy_pool)
+        
+        # Initial refresh
         _refresh_table()
         _update_status()
         
@@ -18351,8 +18498,6 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
         if dialog.exec() == QDialog.Accepted:
             # Collect cookies from cookies_result (dict {email: list_of_cookie_dicts})
             parsed_cookies = []
-            parsed_profile_paths = []  # ✅ Lưu profile_path song song với cookies
-            parsed_emails = []  # ✅ Lưu email song song với cookies (cho proxy per-account)
             
             # Debug: Log cookies_result
             self.log(f"🔍 cookies_result có {len(cookies_result)} entries")
@@ -18363,14 +18508,6 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                         # Convert list of Playwright cookie dicts to JSON string format
                         cookie_json_str = convert_cookies_to_json_string(cookies_list)
                         parsed_cookies.append(cookie_json_str)
-                        # ✅ Tìm profile_path cho email này
-                        email_profile_path = None
-                        for acc in accounts:
-                            if acc.get('email') == email_key:
-                                email_profile_path = acc.get('profile_path', '')
-                                break
-                        parsed_profile_paths.append(email_profile_path or '')
-                        parsed_emails.append(email_key)
                         self.log(f"✅ Đã convert cookie cho {email_key}")
                     except Exception as e:
                         self.log(f"❌ Lỗi convert cookie cho {email_key}: {e}")
@@ -18401,8 +18538,6 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
             
             # Lưu cookies
             self.cookies_list = parsed_cookies
-            self.cookie_profile_paths = parsed_profile_paths  # ✅ Lưu profile_path song song
-            self.cookie_emails = parsed_emails  # ✅ Lưu email song song (cho proxy per-account)
             self._apply_plan_cookie_limit()
             self.cookie_value = self.cookies_list[0] if self.cookies_list else ""
             
@@ -21454,28 +21589,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                 self.log(f"❌ Cookie {cookie_index+1} không hợp lệ")
                 return None
             
-            # ✅ Lấy profile_path cho cookie này (nếu có)
-            profile_path = None
-            if hasattr(self, 'cookie_profile_paths') and self.cookie_profile_paths:
-                if cookie_index < len(self.cookie_profile_paths):
-                    profile_path = self.cookie_profile_paths[cookie_index] or None
-            
-            client = LabsFlowClient(cookies, profile_path=profile_path)
-            
-            # ✅ Áp dụng proxy per-account (nếu có)
-            if hasattr(self, 'cookie_emails') and self.cookie_emails:
-                if cookie_index < len(self.cookie_emails):
-                    email = self.cookie_emails[cookie_index]
-                    if email:
-                        try:
-                            from cookiauto import db_get_account_proxy_config
-                            proxy_cfg = db_get_account_proxy_config(email)
-                            if proxy_cfg:
-                                client.proxy_config = proxy_cfg
-                                client._apply_proxy_to_session(proxy_cfg)
-                        except Exception:
-                            pass
-            
+            client = LabsFlowClient(cookies)
             return client
         except Exception as e:
             self.log(f"❌ Lỗi tạo client: {e}")
@@ -27514,220 +27628,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
         """Log with timestamp"""
         timestamp = datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
         self.signals.new_log.emit(f"{timestamp} {message}")
-
-    # ==================== WRAP CLI HELPERS ====================
-    def _rotate_warp_ip(self) -> bool:
-        """Đổi IP bằng WARP CLI (disconnect → connect). Returns True nếu thành công."""
-        import subprocess
-        import platform
-        import requests
-        import shutil
-
-        sys_name = platform.system()
-        self.log("🔄 [_WARP] Đang đổi IP bằng WARP CLI...")
-
-        # Check if warp-cli is available
-        warp_cmd = None
-        if sys_name == "Darwin":
-            if shutil.which("warp-cli"):
-                warp_cmd = "warp-cli"
-            else:
-                self.log("❌ [_WARP] warp-cli không tìm thấy. Hãy cài Cloudflare WARP: https://one.one.one.one/")
-                return False
-        elif sys_name == "Windows":
-            # Try common Windows warp-cli locations
-            if shutil.which("warp-cli"):
-                warp_cmd = "warp-cli"
-            elif shutil.which("warp-cli.exe"):
-                warp_cmd = "warp-cli.exe"
-            elif Path("C:/Program Files/Cloudflare/WARPCLI/warp-cli.exe").exists():
-                warp_cmd = "C:/Program Files/Cloudflare/WARPCLI/warp-cli.exe"
-            else:
-                self.log("❌ [_WARP] warp-cli không tìm thấy. Hãy cài Cloudflare WARP: https://one.one.one.one/")
-                return False
-        else:
-            # Linux - try wg-quick with wgcf
-            if not shutil.which("wg-quick"):
-                self.log("❌ [_WARP] wg-quick không tìm thấy (Linux)")
-                return False
-            warp_cmd = "wg-quick"
-
-        old_ip = None
-        try:
-            old_ip = requests.get("https://api.ipify.org", timeout=5).text
-            self.log(f"  👉 IP hiện tại: {old_ip}")
-        except Exception as e:
-            self.log(f"  ⚠️ Không lấy được IP: {e}")
-
-        # Disconnect
-        disconnect_ok = False
-        try:
-            if sys_name in ("Darwin", "Windows"):
-                subprocess.run([warp_cmd, "disconnect"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
-            else:
-                subprocess.run(["wg-quick", "down", "wgcf"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
-            self.log("  ✅ Đã disconnect WARP")
-            disconnect_ok = True
-        except FileNotFoundError:
-            self.log(f"  ❌ Lệnh không tìm thấy: {warp_cmd}")
-            return False
-        except subprocess.TimeoutExpired:
-            self.log("  ⚠️ Timeout disconnect")
-        except Exception as e:
-            self.log(f"  ⚠️ Lỗi disconnect: {e}")
-
-        if not disconnect_ok:
-            return False
-
-        import time as _time
-        _time.sleep(2)
-
-        # Connect
-        connect_ok = False
-        try:
-            if sys_name in ("Darwin", "Windows"):
-                subprocess.run([warp_cmd, "connect"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
-            else:
-                subprocess.run(["wg-quick", "up", "wgcf"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
-            self.log("  ✅ Đã connect WARP")
-            connect_ok = True
-        except FileNotFoundError:
-            self.log(f"  ❌ Lệnh không tìm thấy: {warp_cmd}")
-            return False
-        except subprocess.TimeoutExpired:
-            self.log("  ⚠️ Timeout connect")
-        except Exception as e:
-            self.log(f"  ⚠️ Lỗi connect: {e}")
-            return False
-
-        if not connect_ok:
-            return False
-
-        _time.sleep(4)
-
-        new_ip = None
-        try:
-            new_ip = requests.get("https://api.ipify.org", timeout=5).text
-            self.log(f"  👉 IP mới: {new_ip}")
-        except Exception as e:
-            self.log(f"  ⚠️ Không lấy được IP mới: {e}")
-
-        if old_ip and new_ip and old_ip != new_ip:
-            self.log("✅ [_WARP] Đổi IP thành công!")
-            return True
-        elif old_ip == new_ip:
-            self.log("⚠️ [_WARP] IP không đổi (có thể WARP chưa kết nối đúng)")
-            return False
-        else:
-            self.log("⚠️ [_WARP] Không xác định được IP")
-            return False
-
-    def _clear_all_cookies_and_relogin(self, job_idx=None):
-        """
-        Xóa tất cả cookies đã lưu trong app và gọi đăng nhập lại.
-        Sau khi login xong sẽ resume flow generation.
-        """
-        from PySide6.QtWidgets import QMessageBox
-
-        self.log("🗑️ [_RELOGIN] Xóa cookie cũ...")
-
-        # Xóa cookies trong memory
-        if hasattr(self, 'cookies_list') and self.cookies_list:
-            self.cookies_list = []
-        if hasattr(self, 'cookie_value') and self.cookie_value:
-            self.cookie_value = ""
-        if hasattr(self, 'accounts') and self.accounts:
-            for acc in self.accounts:
-                if 'cookies' in acc:
-                    acc['cookies'] = ""
-                if 'cookie' in acc:
-                    acc['cookie'] = ""
-        if hasattr(self, 'account_cookies') and self.account_cookies:
-            self.account_cookies = {}
-
-        # Xóa cookies trong LabsFlowClient
-        try:
-            from complete_flow import LabsFlowClient
-            LabsFlowClient._browser_contexts = {}
-            LabsFlowClient._cookies_injected_contexts = {}
-            LabsFlowClient._recaptcha_renew_cookie_callbacks = {}
-            LabsFlowClient._recaptcha_worker_browser = None
-        except Exception as e:
-            self.log(f"  ⚠️ Lỗi clear LabsFlowClient: {e}")
-
-        self.log("🗑️ Đã xóa cookie cũ xong")
-
-        # Hỏi user có muốn đăng nhập lại không
-        reply = QMessageBox.question(
-            self,
-            "🔑 Đăng Nhập Lại",
-            "Đã xóa cookie cũ.\n\n"
-            "Bạn cần đăng nhập lại để lấy cookie mới.\n"
-            "Nhấn 'OK' để mở cửa sổ đăng nhập.\n\n"
-            "(Sau khi đăng nhập xong, bạn sẽ được chuyển về app và nhấn Run lại)",
-            QMessageBox.Ok | QMessageBox.Cancel
-        )
-
-        if reply == QMessageBox.Ok:
-            self.log("🔑 [_RELOGIN] Mở cửa sổ đăng nhập...")
-            self._on_add_account_clicked()  # Mở dialog đăng nhập
-        else:
-            self.log("⚠️ [_RELOGIN] User hủy đăng nhập lại")
-
-    def _wrap_cli_full_recovery(self, job_idx=None):
-        """
-        Workflow đầy đủ khi bị 403 nhiều lần:
-        1. Đổi IP bằng WRAP CLI
-        2. Xóa cookie cũ
-        3. Đăng nhập lại lấy cookie mới
-        4. User tự nhấn Run lại
-        """
-        self.log("=" * 60)
-        self.log("🚨 [_RECOVERY] BẮT ĐẦU QUY TRÌNH KHẮC PHỤC 403")
-        self.log("=" * 60)
-
-        # Bước 1: Đổi IP
-        warp_ok = self._rotate_warp_ip()
-        if warp_ok:
-            self.log("✅ Đổi IP thành công")
-        else:
-            self.log("⚠️ Đổi IP thất bại hoặc IP không đổi")
-            # Vẫn tiếp tục xóa cookie để thử
-
-        # Bước 2: Xóa cookie cũ + login lại
-        self._clear_all_cookies_and_relogin(job_idx)
-
-        self.log("=" * 60)
-        self.log("📋 [_RECOVERY] HƯỚNG DẪN:")
-        self.log("   1. Đăng nhập lại tài khoản Google")
-        self.log("   2. Nhấn 'Lấy Cookie' để lấy cookie mới")
-        self.log("   3. Nhấn 'Chạy Flow' để tiếp tục")
-        self.log("=" * 60)
-
-    def _on_403_detected(self, job_idx=None):
-        """Gọi mỗi khi phát hiện 403. Hiển thị cảnh báo + tự động chạy recovery."""
-        now = time.time()
-        if now - self._403_last_reset_time > 300:
-            self._403_count = 0
-            self._403_last_reset_time = now
-
-        self._403_count += 1
-        self.log(f"⚠️ [_403] Phát hiện 403 lần thứ {self._403_count} (job_idx={job_idx})")
-
-        # Mỗi lần phát hiện 403, tự động chạy recovery (đổi IP + xóa cookie + login lại)
-        if self._403_count >= 2:
-            if not self._wrap_cli_dismissed:
-                self._wrap_cli_dismissed = True
-                # Chạy recovery trong thread riêng để không block UI
-                import threading
-                t = threading.Thread(target=self._wrap_cli_full_recovery, args=(job_idx,), daemon=True)
-                t.start()
-            elif self._403_count >= 4:
-                # Nếu đã dismiss rồi nhưng vẫn 403 tiếp, vẫn đổi IP (không hiện dialog)
-                warp_t = threading.Thread(target=self._rotate_warp_ip, daemon=True)
-                warp_t.start()
-    # ==================== END WRAP CLI HELPERS ====================
-
+    
     def _update_task_metadata_cache(self, tasks=None, reset=False):
         """Snapshot task metadata for retry flows (integrate, custom modes, etc.)."""
         try:
@@ -30541,14 +30442,12 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
             self.current_whisk_seed = auto_seed_value
             self.log(f"🎲 Seed tự động: {auto_seed_value} (áp dụng cho toàn bộ ảnh trong phiên này)")
 
-            aspectMap = {
+            aspect_map = {
                 "16:9": "IMAGE_ASPECT_RATIO_LANDSCAPE",
                 "9:16": "IMAGE_ASPECT_RATIO_PORTRAIT",
-                "4:3": "IMAGE_ASPECT_RATIO_LANDSCAPE_FOUR_THREE",
-                "3:4": "IMAGE_ASPECT_RATIO_PORTRAIT_THREE_FOUR",
                 "1:1": "IMAGE_ASPECT_RATIO_SQUARE"
             }
-            aspect_value = aspectMap.get(aspect, "IMAGE_ASPECT_RATIO_LANDSCAPE")
+            aspect_value = aspect_map.get(aspect, "IMAGE_ASPECT_RATIO_LANDSCAPE")
             
             def get_seed_for_image(img_idx: int, prompt_idx: int) -> int:
                 """Get seed value cho ảnh hiện tại (mọi ảnh dùng cùng seed tự động)"""
@@ -43194,14 +43093,13 @@ Requirements:
         self._save_recaptcha_settings()
     
     def _save_recaptcha_settings(self):
-        """Lưu recaptcha settings (headless mode + proxy pool + proxy config) vào file."""
+        """Lưu recaptcha settings (headless mode + proxy pool) vào file."""
         import json
         try:
             settings = {
                 "headless": LabsFlowClient._global_headless_mode,
                 "proxy_pool": LabsFlowClient._proxy_pool if LabsFlowClient._proxy_pool else [],
                 "use_proxy_pool": LabsFlowClient._use_proxy_pool,
-                "proxy_config": getattr(self, '_proxy_config_cache', None),
             }
             with open("recaptcha_settings.json", "w", encoding="utf-8") as f:
                 json.dump(settings, f, indent=2, ensure_ascii=False)
@@ -43233,14 +43131,6 @@ Requirements:
                 LabsFlowClient._proxy_pool = []
                 LabsFlowClient._use_proxy_pool = False
             
-            # Load proxy config cache
-            proxy_config = settings.get("proxy_config", None)
-            if proxy_config and isinstance(proxy_config, dict):
-                self._proxy_config_cache = proxy_config
-                print(f"  ✅ [Settings] Proxy config: type={proxy_config.get('proxy_type', 'none')}")
-            else:
-                self._proxy_config_cache = {"proxy_type": "none"}
-            
             # Update checkbox nếu đã tạo
             if hasattr(self, 'chk_hide_browser') and self.chk_hide_browser:
                 self.chk_hide_browser.blockSignals(True)
@@ -43248,14 +43138,11 @@ Requirements:
                 self.chk_hide_browser.blockSignals(False)
             
             mode_str = "HEADLESS" if headless else "OFF-SCREEN"
-            proxy_type = self._proxy_config_cache.get("proxy_type", "none") if hasattr(self, '_proxy_config_cache') else "none"
-            print(f"  ✅ [Settings] Loaded: mode={mode_str}, proxy_pool={len(proxy_pool)}, use_proxy={use_proxy}, proxy_type={proxy_type}")
+            print(f"  ✅ [Settings] Loaded: mode={mode_str}, proxy_pool={len(proxy_pool)}, use_proxy={use_proxy}")
             
         except FileNotFoundError:
-            self._proxy_config_cache = {"proxy_type": "none"}
             print(f"  ℹ️ [Settings] recaptcha_settings.json chưa tồn tại, dùng mặc định")
         except Exception as e:
-            self._proxy_config_cache = {"proxy_type": "none"}
             print(f"  ⚠️ [Settings] Lỗi load recaptcha_settings.json: {e}")
     
     def create_progress_bar(self, initial_value=0):
