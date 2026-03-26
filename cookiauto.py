@@ -3027,7 +3027,7 @@ class GetCookieJSWindow(QMainWindow):
                 continue
             
             # ✅ Tất cả điều kiện OK → thêm vào danh sách
-                selected_accounts.append(acc)
+            selected_accounts.append(acc)
         
         # ✅ Thông báo nếu có account bị bỏ qua
         if skipped_accounts:
@@ -4028,6 +4028,10 @@ class GetCookieJSWindow(QMainWindow):
         
         self._log(f"🌐 Mở browser cho {email}...")  # Terminal only
         
+        # ✅ Kill Chrome cũ đang dùng profile này trước khi mở mới (tránh lock profile → treo)
+        self._kill_chrome_for_profile_static(profile_path)
+        time.sleep(1)
+        
         # Find Chrome executable (platform-specific)
         system = platform.system()
         chrome_exe = None
@@ -4036,6 +4040,7 @@ class GetCookieJSWindow(QMainWindow):
             chrome_paths = [
                 r"C:\Program Files\Google\Chrome\Application\chrome.exe",
                 r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+                os.path.expandvars(r"%LocalAppData%\Google\Chrome\Application\chrome.exe"),
             ]
             for path in chrome_paths:
                 if Path(path).exists():
@@ -4073,6 +4078,58 @@ class GetCookieJSWindow(QMainWindow):
             self._log("   Sau khi đăng nhập xong, nhấn 'Lấy Cookies' để lấy cookies.")  # Terminal
         except Exception as e:
             self._log(f"❌ Lỗi mở Chrome: {e}")  # Terminal only
+    
+    def _kill_chrome_for_profile_static(self, profile_path: str):
+        """Kill Chrome processes đang dùng profile này (dùng ngoài CookieWorker)."""
+        import subprocess as sp
+        import platform
+        
+        # Xóa lock files
+        for lock_name in ["SingletonLock", "SingletonSocket", "SingletonCookie"]:
+            lock_file = Path(profile_path) / lock_name
+            try:
+                if lock_file.exists():
+                    lock_file.unlink()
+            except Exception:
+                pass
+        
+        system = platform.system()
+        profile_name = Path(profile_path).name
+        try:
+            if system == "Windows":
+                for browser in ['chrome.exe', 'chromium.exe']:
+                    try:
+                        result = sp.run(
+                            ['wmic', 'process', 'where', f"name='{browser}'", 'get', 'processid,commandline'],
+                            capture_output=True, text=True, timeout=10, creationflags=0x08000000
+                        )
+                        for line in result.stdout.split('\n'):
+                            if profile_name in line or profile_path in line:
+                                parts = line.strip().split()
+                                if parts:
+                                    try:
+                                        pid = int(parts[-1])
+                                        sp.run(['taskkill', '/F', '/PID', str(pid)],
+                                               capture_output=True, timeout=5, creationflags=0x08000000)
+                                    except (ValueError, Exception):
+                                        pass
+                    except Exception:
+                        pass
+            elif system == "Darwin":
+                result = sp.run(
+                    ['ps', 'aux'], capture_output=True, text=True, timeout=10
+                )
+                for line in result.stdout.split('\n'):
+                    if ('Google Chrome' in line or 'Chromium' in line) and profile_path in line:
+                        parts = line.split()
+                        if len(parts) > 1:
+                            try:
+                                pid = int(parts[1])
+                                sp.run(['kill', '-9', str(pid)], capture_output=True, timeout=5)
+                            except Exception:
+                                pass
+        except Exception:
+            pass
     
     def _on_select_all(self):
         """Select all accounts"""

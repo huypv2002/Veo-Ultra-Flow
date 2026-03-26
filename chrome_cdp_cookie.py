@@ -156,9 +156,38 @@ def kill_chrome_for_profile(profile_path: str):
     system = platform.system()
     profile_name = Path(profile_path).name
     try:
-        if system == "Darwin":
+        if system == "Windows":
+            # Dùng wmic để tìm Chrome process theo command line chứa profile path
+            try:
+                result = subprocess.run(
+                    ['wmic', 'process', 'where', "name='chrome.exe'", 'get', 'processid,commandline'],
+                    capture_output=True, text=True, timeout=10,
+                    creationflags=0x08000000,  # CREATE_NO_WINDOW
+                )
+                for line in result.stdout.split('\n'):
+                    # Match cả full path lẫn tên folder (tăng khả năng kill đúng)
+                    if profile_name in line or profile_path in line:
+                        parts = line.strip().split()
+                        if parts:
+                            try:
+                                pid = int(parts[-1])
+                                subprocess.run(
+                                    ['taskkill', '/F', '/PID', str(pid)],
+                                    capture_output=True, timeout=5,
+                                    creationflags=0x08000000,
+                                )
+                            except (ValueError, Exception):
+                                pass
+            except Exception:
+                # Fallback: taskkill theo window title (ít tin cậy hơn)
+                subprocess.run(
+                    ["taskkill", "/F", "/FI", f"WINDOWTITLE eq *{profile_name}*"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5,
+                    creationflags=0x08000000,
+                )
+        elif system == "Darwin":
             result = subprocess.run(
-                ["pgrep", "-f", profile_name],
+                ["pgrep", "-f", f"--user-data-dir={profile_path}"],
                 capture_output=True, text=True, timeout=5,
             )
             for pid_str in result.stdout.strip().split("\n"):
@@ -168,11 +197,6 @@ def kill_chrome_for_profile(profile_path: str):
                         os.kill(int(pid_str), signal.SIGTERM)
                     except ProcessLookupError:
                         pass
-        elif system == "Windows":
-            subprocess.run(
-                ["taskkill", "/F", "/FI", f"WINDOWTITLE eq *{profile_name}*"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5,
-            )
     except Exception:
         pass
 
@@ -648,20 +672,41 @@ class ChromeCDPSession:
                 self.log_fn(f"   ✅ Đã đăng nhập sẵn!")
                 return True
 
-            # Enter email
+            # Enter email - dùng CDP Input để simulate typing thực sự
+            # (input.value = ... không trigger React/Material state của Google)
             self.log_fn(f"   📧 Nhập email...")
+            
+            # Focus vào input email
             self._send_cdp("Runtime.evaluate", {
-                "expression": f"""
-                    (function() {{
+                "expression": """
+                    (function() {
                         let input = document.querySelector('input[type="email"]');
-                        if (input) {{
-                            input.value = '{email}';
-                            input.dispatchEvent(new Event('input', {{bubbles: true}}));
-                        }}
-                    }})()
+                        if (input) {
+                            input.focus();
+                            input.value = '';
+                        }
+                    })()
                 """
             })
-            time.sleep(1)
+            time.sleep(0.3)
+            
+            # Dùng Input.insertText để nhập email (trigger đúng input events)
+            self._send_cdp("Input.insertText", {"text": email})
+            time.sleep(0.5)
+            
+            # Dispatch input + change events để đảm bảo framework JS nhận giá trị
+            self._send_cdp("Runtime.evaluate", {
+                "expression": """
+                    (function() {
+                        let input = document.querySelector('input[type="email"]');
+                        if (input) {
+                            input.dispatchEvent(new Event('input', {bubbles: true}));
+                            input.dispatchEvent(new Event('change', {bubbles: true}));
+                        }
+                    })()
+                """
+            })
+            time.sleep(0.5)
 
             # Click Next
             self._send_cdp("Runtime.evaluate", {
@@ -676,20 +721,38 @@ class ChromeCDPSession:
 
             # Enter password
             self.log_fn(f"   🔑 Nhập password...")
-            # Escape password for JS string
-            escaped_pw = password.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
+            
+            # Focus vào input password
             self._send_cdp("Runtime.evaluate", {
-                "expression": f"""
-                    (function() {{
+                "expression": """
+                    (function() {
                         let input = document.querySelector('input[type="password"]');
-                        if (input) {{
-                            input.value = '{escaped_pw}';
-                            input.dispatchEvent(new Event('input', {{bubbles: true}}));
-                        }}
-                    }})()
+                        if (input) {
+                            input.focus();
+                            input.value = '';
+                        }
+                    })()
                 """
             })
-            time.sleep(1)
+            time.sleep(0.3)
+            
+            # Dùng Input.insertText để nhập password
+            self._send_cdp("Input.insertText", {"text": password})
+            time.sleep(0.5)
+            
+            # Dispatch events
+            self._send_cdp("Runtime.evaluate", {
+                "expression": """
+                    (function() {
+                        let input = document.querySelector('input[type="password"]');
+                        if (input) {
+                            input.dispatchEvent(new Event('input', {bubbles: true}));
+                            input.dispatchEvent(new Event('change', {bubbles: true}));
+                        }
+                    })()
+                """
+            })
+            time.sleep(0.5)
 
             # Click Next
             self._send_cdp("Runtime.evaluate", {

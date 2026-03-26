@@ -3826,27 +3826,18 @@ class LabsFlowClient:
         LabsFlowClient._zendriver_reset_page(cookie_hash)
         
         # ✅ Reset playwright context để lấy cookie mới
+        # CHỈ set None reference, KHÔNG gọi .close() vì context có thể được tạo trong worker thread
         if hasattr(LabsFlowClient, '_browser_contexts') and cookie_hash in LabsFlowClient._browser_contexts:
-            try:
-                LabsFlowClient._browser_contexts[cookie_hash].close()
-            except:
-                pass
             LabsFlowClient._browser_contexts.pop(cookie_hash, None)
-            LabsFlowClient._cookies_injected_contexts.pop(cookie_hash, None)
+            if hasattr(LabsFlowClient, '_cookies_injected_contexts'):
+                LabsFlowClient._cookies_injected_contexts.pop(cookie_hash, None)
         
-        # ✅ Reset playwright recaptcha page để buộc tạo page mới với cookies mới
-        if hasattr(LabsFlowClient, '_recaptcha_page') and LabsFlowClient._recaptcha_page is not None:
-            try:
-                LabsFlowClient._recaptcha_page.close()
-            except:
-                pass
-            LabsFlowClient._recaptcha_page = None
-        if hasattr(LabsFlowClient, '_recaptcha_context') and LabsFlowClient._recaptcha_context is not None:
-            try:
-                LabsFlowClient._recaptcha_context.close()
-            except:
-                pass
-            LabsFlowClient._recaptcha_context = None
+        # ✅ Reset playwright recaptcha page - CHỈ đánh dấu flag, KHÔNG gọi .close() từ thread này
+        # Playwright sync API dùng greenlet bị ràng buộc vào worker thread đã tạo nó.
+        # Gọi .close() từ thread khác sẽ gây lỗi "greenlet.error: Cannot switch to a different thread".
+        # Worker thread sẽ tự close page/context cũ khi xử lý request tiếp theo (qua _contexts_need_reset flag).
+        with LabsFlowClient._contexts_need_reset_lock:
+            LabsFlowClient._contexts_need_reset[cookie_hash] = True
         
         # ✅ Reset all error counters cho cookie này
         self._reset_all_error_counters()
