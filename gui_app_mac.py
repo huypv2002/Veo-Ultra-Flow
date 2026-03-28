@@ -351,6 +351,7 @@ class WorkerSignals(QObject):
     flow_worker_done = Signal(bool, object)  # (success, batch_context)
     show_update_available = Signal(object)  # (update_info dict) - hiển thị dialog cập nhật
     show_flow_success_popup = Signal(int)  # (success_count) - hiển thị popup thành công Banana Pro
+    show_error_popup = Signal(str, str)  # (title, message) - hiển thị popup lỗi cho người dùng
     flow_update_task_grid_status = Signal(int, str, str)  # (task_index, status, error_msg) - update Task_Grid row
     flow_update_task_grid_preview = Signal(int, str)  # (task_index, image_path) - update preview column
 
@@ -2836,6 +2837,7 @@ class GoogleLabsFlowQt6(QMainWindow):
         self.signals.flow_start_next_batch.connect(self._start_next_flow_batch)
         self.signals.flow_worker_done.connect(self._flow_worker_done_main)
         self.signals.show_flow_success_popup.connect(self._show_flow_success_popup_slot)  # Popup thành công Banana Pro
+        self.signals.show_error_popup.connect(self._show_error_popup_slot)  # Popup lỗi cho người dùng
         self.signals.flow_update_task_grid_status.connect(self._flow_update_task_grid_status_slot)  # Task Grid status
         self.signals.flow_update_task_grid_preview.connect(self._flow_update_task_grid_preview_slot)  # Task Grid preview
         self._log_buffer = []
@@ -7170,6 +7172,17 @@ class GoogleLabsFlowQt6(QMainWindow):
         except Exception:
             pass
     
+    def _show_error_popup_slot(self, title: str, message: str):
+        """Slot handler để hiển thị popup lỗi cho người dùng (chạy trên main thread)"""
+        try:
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Warning)
+            msg.setWindowTitle(title)
+            msg.setText(message)
+            msg.exec()
+        except Exception:
+            pass
+    
     def on_flow_stop_clicked(self):
         """Xử lý khi nhấn nút dừng tạo ảnh Banana Pro"""
         if not self.flow_is_running and not self.flow_batch_active:
@@ -8140,6 +8153,11 @@ class GoogleLabsFlowQt6(QMainWindow):
                         # ✅ Gửi request với cookie riêng của job này
                         self.log(f"📤 Flow job {job_idx}: Gửi request với cookie {cookie_index+1}")
                         api_result = job_client.generate_flow_images(requests_payload)
+
+                        # ✅ Debug: Log error detail ngay sau khi gọi API
+                        if not api_result:
+                            debug_error = job_client.last_error_detail or job_client.last_error or "Unknown error"
+                            self.log(f"🔍 [DEBUG API] job_client.last_error_detail: {debug_error}")
                         
                         # ✅ Check stop_event sau khi gọi API
                         if self.stop_event.is_set():
@@ -8271,6 +8289,12 @@ class GoogleLabsFlowQt6(QMainWindow):
                                     return None
                                 
                                 continue  # Thử lại với cookie khác
+
+                            # ✅ Debug log cho 401 - xem có vào đây không
+                            if "401" in error_str or "unauthorized" in error_str:
+                                self.log(f"🔍 [DEBUG 401] error_detail: {error_detail[:200]}")
+                                self.log(f"🔍 [DEBUG 401] error_str contains: 401={('401' in error_str)}, unauthorized={('unauthorized' in error_str)}")
+
                             elif ("403" in error_str or "401" in error_str or
                                   "forbidden" in error_str or "unauthorized" in error_str or
                                   "cookie" in error_str and ("die" in error_str or "expired" in error_str or "invalid" in error_str)):

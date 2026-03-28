@@ -3318,9 +3318,42 @@ class LabsFlowClient:
                                     os.remove(lock_path)
                                 except Exception:
                                     pass
+                        # ✅ Xóa thêm các lock files trong Default/ subfolder
+                        default_dir = os.path.join(temp_dir, "Default")
+                        if os.path.exists(default_dir):
+                            for lock_file in ["SingletonLock", "SingletonSocket", "SingletonCookie", "lockfile", "LOCK"]:
+                                lock_path = os.path.join(default_dir, lock_file)
+                                if os.path.exists(lock_path):
+                                    try:
+                                        os.remove(lock_path)
+                                    except Exception:
+                                        pass
+                            # Xóa lock trong Network subfolder (chứa Cookies DB)
+                            network_dir = os.path.join(default_dir, "Network")
+                            if os.path.exists(network_dir):
+                                for lock_file in ["LOCK", "lockfile"]:
+                                    lock_path = os.path.join(network_dir, lock_file)
+                                    if os.path.exists(lock_path):
+                                        try:
+                                            os.remove(lock_path)
+                                        except Exception:
+                                            pass
+                        
+                        # ✅ Validate: kiểm tra cookies DB tồn tại
+                        cookies_db = os.path.join(temp_dir, "Default", "Network", "Cookies")
+                        cookies_db_alt = os.path.join(temp_dir, "Default", "Cookies")
+                        if os.path.exists(cookies_db):
+                            print(f"  📂 [Chrome CDP] Dùng profile thật (copy): {profile_path}")
+                            print(f"  ✅ [Chrome CDP] Cookies DB found: {cookies_db} ({os.path.getsize(cookies_db)} bytes)")
+                        elif os.path.exists(cookies_db_alt):
+                            print(f"  📂 [Chrome CDP] Dùng profile thật (copy): {profile_path}")
+                            print(f"  ✅ [Chrome CDP] Cookies DB found (alt): {cookies_db_alt} ({os.path.getsize(cookies_db_alt)} bytes)")
+                        else:
+                            print(f"  📂 [Chrome CDP] Dùng profile thật (copy): {profile_path}")
+                            print(f"  ⚠️ [Chrome CDP] Cookies DB KHÔNG tìm thấy trong profile copy!")
+                        
                         cls._chrome_cdp_user_data_dir = temp_dir
                         cls._chrome_cdp_current_profile = profile_path
-                        print(f"  📂 [Chrome CDP] Dùng profile thật (copy): {profile_path}")
                     except Exception as e:
                         print(f"  ⚠️ [Chrome CDP] Không copy được profile: {e}, dùng temp dir trống")
                         cls._chrome_cdp_user_data_dir = tempfile.mkdtemp(prefix="chrome_cdp_recaptcha_")
@@ -3574,33 +3607,133 @@ class LabsFlowClient:
                 if ws is None:
                     return None
             
-            # ═══ Bước 3: Inject cookies nếu chưa ═══
-            if not LabsFlowClient._chrome_cdp_cookies_injected.get(cookie_hash, False):
+            # ═══ Bước 3: Nếu dùng profile copy, navigate trước để dùng cookies từ profile DB ═══
+            has_profile = getattr(LabsFlowClient, '_chrome_cdp_current_profile', None) is not None
+            profile_cookies_ok = False
+            
+            if has_profile and need_navigate and not LabsFlowClient._chrome_cdp_cookies_injected.get(cookie_hash, False):
+                # Profile đã copy → Chrome đã load cookies từ SQLite DB
+                # Navigate trước để check xem profile cookies còn hợp lệ không
+                print(f"  🌐 [Chrome CDP] Navigate (profile mode) đến {TARGET_URL}...")
+                _cdp_send(ws, "Page.enable", cmd_timeout=5)
+                _cdp_send(ws, "Page.navigate", {"url": TARGET_URL}, cmd_timeout=15)
+                start_load = time.time()
+                while time.time() - start_load < 15:
+                    try:
+                        rs = _cdp_send(ws, "Runtime.evaluate", {
+                            "expression": "document.readyState",
+                            "returnByValue": True,
+                        }, cmd_timeout=5)
+                        state = rs.get("result", {}).get("result", {}).get("value", "")
+                        if state in ("complete", "interactive"):
+                            break
+                    except Exception:
+                        pass
+                    time.sleep(0.5)
+                
+                # Check URL - nếu không bị redirect thì profile cookies OK
+                try:
+                    loc_result = _cdp_send(ws, "Runtime.evaluate", {
+                        "expression": "window.location.href",
+                        "returnByValue": True,
+                    }, cmd_timeout=5)
+                    current_url = loc_result.get("result", {}).get("result", {}).get("value", "")
+                    if "accounts.google" not in current_url and "signin" not in current_url.lower():
+                        print(f"  ✅ [Chrome CDP] Profile cookies hợp lệ, không cần inject CDP cookies")
+                        profile_cookies_ok = True
+                        LabsFlowClient._chrome_cdp_cookies_injected[cookie_hash] = True
+                        need_navigate = False  # Đã navigate rồi
+                        page_ready = False  # Cần check grecaptcha
+                    else:
+                        print(f"  ⚠️ [Chrome CDP] Profile cookies expired, sẽ inject CDP cookies...")
+                except Exception:
+                    pass
+            
+            # ═══ Bước 3b: Inject cookies nếu chưa (profile cookies failed hoặc không có profile) ═══
+            if not profile_cookies_ok and not LabsFlowClient._chrome_cdp_cookies_injected.get(cookie_hash, False):
                 _cdp_send(ws, "Network.enable", cmd_timeout=10)
                 
-                # ✅ Inject cookies cho cả .labs.google VÀ .google.com
-                # Google auth cookies (SID, HSID, SSID, etc.) thuộc .google.com
-                # Labs cookies thuộc .labs.google
-                # Cần cả 2 domain để tránh bị redirect to login
-                inject_domains = [".labs.google", ".google.com"]
+                # ✅ Inject cookies với xử lý đúng cho __Host- và __Secure- prefix
+                # __Host- cookies: PHẢI có secure=True, path="/", KHÔNG được set domain
+                # __Secure- cookies: PHẢI có secure=True, domain phải match
+                # Cần set url để Chrome biết context cho cookie
+                inject_success = 0
+                inject_fail = 0
                 for name, value in self.cookies.items():
-                    for domain in inject_domains:
-                        try:
-                            _cdp_send(ws, "Network.setCookie", {
+                    try:
+                        if name.startswith("__Host-"):
+                            # __Host- prefix: không set domain, phải dùng url
+                            result = _cdp_send(ws, "Network.setCookie", {
                                 "name": name,
                                 "value": value,
-                                "domain": domain,
+                                "url": "https://labs.google/fx/tools/flow",
                                 "path": "/",
                                 "secure": True,
                                 "httpOnly": True,
                             }, cmd_timeout=5)
-                        except Exception:
-                            pass
+                        elif name.startswith("__Secure-"):
+                            # __Secure- prefix: set domain .labs.google
+                            result = _cdp_send(ws, "Network.setCookie", {
+                                "name": name,
+                                "value": value,
+                                "domain": ".labs.google",
+                                "url": "https://labs.google/fx/tools/flow",
+                                "path": "/",
+                                "secure": True,
+                                "httpOnly": True,
+                            }, cmd_timeout=5)
+                        else:
+                            # Regular cookies: inject cho cả 2 domains
+                            for domain, url in [
+                                (".labs.google", "https://labs.google/fx/tools/flow"),
+                                (".google.com", "https://accounts.google.com"),
+                            ]:
+                                result = _cdp_send(ws, "Network.setCookie", {
+                                    "name": name,
+                                    "value": value,
+                                    "domain": domain,
+                                    "url": url,
+                                    "path": "/",
+                                    "secure": True,
+                                    "httpOnly": True,
+                                }, cmd_timeout=5)
+                        
+                        # Check if setCookie succeeded
+                        success = result.get("result", {}).get("success", True) if result else False
+                        if success and "error" not in result:
+                            inject_success += 1
+                        else:
+                            inject_fail += 1
+                    except Exception:
+                        inject_fail += 1
+                
+                # ✅ Verify cookies were actually set
+                try:
+                    verify_result = _cdp_send(ws, "Network.getCookies", {
+                        "urls": ["https://labs.google/fx/tools/flow"]
+                    }, cmd_timeout=5)
+                    actual_cookies = verify_result.get("result", {}).get("cookies", [])
+                    session_found = any(c.get("name") == "__Secure-next-auth.session-token" for c in actual_cookies)
+                    if not session_found:
+                        print(f"  ⚠️ [Chrome CDP] Session token KHÔNG có trong browser sau inject! Thử lại...")
+                        # Retry với url-based approach
+                        for name, value in self.cookies.items():
+                            _cdp_send(ws, "Network.setCookie", {
+                                "name": name,
+                                "value": value,
+                                "url": "https://labs.google/fx/tools/flow",
+                                "secure": True,
+                                "httpOnly": True,
+                            }, cmd_timeout=5)
+                    else:
+                        print(f"  ✅ [Chrome CDP] Verified: session token có trong browser ({len(actual_cookies)} cookies)")
+                except Exception as e:
+                    print(f"  ⚠️ [Chrome CDP] Không verify được cookies: {e}")
                 
                 LabsFlowClient._chrome_cdp_cookies_injected[cookie_hash] = True
                 need_navigate = True
                 page_ready = False
-                print(f"  🍪 [Chrome CDP] Đã inject {len(self.cookies)} cookies cho {len(inject_domains)} domains")
+                print(f"  🍪 [Chrome CDP] Đã inject {inject_success} cookies OK, {inject_fail} failed")
             
             # ═══ Bước 4: Navigate nếu cần, KHÔNG reload nếu page đã sẵn sàng ═══
             if need_navigate:
@@ -3847,6 +3980,58 @@ class LabsFlowClient:
         
         print(f"  ✅ [403 Handler] Đã refresh cookie {cookie_hash[:8]}... - tab mới sẽ được tạo ở attempt tiếp theo")
         return True
+    
+    def _handle_401_refresh_token(self) -> bool:
+        """Xử lý 401 thông minh: re-fetch access token, nếu token không đổi thì refresh cookies.
+        
+        Returns:
+            True nếu có token mới (nên retry), False nếu không thể fix
+        """
+        cookie_hash = self._cookie_hash
+        old_token = self.access_token
+        
+        # Bước 1: Re-fetch access token
+        if self.fetch_access_token():
+            if self.access_token != old_token:
+                print(f"  ✅ [401 Handler] Access token ĐÃ THAY ĐỔI → retry")
+                return True
+            
+            # Token không đổi → session có thể expired
+            same_count = getattr(self, '_same_token_count', 0)
+            print(f"  ⚠️ [401 Handler] Token KHÔNG ĐỔI (lần {same_count})")
+            
+            if same_count >= 2:
+                # Thử refresh cookies từ profile
+                print(f"  🔄 [401 Handler] Thử refresh cookies từ profile...")
+                new_cookies = self._refresh_cookies_from_profile()
+                if new_cookies:
+                    self._apply_new_cookies(new_cookies, cookie_hash)
+                    # Re-fetch access token với cookies mới
+                    if self.fetch_access_token():
+                        print(f"  ✅ [401 Handler] Token mới sau refresh cookies: {self.access_token[:20]}...")
+                        return True
+                    else:
+                        print(f"  ❌ [401 Handler] Không thể lấy token sau refresh cookies")
+                        return False
+                else:
+                    # Không có profile → thử renew callback
+                    renew_cb = LabsFlowClient._recaptcha_renew_cookie_callbacks.get(cookie_hash) if hasattr(LabsFlowClient, '_recaptcha_renew_cookie_callbacks') else None
+                    if renew_cb:
+                        print(f"  🔄 [401 Handler] Thử renew cookie callback...")
+                        new_cookies = renew_cb(cookie_hash, self.cookies)
+                        if new_cookies:
+                            self._apply_new_cookies(new_cookies, cookie_hash)
+                            if self.fetch_access_token():
+                                print(f"  ✅ [401 Handler] Token mới sau renew callback: {self.access_token[:20]}...")
+                                return True
+                    print(f"  ⚠️ [401 Handler] Không thể refresh cookies")
+                    return False
+            
+            # Chưa đến ngưỡng, vẫn retry với token hiện tại
+            return True
+        else:
+            print(f"  ❌ [401 Handler] Không thể fetch access token")
+            return False
     
     def _on_api_success(self):
         """Gọi khi API call thành công - reset counters."""
@@ -4276,6 +4461,10 @@ class LabsFlowClient:
         try:
             print("→ Fetching access token from labs session...")
             url = "https://labs.google/fx/api/auth/session"
+            
+            # ✅ Lưu token cũ để detect token không thay đổi
+            old_token = getattr(self, 'access_token', None)
+            
             resp = self.session.get(
                 url,
                 headers=self._labs_headers(),
@@ -4298,6 +4487,14 @@ class LabsFlowClient:
             token = None
             if isinstance(data, dict):
                 token = data.get("access_token")
+                # ✅ Log thêm thông tin session để debug 401
+                expires_str = data.get("expires") or data.get("accessTokenExpires") or data.get("exp")
+                if expires_str:
+                    print(f"  📋 [Session] Token expires: {expires_str}")
+                # Log session user info nếu có
+                user_info = data.get("user", {})
+                if user_info:
+                    print(f"  📋 [Session] User: {user_info.get('email', user_info.get('name', 'unknown'))}")
                 if not token:
                     token = _extract_bearer_like(data)
             
@@ -4330,6 +4527,22 @@ class LabsFlowClient:
                 return False
             
             self.access_token = token
+            
+            # ✅ Detect token không thay đổi → có thể session expired
+            if old_token and token == old_token:
+                if not hasattr(self, '_same_token_count'):
+                    self._same_token_count = 0
+                self._same_token_count += 1
+                print(f"  ⚠️ [Token] Cùng token sau {self._same_token_count} lần fetch (có thể session expired)")
+                # Log full response khi token không đổi nhiều lần
+                if self._same_token_count >= 2:
+                    print(f"  📋 [Token Debug] Full session response keys: {list(data.keys()) if isinstance(data, dict) else type(data)}")
+                    if isinstance(data, dict):
+                        # Log token length và expiry info
+                        print(f"  📋 [Token Debug] Token length: {len(token)}, starts: {token[:30]}..., ends: ...{token[-20:]}")
+            else:
+                self._same_token_count = 0
+            
             print(f"  ✓ Access token retrieved: {token[:20]}...")
             return True
             
@@ -4549,12 +4762,8 @@ class LabsFlowClient:
                     if resp.status_code in [400, 401, 429]:
                         if resp.status_code == 401:
                             print(f"  ⚠️ Lỗi 401 Debug Payload: {json.dumps(payload)}")
-                            # ✅ FIX: Re-fetch access token khi gặp 401 (token expired)
-                            print(f"  🔄 [T2V] 401 - Re-fetch access token...")
-                            if self.fetch_access_token():
-                                print(f"  ✅ [T2V] Access token refreshed: {self.access_token[:20]}...")
-                            else:
-                                print(f"  ❌ [T2V] Không thể refresh access token")
+                            # ✅ FIX: Xử lý 401 thông minh - refresh token + cookies nếu cần
+                            self._handle_401_refresh_token()
                         # Set flag bị chặn cho 429 (rate limit/IP blocked)
                         if resp.status_code == 429:
                             cookie_hash = self._cookie_hash

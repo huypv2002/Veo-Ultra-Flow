@@ -638,16 +638,29 @@ class ChromeCDPSession:
         return labs_cookies
 
     def set_cookies(self, cookies: List[dict]):
-        """Inject cookies vào browser qua CDP Network.setCookie."""
+        """Inject cookies vào browser qua CDP Network.setCookie.
+        
+        Xử lý đúng __Host- và __Secure- prefix cookies:
+        - __Host-: không set domain, dùng url thay thế
+        - __Secure-: phải có secure=True
+        """
         for c in cookies:
+            name = c.get("name", "")
             params = {
-                "name": c.get("name", ""),
+                "name": name,
                 "value": c.get("value", ""),
-                "domain": c.get("domain", LABS_DOMAIN),
                 "path": c.get("path", "/"),
                 "secure": c.get("secure", True),
                 "httpOnly": c.get("httpOnly", True),
             }
+            
+            # __Host- cookies: KHÔNG được set domain, dùng url
+            if name.startswith("__Host-"):
+                params["url"] = f"https://{LABS_DOMAIN}/fx/tools/flow"
+            else:
+                params["domain"] = c.get("domain", LABS_DOMAIN)
+                params["url"] = f"https://{LABS_DOMAIN}/fx/tools/flow"
+            
             expires = c.get("expirationDate") or c.get("expires")
             if expires and float(expires) > 0:
                 params["expires"] = float(expires)
