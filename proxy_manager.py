@@ -1,12 +1,11 @@
 """
 Proxy Manager - Quản lý proxy đa loại cho LabsFlowClient.
 
-Hỗ trợ 5 loại proxy:
+Hỗ trợ 4 loại proxy:
 1. none       - Không dùng proxy (IP gốc)
 2. static     - Proxy Tĩnh (HTTP/SOCKS5 cố định)
 3. rotating   - Proxy Xoay (tự động đổi IP mỗi request)
-4. warp       - WARP (Cloudflare 1.1.1.1) qua warp-svc local
-5. tor        - Tor Network qua SOCKS5 local (127.0.0.1:9050)
+4. proxyvn    - Proxy.vn key xoay
 """
 
 import json
@@ -23,10 +22,7 @@ from urllib.parse import quote
 # Constants
 # ═══════════════════════════════════════════════════════════════
 
-PROXY_TYPES = ("none", "static", "rotating", "warp", "tor")
-
-WARP_SOCKS5 = "socks5://127.0.0.1:40000"   # warp-cli proxy mode default
-TOR_SOCKS5 = "socks5://127.0.0.1:9050"      # Tor default SOCKS5
+PROXY_TYPES = ("none", "static", "rotating", "proxyvn")
 
 SETTINGS_FILE = Path(os.path.dirname(os.path.abspath(__file__))) / "proxy_settings.json"
 
@@ -79,15 +75,18 @@ class ProxyEntry:
 @dataclass
 class ProxyConfig:
     """Cấu hình proxy cho 1 account."""
-    proxy_type: str = "none"          # none, static, rotating, warp, tor
+    proxy_type: str = "none"          # none, static, rotating, proxyvn
     static_server: str = ""           # http://host:port hoặc socks5://host:port
     static_username: str = ""
     static_password: str = ""
     rotating_server: str = ""         # http://host:port (gateway xoay)
     rotating_username: str = ""
     rotating_password: str = ""
-    warp_port: int = 40000            # WARP local SOCKS5 port
-    tor_port: int = 9050              # Tor local SOCKS5 port
+    proxyvn_key: str = ""             # Key xoay từ proxy.vn
+    proxyvn_nhamang: str = "Random"   # Random|viettel|fpt|vnpt
+    proxyvn_tinhthanh: str = "0"      # 0 = Random
+    proxyvn_whitelist: str = ""       # IPv4 whitelist (optional)
+    proxyvn_protocol: str = "http"    # http|socks5
 
     def get_active_proxy(self) -> Optional[ProxyEntry]:
         """Trả về ProxyEntry đang active dựa trên proxy_type."""
@@ -111,17 +110,48 @@ class ProxyConfig:
                 password=self.rotating_password,
                 proxy_type="rotating",
             )
-        elif self.proxy_type == "warp":
-            return ProxyEntry(
-                server=f"socks5://127.0.0.1:{self.warp_port}",
-                proxy_type="static",
-            )
-        elif self.proxy_type == "tor":
-            return ProxyEntry(
-                server=f"socks5://127.0.0.1:{self.tor_port}",
-                proxy_type="static",
-            )
+        elif self.proxy_type == "proxyvn":
+            return self._fetch_proxyvn_entry()
         return None
+
+    def _fetch_proxyvn_entry(self) -> Optional[ProxyEntry]:
+        """Lấy 1 proxy mới từ proxy.vn key xoay."""
+        if not self.proxyvn_key:
+            return None
+        try:
+            import requests
+
+            params = {
+                "key": self.proxyvn_key,
+                "nhamang": self.proxyvn_nhamang or "Random",
+                "tinhthanh": self.proxyvn_tinhthanh or "0",
+            }
+            if self.proxyvn_whitelist:
+                params["whitelist"] = self.proxyvn_whitelist
+
+            resp = requests.get("https://proxyxoay.shop/api/get.php", params=params, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+
+            if not isinstance(data, dict) or data.get("status") != 100:
+                return None
+
+            protocol = (self.proxyvn_protocol or "http").lower()
+            raw_proxy = ""
+            if protocol == "socks5":
+                raw_proxy = str(data.get("proxysocks5", "")).strip()
+            if not raw_proxy:
+                raw_proxy = str(data.get("proxyhttp", "")).strip()
+                protocol = "http"
+
+            raw_proxy = raw_proxy.split("::")[0].strip()
+            if not raw_proxy:
+                return None
+
+            server = raw_proxy if "://" in raw_proxy else f"{protocol}://{raw_proxy}"
+            return ProxyEntry(server=server, proxy_type="rotating")
+        except Exception:
+            return None
 
     def get_requests_proxies(self) -> Optional[Dict[str, str]]:
         """Trả về dict proxies cho requests.Session."""
@@ -152,8 +182,11 @@ class ProxyConfig:
             rotating_server=d.get("rotating_server", ""),
             rotating_username=d.get("rotating_username", ""),
             rotating_password=d.get("rotating_password", ""),
-            warp_port=d.get("warp_port", 40000),
-            tor_port=d.get("tor_port", 9050),
+            proxyvn_key=d.get("proxyvn_key", ""),
+            proxyvn_nhamang=d.get("proxyvn_nhamang", "Random"),
+            proxyvn_tinhthanh=d.get("proxyvn_tinhthanh", "0"),
+            proxyvn_whitelist=d.get("proxyvn_whitelist", ""),
+            proxyvn_protocol=d.get("proxyvn_protocol", "http"),
         )
 
 

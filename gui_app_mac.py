@@ -41,6 +41,65 @@ from PySide6.QtCore import Qt, QThread, Signal, QTimer, Slot, QObject, QStandard
 from PySide6.QtGui import QFont, QColor, QPalette, QPixmap, QTextOption
 
 
+def _install_thread_safe_qmessagebox():
+    """Prevent native QMessageBox calls from worker threads on macOS/Qt."""
+    original_information = QMessageBox.information
+    original_warning = QMessageBox.warning
+    original_critical = QMessageBox.critical
+    original_question = QMessageBox.question
+
+    def _on_main_thread() -> bool:
+        app = QApplication.instance()
+        if app is None:
+            return threading.current_thread() is threading.main_thread()
+        return app.thread() == QThread.currentThread()
+
+    def _format_message(args) -> str:
+        title = args[1] if len(args) > 1 else ""
+        text = args[2] if len(args) > 2 else ""
+        return f"[QMessageBox][worker-thread] {title}: {text}"
+
+    def _fallback_button(args, default_button):
+        if len(args) >= 5:
+            try:
+                return args[4]
+            except Exception:
+                pass
+        return default_button
+
+    def safe_information(*args, **kwargs):
+        if _on_main_thread():
+            return original_information(*args, **kwargs)
+        print(_format_message(args), flush=True)
+        return QMessageBox.Ok
+
+    def safe_warning(*args, **kwargs):
+        if _on_main_thread():
+            return original_warning(*args, **kwargs)
+        print(_format_message(args), flush=True)
+        return QMessageBox.Ok
+
+    def safe_critical(*args, **kwargs):
+        if _on_main_thread():
+            return original_critical(*args, **kwargs)
+        print(_format_message(args), flush=True)
+        return QMessageBox.Ok
+
+    def safe_question(*args, **kwargs):
+        if _on_main_thread():
+            return original_question(*args, **kwargs)
+        print(_format_message(args), flush=True)
+        return _fallback_button(args, QMessageBox.No)
+
+    QMessageBox.information = staticmethod(safe_information)
+    QMessageBox.warning = staticmethod(safe_warning)
+    QMessageBox.critical = staticmethod(safe_critical)
+    QMessageBox.question = staticmethod(safe_question)
+
+
+_install_thread_safe_qmessagebox()
+
+
 # ==================== NO SCROLL WIDGETS ====================
 # Custom widgets để vô hiệu hóa scroll wheel trên ComboBox và SpinBox
 class NoScrollComboBox(QComboBox):
@@ -79,6 +138,7 @@ from story_script_manager import StoryScriptManager, ProjectStage, SetupMode, Ch
 from character_profile_parser import parse_character_profile_from_text, parse_multiple_profiles
 from src.core.updater import UpdateChecker, UpdateDownloader, apply_update, APP_VERSION
 from src.gui.update_dialog import UpdateDialog, UpdateButton
+from chrome_profile_utils import is_managed_profile_path, resolve_chrome_profile, get_default_system_chrome_profile_path, get_tool_system_chrome_profile_path, get_tool_account_profile_path
 
 # Import CookieWorker and AddAccountDialog from cookiauto.py
 try:
@@ -99,7 +159,7 @@ class FlowTaskData:
     model_code: str                                     # "NARWHAL" / "GEM_PIX_2"
     aspect_ratio: str                                   # "IMAGE_ASPECT_RATIO_LANDSCAPE" / "PORTRAIT"
     seed: int                                           # Seed value
-    reference_images: List[str] = field(default_factory=list)  # Paths to reference images (max 3)
+    reference_images: List[str] = field(default_factory=list)  # Paths to reference images (max 15 cho Banana Pro)
     status: str = "pending"                             # "pending" / "running" / "success" / "error"
     error_message: Optional[str] = None                 # Error detail if status == "error"
     output_path: Optional[str] = None                   # Path to saved image if success
@@ -111,18 +171,28 @@ class ThumbnailGridWidget(QWidget):
     """Widget hiển thị grid thumbnail + nút "+" trong cell của QTableWidget."""
 
     images_changed = Signal(int, list)  # (row_index, image_paths)
+    height_hint_changed = Signal(int, int)  # (row_index, suggested_height)
 
-    def __init__(self, row_index: int, max_images: int = 3, parent=None):
+    def __init__(
+        self,
+        row_index: int,
+        max_images: int = 3,
+        parent=None,
+        thumbnail_size: int = 48,
+        columns: Optional[int] = None,
+    ):
         super().__init__(parent)
         self.row_index = row_index
         self.max_images = max_images
         self.image_paths: List[str] = []
-        self.thumbnail_size = 48
+        self.thumbnail_size = thumbnail_size
+        self.grid_columns = max(1, columns or min(max_images, 3))
         self._locked = False
 
-        self._layout = QHBoxLayout(self)
+        self._layout = QGridLayout(self)
         self._layout.setSpacing(4)
         self._layout.setContentsMargins(2, 2, 2, 2)
+        self._layout.setAlignment(Qt.AlignLeft | Qt.AlignTop)
 
         self._add_btn = QPushButton("+")
         self._add_btn.setFixedSize(self.thumbnail_size, self.thumbnail_size)
@@ -132,8 +202,8 @@ class ThumbnailGridWidget(QWidget):
         )
         self._add_btn.setCursor(Qt.PointingHandCursor)
         self._add_btn.clicked.connect(self._on_add_clicked)
-        self._layout.addWidget(self._add_btn)
-        self._layout.addStretch()
+        self._layout.addWidget(self._add_btn, 0, 0)
+        self.setMinimumHeight(self._compute_height())
 
     def add_images(self, paths: List[str]) -> None:
         """Thêm ảnh, giới hạn tối đa max_images."""
@@ -141,6 +211,14 @@ class ThumbnailGridWidget(QWidget):
         if remaining <= 0:
             return
         self.image_paths.extend(paths[:remaining])
+        self._rebuild_layout()
+        self.images_changed.emit(self.row_index, list(self.image_paths))
+
+    def remove_image_at(self, index: int) -> None:
+        """Xóa 1 ảnh theo index và cập nhật UI ngay."""
+        if index < 0 or index >= len(self.image_paths):
+            return
+        self.image_paths.pop(index)
         self._rebuild_layout()
         self.images_changed.emit(self.row_index, list(self.image_paths))
 
@@ -153,10 +231,13 @@ class ThumbnailGridWidget(QWidget):
             if w:
                 w.setParent(None)
 
-        # Add thumbnail labels
-        for path in self.image_paths:
-            lbl = QLabel()
-            lbl.setFixedSize(self.thumbnail_size, self.thumbnail_size)
+        # Add thumbnail items with a corner delete button.
+        for index, path in enumerate(self.image_paths):
+            item = QWidget()
+            item.setFixedSize(self.thumbnail_size, self.thumbnail_size)
+
+            lbl = QLabel(item)
+            lbl.setGeometry(0, 0, self.thumbnail_size, self.thumbnail_size)
             pixmap = QPixmap(path)
             if not pixmap.isNull():
                 pixmap = pixmap.scaled(
@@ -166,7 +247,29 @@ class ThumbnailGridWidget(QWidget):
             lbl.setPixmap(pixmap)
             lbl.setAlignment(Qt.AlignCenter)
             lbl.setStyleSheet("border: 1px solid #e2e8f0; border-radius: 6px; background: #f8fafc;")
-            self._layout.addWidget(lbl)
+
+            remove_btn = QToolButton(item)
+            remove_btn.setText("x")
+            remove_btn.setCursor(Qt.PointingHandCursor)
+            remove_btn.setEnabled(not self._locked)
+            remove_btn.setGeometry(self.thumbnail_size - 18, 2, 16, 16)
+            remove_btn.setStyleSheet(
+                "QToolButton {"
+                "background: rgba(239, 68, 68, 0.95);"
+                "color: white;"
+                "border: none;"
+                "border-radius: 8px;"
+                "font-size: 10px;"
+                "font-weight: 700;"
+                "padding: 0;"
+                "}"
+                "QToolButton:hover { background: rgba(220, 38, 38, 1); }"
+                "QToolButton:disabled { background: rgba(148, 163, 184, 0.9); color: #e2e8f0; }"
+            )
+            remove_btn.clicked.connect(lambda checked=False, idx=index: self.remove_image_at(idx))
+            row = index // self.grid_columns
+            col = index % self.grid_columns
+            self._layout.addWidget(item, row, col)
 
         # Show "+" button only if under max
         if len(self.image_paths) < self.max_images:
@@ -181,9 +284,14 @@ class ThumbnailGridWidget(QWidget):
                 f"color: {'#94a3b8' if locked else '#3b82f6'};"
             )
             self._add_btn.clicked.connect(self._on_add_clicked)
-            self._layout.addWidget(self._add_btn)
+            next_index = len(self.image_paths)
+            next_row = next_index // self.grid_columns
+            next_col = next_index % self.grid_columns
+            self._layout.addWidget(self._add_btn, next_row, next_col)
 
-        self._layout.addStretch()
+        suggested_height = self._compute_height()
+        self.setMinimumHeight(suggested_height)
+        self.height_hint_changed.emit(self.row_index, suggested_height)
 
     def set_locked(self, locked: bool) -> None:
         """Lock/unlock the '+' button (disable adding images while running)."""
@@ -206,12 +314,17 @@ class ThumbnailGridWidget(QWidget):
             return
         files, _ = QFileDialog.getOpenFileNames(
             self,
-            "Chọn ảnh tham chiếu",
+            f"Chọn ảnh tham chiếu (tối đa {self.max_images} ảnh)",
             "",
             "Images (*.png *.jpg *.jpeg *.webp)"
         )
         if files:
             self.add_images(files)
+
+    def _compute_height(self) -> int:
+        visible_items = len(self.image_paths) + (1 if len(self.image_paths) < self.max_images else 0)
+        rows = max(1, math.ceil(visible_items / self.grid_columns))
+        return rows * self.thumbnail_size + max(4, (rows - 1) * self._layout.spacing()) + 8
 # ==================== END THUMBNAIL GRID WIDGET ====================
 
 
@@ -2846,6 +2959,7 @@ class GoogleLabsFlowQt6(QMainWindow):
         self.cookies_list = []  # List of cookie strings
         self.cookie_profile_paths = []  # ✅ List of profile paths song song với cookies_list
         self.cookie_emails = []  # ✅ List of emails song song với cookies_list (cho proxy per-account)
+        self.cookie_passwords = []  # ✅ List of passwords song song với cookies_list (cho auto-renew/proxy-first)
         self.cookie_value = ""  # Backward compatibility
         
         # Gemini API Keys storage (dùng chung cho toàn app)
@@ -2855,6 +2969,9 @@ class GoogleLabsFlowQt6(QMainWindow):
         # Current mode state
         self.current_video_mode = "Text to Video"
         self.current_image_mode = "Text-to-Image"
+        self.video_mode_grid_states: Dict[str, Dict[str, Any]] = {}
+        self.video_mode_row_ref_images: Dict[str, Dict[int, List[str]]] = {}
+        self.video_mode_row_end_images: Dict[str, Dict[int, List[str]]] = {}
 
         # Window state for zoom functionality
         self.normal_geometry = None
@@ -3568,7 +3685,7 @@ class GoogleLabsFlowQt6(QMainWindow):
         self.main_tabs[0].setChecked(True)
         
         # ✅ Ẩn các tab tạm thời không dùng
-        hidden_tab_indices = [3, 4, 5, 6, 7]  # Siêu Đồng Bộ, Viết lại nội dung, Viết Kịch Bản, Trích Xuất Ảnh, Clone Videos
+        hidden_tab_indices = [1, 2, 3, 4, 5, 6, 7]  # Whisk, Edit, Siêu Đồng Bộ, Viết lại nội dung, Viết Kịch Bản, Trích Xuất Ảnh, Clone Videos
         for idx in hidden_tab_indices:
             if idx < len(self.main_tabs):
                 self.main_tabs[idx].setVisible(False)
@@ -3670,31 +3787,110 @@ class GoogleLabsFlowQt6(QMainWindow):
         parent_layout.addWidget(self.sub_toolbar)
     
     def build_video_tab_content(self):
-        """Build Video tab content: 2 cột trên + Logs ngang dưới"""
+        """Build Video tab content with a compact web-like layout."""
         video_widget = QWidget()
+        video_widget.setObjectName("videoTabRoot")
+        video_widget.setStyleSheet("""
+            QWidget#videoTabRoot {
+                background: #f6f8fb;
+            }
+            QWidget#videoTabRoot QScrollArea {
+                border: none;
+                background: transparent;
+            }
+            QWidget#videoTabRoot QGroupBox {
+                background: #ffffff;
+                border: 1px solid #dbe3ef;
+                border-radius: 14px;
+                margin-top: 12px;
+                padding-top: 10px;
+                font-size: 13px;
+                font-weight: 600;
+                color: #0f172a;
+            }
+            QWidget#videoTabRoot QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 12px;
+                padding: 0 6px;
+                color: #0f172a;
+            }
+            QWidget#videoTabRoot QLineEdit,
+            QWidget#videoTabRoot QComboBox,
+            QWidget#videoTabRoot QSpinBox,
+            QWidget#videoTabRoot QTextEdit,
+            QWidget#videoTabRoot QListWidget,
+            QWidget#videoTabRoot QTableWidget {
+                background: #ffffff;
+                border: 1px solid #d7dfeb;
+                border-radius: 10px;
+                padding: 6px 8px;
+                color: #0f172a;
+                selection-background-color: #dbeafe;
+            }
+            QWidget#videoTabRoot QLineEdit:focus,
+            QWidget#videoTabRoot QComboBox:focus,
+            QWidget#videoTabRoot QSpinBox:focus,
+            QWidget#videoTabRoot QTextEdit:focus {
+                border: 1px solid #60a5fa;
+            }
+            QWidget#videoTabRoot QPushButton {
+                background: #eef4ff;
+                border: 1px solid #c7d6f7;
+                border-radius: 10px;
+                color: #1d4ed8;
+                font-weight: 600;
+                padding: 7px 12px;
+            }
+            QWidget#videoTabRoot QPushButton:hover {
+                background: #dbeafe;
+            }
+            QWidget#videoTabRoot QPushButton#startButton {
+                background: #1d4ed8;
+                border-color: #1d4ed8;
+                color: white;
+            }
+            QWidget#videoTabRoot QPushButton#pauseButton,
+            QWidget#videoTabRoot QPushButton#continueButton {
+                background: #ffffff;
+                color: #334155;
+                border-color: #cbd5e1;
+            }
+            QWidget#videoTabRoot QPushButton#fixButton {
+                background: #fff7ed;
+                border-color: #fdba74;
+                color: #c2410c;
+            }
+            QWidget#videoTabRoot QHeaderView::section {
+                background: #f8fafc;
+                color: #475569;
+                border: none;
+                border-bottom: 1px solid #e2e8f0;
+                padding: 8px;
+                font-weight: 600;
+            }
+            QWidget#videoTabRoot QLabel {
+                color: #334155;
+            }
+        """)
         layout = QVBoxLayout(video_widget)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
         
-        # TOP: 2 cột (Settings | Prompts)
         top_splitter = QSplitter(Qt.Horizontal)
         
-        # LEFT: Settings
         left = self.build_left_panel()
         top_splitter.addWidget(left)
         
-        # RIGHT: Prompts table (rộng hơn)
         center = self.build_center_panel()
         top_splitter.addWidget(center)
         
-        top_splitter.setSizes([500, 900])
+        top_splitter.setSizes([430, 980])
         top_splitter.setChildrenCollapsible(False)
         
         layout.addWidget(top_splitter)
         
-        # BOTTOM: Logs (ngang, full width)
-        logs_panel = self.build_logs_panel()
-        layout.addWidget(logs_panel)
+        self.video_logs_panel = self.build_logs_panel()
+        self.video_logs_panel.setVisible(False)
         
         self.tab_stack.addWidget(video_widget)
     
@@ -3726,8 +3922,8 @@ class GoogleLabsFlowQt6(QMainWindow):
         """Build Flow Image tab content similar to provided mock"""
         flow_widget = QWidget()
         layout = QVBoxLayout(flow_widget)
-        layout.setContentsMargins(5, 5, 5, 5)
-        layout.setSpacing(5)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
 
         splitter = QSplitter(Qt.Horizontal)
         splitter.setChildrenCollapsible(False)
@@ -3736,7 +3932,7 @@ class GoogleLabsFlowQt6(QMainWindow):
         right_panel = self.build_flow_right_panel()
         splitter.addWidget(left_panel)
         splitter.addWidget(right_panel)
-        splitter.setSizes([550, 870])
+        splitter.setSizes([470, 950])
 
         layout.addWidget(splitter)
         self.tab_stack.addWidget(flow_widget)
@@ -3746,7 +3942,7 @@ class GoogleLabsFlowQt6(QMainWindow):
         widget.setObjectName("flowInputPanel")
         widget.setStyleSheet("""
             QWidget#flowInputPanel {
-                background: #f1f5f9;
+                background: #ffffff;
             }
             QFrame#flowCard {
                 background: #ffffff;
@@ -3831,7 +4027,7 @@ class GoogleLabsFlowQt6(QMainWindow):
         config_form.addWidget(variations_label, 3, 0)
         config_form.addWidget(self.flow_variations_spin, 3, 1)
 
-        # Row 4: Concurrent
+        # Row 4: Concurrent (ẩn khỏi UI, vẫn giữ cho logic cũ)
         concurrent_label = QLabel("Số công việc đồng thời")
         concurrent_label.setStyleSheet("color: #0f172a; font-weight: 600;")
         self.flow_concurrent_spin = QSpinBox()
@@ -3840,6 +4036,8 @@ class GoogleLabsFlowQt6(QMainWindow):
         self.flow_concurrent_spin.setToolTip("Số prompt xử lý đồng thời (1-6)")
         config_form.addWidget(concurrent_label, 4, 0)
         config_form.addWidget(self.flow_concurrent_spin, 4, 1)
+        concurrent_label.setVisible(False)
+        self.flow_concurrent_spin.setVisible(False)
 
         # Row 5: Delay
         delay_label = QLabel("Delay (giây)")
@@ -3853,7 +4051,7 @@ class GoogleLabsFlowQt6(QMainWindow):
         config_form.addWidget(self.flow_delay_spin, 5, 1)
         self._load_flow_delay_setting()
 
-        # Row 6: Reference Mode
+        # Row 6: Reference Mode (ẩn khỏi UI)
         ref_mode_label = QLabel("Chế độ tham chiếu")
         ref_mode_label.setStyleSheet("color: #0f172a; font-weight: 600;")
         self.flow_ref_mode_combo = QComboBox()
@@ -3864,8 +4062,10 @@ class GoogleLabsFlowQt6(QMainWindow):
         self.flow_ref_mode_combo.setCurrentIndex(0)
         config_form.addWidget(ref_mode_label, 6, 0)
         config_form.addWidget(self.flow_ref_mode_combo, 6, 1)
+        ref_mode_label.setVisible(False)
+        self.flow_ref_mode_combo.setVisible(False)
 
-        # Row 7: Seed
+        # Row 7: Seed (ẩn khỏi UI)
         seed_label = QLabel("Seed")
         seed_label.setStyleSheet("color: #0f172a; font-weight: 600;")
         self.flow_seed_input = QSpinBox()
@@ -3875,8 +4075,10 @@ class GoogleLabsFlowQt6(QMainWindow):
         self.flow_seed_input.setSpecialValueText("Random")
         config_form.addWidget(seed_label, 7, 0)
         config_form.addWidget(self.flow_seed_input, 7, 1)
+        seed_label.setVisible(False)
+        self.flow_seed_input.setVisible(False)
 
-        # Row 8: Output directory
+        # Row 8: Output directory (ẩn khỏi UI)
         output_label = QLabel("Thư mục lưu ảnh")
         output_label.setStyleSheet("color: #0f172a; font-weight: 600;")
         output_row = QHBoxLayout()
@@ -3912,11 +4114,14 @@ class GoogleLabsFlowQt6(QMainWindow):
         output_row.addWidget(btn_browse_output)
         config_form.addWidget(output_label, 8, 0)
         config_form.addLayout(output_row, 8, 1)
+        output_label.setVisible(False)
+        self.flow_output_input.setVisible(False)
+        btn_browse_output.setVisible(False)
 
         config_layout.addLayout(config_form)
         container_layout.addWidget(config_card)
 
-        # ===== MODE SELECTION =====
+        # ===== MODE SELECTION (ẩn khỏi UI, giữ mode mặc định tương thích) =====
         mode_card, mode_layout = self._create_flow_card("Chế độ tạo ảnh")
         mode_group_layout = QVBoxLayout()
 
@@ -3947,6 +4152,7 @@ class GoogleLabsFlowQt6(QMainWindow):
         mode_group_layout.addLayout(row3_layout)
 
         mode_layout.addLayout(mode_group_layout)
+        mode_card.setVisible(False)
         container_layout.addWidget(mode_card)
 
         # ===== REFERENCE IMAGES - NORMAL MODE (ẨN - đã có nút ở toolbar grid) =====
@@ -3962,8 +4168,8 @@ class GoogleLabsFlowQt6(QMainWindow):
         self.flow_prompt_count_label.setVisible(False)
 
         # ===== NGUỒN PROMPT (.TXT) =====
-        self.flow_source_card, source_layout = self._create_flow_card("Nguồn prompt (.txt)")
-        source_desc = QLabel("Có thể chọn 1 file hoặc 1 thư mục chứa nhiều file .txt để chạy hàng loạt như Whisk Image.")
+        self.flow_source_card, source_layout = self._create_flow_card("Nguồn nội dung (.txt)")
+        source_desc = QLabel("Chọn 1 file .txt hoặc 1 thư mục chứa nhiều file .txt.")
         source_desc.setObjectName("flowSubLabel")
         source_desc.setWordWrap(True)
         source_layout.addWidget(source_desc)
@@ -4016,7 +4222,7 @@ class GoogleLabsFlowQt6(QMainWindow):
 
         action_row = QHBoxLayout()
         action_row.addStretch()
-        btn_clear_sources = QPushButton("🧹 Xóa danh sách")
+        btn_clear_sources = QPushButton("Xóa danh sách")
         btn_clear_sources.setFixedWidth(140)
         btn_clear_sources.clicked.connect(self.clear_flow_prompt_sources)
         action_row.addWidget(btn_clear_sources)
@@ -4159,7 +4365,7 @@ class GoogleLabsFlowQt6(QMainWindow):
         self.flow_ref_folder_structure_card.setVisible(False)  # Hidden by default
         container_layout.addWidget(self.flow_ref_folder_structure_card)
 
-        # ===== REFERENCE IMAGE DIRECTORY =====
+        # ===== REFERENCE IMAGE DIRECTORY (ẩn khỏi UI) =====
         ref_dir_card, ref_dir_layout = self._create_flow_card("Thư mục ảnh tham chiếu")
         ref_dir_row = QHBoxLayout()
         self.flow_ref_dir_input = QLineEdit()
@@ -4191,10 +4397,11 @@ class GoogleLabsFlowQt6(QMainWindow):
         ref_dir_row.addWidget(self.flow_ref_dir_input)
         ref_dir_row.addWidget(btn_browse_ref_dir)
         ref_dir_layout.addLayout(ref_dir_row)
+        ref_dir_card.setVisible(False)
         container_layout.addWidget(ref_dir_card)
 
-        # ===== ACTION BUTTONS (hidden - moved to toolbar/other location) =====
-        action_card, action_layout = self._create_flow_card("Thực thi")
+        # ===== ACTION BUTTONS =====
+        action_card, action_layout = self._create_flow_card("Thao tác")
 
         self.btn_flow_run = QPushButton("CHẠY NGAY")
         self.btn_flow_run.setFixedHeight(50)
@@ -4287,7 +4494,6 @@ class GoogleLabsFlowQt6(QMainWindow):
         self.flow_status_label.setAlignment(Qt.AlignCenter)
         self.flow_status_label.setStyleSheet("color: #475569; font-style: italic; padding-top: 6px;")
         action_layout.addWidget(self.flow_status_label)
-        action_card.setVisible(False)  # ✅ Ẩn panel Thực thi
         container_layout.addWidget(action_card)
 
         container_layout.addStretch()
@@ -4324,7 +4530,7 @@ class GoogleLabsFlowQt6(QMainWindow):
         header_layout = QHBoxLayout()
         header_layout.setSpacing(10)
         
-        title_label = QLabel("📋 Danh sách Task")
+        title_label = QLabel("Kết quả")
         title_label.setStyleSheet("color: #0f172a; font-size: 15px; font-weight: 700;")
         header_layout.addWidget(title_label)
         header_layout.addStretch()
@@ -4366,7 +4572,7 @@ class GoogleLabsFlowQt6(QMainWindow):
         # ==================== TASK GRID (QTableWidget) ====================
         self.flow_task_grid = QTableWidget()
         self.flow_task_grid.setColumnCount(6)
-        self.flow_task_grid.setHorizontalHeaderLabels(["#", "Trạng thái", "Ảnh tham chiếu", "Preview", "Prompt", "Status"])
+        self.flow_task_grid.setHorizontalHeaderLabels(["#", "Trạng thái", "Ảnh tham chiếu", "Kết quả", "Nội dung", "Chi tiết"])
         self.flow_task_grid.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.flow_task_grid.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.flow_task_grid.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -4429,15 +4635,15 @@ class GoogleLabsFlowQt6(QMainWindow):
         self.flow_task_grid.setColumnWidth(1, 160)
         # Col 2: Ảnh tham chiếu
         header.setSectionResizeMode(2, QHeaderView.Fixed)
-        self.flow_task_grid.setColumnWidth(2, 150)
+        self.flow_task_grid.setColumnWidth(2, 300)
         # Col 3: Preview (nhỏ, cố định)
         header.setSectionResizeMode(3, QHeaderView.Fixed)
-        self.flow_task_grid.setColumnWidth(3, 100)
+        self.flow_task_grid.setColumnWidth(3, 110)
         # Col 4: Prompt
         header.setSectionResizeMode(4, QHeaderView.Stretch)
         # Col 5: Status (hiển thị trạng thái chi tiết + lỗi dễ hiểu)
         header.setSectionResizeMode(5, QHeaderView.Fixed)
-        self.flow_task_grid.setColumnWidth(5, 220)
+        self.flow_task_grid.setColumnWidth(5, 170)
 
         layout.addWidget(self.flow_task_grid, 1)
 
@@ -4474,26 +4680,26 @@ class GoogleLabsFlowQt6(QMainWindow):
         self.btn_add_images.setStyleSheet(btn_base.format(bg="#3b82f6", fg="white", hover="#2563eb"))
         toolbar.addWidget(self.btn_add_images)
 
-        self.btn_delete_selected = QPushButton("🗑 Xóa chọn")
+        self.btn_delete_selected = QPushButton("Xóa chọn")
         self.btn_delete_selected.setFixedHeight(34)
         self.btn_delete_selected.setCursor(Qt.PointingHandCursor)
         self.btn_delete_selected.setStyleSheet(btn_base.format(bg="#f1f5f9", fg="#475569", hover="#e2e8f0"))
         toolbar.addWidget(self.btn_delete_selected)
 
-        self.btn_delete_all = QPushButton("Xóa hết")
+        self.btn_delete_all = QPushButton("Xóa kết quả")
         self.btn_delete_all.setFixedHeight(34)
         self.btn_delete_all.setCursor(Qt.PointingHandCursor)
         self.btn_delete_all.setStyleSheet(btn_base.format(bg="#fef2f2", fg="#b91c1c", hover="#fecaca"))
         toolbar.addWidget(self.btn_delete_all)
 
         # ===== BULK REFERENCE IMAGE BUTTONS =====
-        self.btn_import_images_all = QPushButton("📷 Import ảnh tất cả")
+        self.btn_import_images_all = QPushButton("Thêm ảnh tham chiếu")
         self.btn_import_images_all.setFixedHeight(34)
         self.btn_import_images_all.setCursor(Qt.PointingHandCursor)
         self.btn_import_images_all.setStyleSheet(btn_base.format(bg="#f0fdf4", fg="#166534", hover="#dcfce7"))
         toolbar.addWidget(self.btn_import_images_all)
 
-        self.btn_clear_images_all = QPushButton("🗑 Xóa ảnh tất cả")
+        self.btn_clear_images_all = QPushButton("Xóa ảnh tham chiếu")
         self.btn_clear_images_all.setFixedHeight(34)
         self.btn_clear_images_all.setCursor(Qt.PointingHandCursor)
         self.btn_clear_images_all.setStyleSheet(btn_base.format(bg="#fef2f2", fg="#b91c1c", hover="#fecaca"))
@@ -4501,13 +4707,13 @@ class GoogleLabsFlowQt6(QMainWindow):
 
         toolbar.addStretch()
 
-        self.btn_retry_failed = QPushButton("🔄 Chạy lại lỗi")
+        self.btn_retry_failed = QPushButton("Chạy lại lỗi")
         self.btn_retry_failed.setFixedHeight(34)
         self.btn_retry_failed.setCursor(Qt.PointingHandCursor)
         self.btn_retry_failed.setStyleSheet(btn_base.format(bg="#fef3c7", fg="#92400e", hover="#fde68a"))
         toolbar.addWidget(self.btn_retry_failed)
 
-        self.btn_flow_stop_toolbar = QPushButton("⏹ Dừng")
+        self.btn_flow_stop_toolbar = QPushButton("Dừng")
         self.btn_flow_stop_toolbar.setFixedHeight(34)
         self.btn_flow_stop_toolbar.setCursor(Qt.PointingHandCursor)
         self.btn_flow_stop_toolbar.setEnabled(False)
@@ -4515,7 +4721,7 @@ class GoogleLabsFlowQt6(QMainWindow):
         self.btn_flow_stop_toolbar.clicked.connect(self.on_flow_stop_clicked)
         toolbar.addWidget(self.btn_flow_stop_toolbar)
 
-        self.btn_run_selected = QPushButton("▶ Chạy tất cả")
+        self.btn_run_selected = QPushButton("Tạo ảnh")
         self.btn_run_selected.setFixedHeight(34)
         self.btn_run_selected.setCursor(Qt.PointingHandCursor)
         self.btn_run_selected.setStyleSheet(btn_base.format(bg="#10b981", fg="white", hover="#059669"))
@@ -7655,8 +7861,7 @@ class GoogleLabsFlowQt6(QMainWindow):
             self.log(f"🔑 Flow sử dụng {num_cookies} cookie(s) với round-robin distribution")
 
             # ✅ Dùng cookie đầu tiên cho upload reference images và setup
-            main_cookies = _parse_cookie_string(available_cookies[0])
-            main_client = LabsFlowClient(main_cookies)
+            main_client = self._build_client_from_cookie_str(available_cookies[0], cookie_index=0)
 
             # Đăng ký callback cho cookie đầu tiên
             main_cookie_hash = main_client._cookie_hash
@@ -7815,8 +8020,7 @@ class GoogleLabsFlowQt6(QMainWindow):
                 self.log(f"📤 Flow Folder Structure mode - Uploading {len(reference_paths)} reference images với TẤT CẢ cookies...")
                 # ✅ Upload với từng cookie để cache riêng
                 for cookie_idx in range(num_cookies):
-                    cookies = _parse_cookie_string(available_cookies[cookie_idx])
-                    cookie_client = LabsFlowClient(cookies)
+                    cookie_client = self._build_client_from_cookie_str(available_cookies[cookie_idx], cookie_index=cookie_idx)
                     if cookie_client and cookie_client.fetch_access_token():
                         self._upload_flow_references(cookie_client, reference_paths)
                         self.log(f"✅ Cookie #{cookie_idx + 1}: Đã upload/cache {len(reference_paths)} ảnh tham chiếu")
@@ -7837,8 +8041,7 @@ class GoogleLabsFlowQt6(QMainWindow):
                 self.log(f"📤 Flow Normal mode - Uploading {len(all_ref_paths_list)} unique reference images với TẤT CẢ cookies...")
                 # ✅ Upload với từng cookie để cache riêng
                 for cookie_idx in range(num_cookies):
-                    cookies = _parse_cookie_string(available_cookies[cookie_idx])
-                    cookie_client = LabsFlowClient(cookies)
+                    cookie_client = self._build_client_from_cookie_str(available_cookies[cookie_idx], cookie_index=cookie_idx)
                     if cookie_client and cookie_client.fetch_access_token():
                         self._upload_flow_references(cookie_client, all_ref_paths_list)
                         self.log(f"✅ Cookie #{cookie_idx + 1}: Đã upload/cache {len(all_ref_paths_list)} ảnh tham chiếu")
@@ -7907,8 +8110,10 @@ class GoogleLabsFlowQt6(QMainWindow):
                             return None, None
                         
                         cookie_str = available_cookies[idx]
-                        job_cookies = _parse_cookie_string(cookie_str)
-                        job_client = LabsFlowClient(job_cookies)
+                        job_client = self._build_client_from_cookie_str(cookie_str, cookie_index=idx)
+                        if not job_client:
+                            failed_cookies_die.add(idx)
+                            continue
                         
                         # Đăng ký callback renew cookie cho cookie này
                         job_cookie_hash = job_client._cookie_hash
@@ -9791,12 +9996,13 @@ class GoogleLabsFlowQt6(QMainWindow):
             self.flow_task_grid.setItem(row, 1, status_item)
 
             # Thumbnail grid
-            thumb = ThumbnailGridWidget(row, max_images=3)
+            thumb = ThumbnailGridWidget(row, max_images=15, thumbnail_size=40, columns=5)
             if reference_paths:
                 thumb.add_images(list(reference_paths))
             thumb.images_changed.connect(self._on_flow_thumbnail_changed)
+            thumb.height_hint_changed.connect(self._on_flow_thumbnail_height_changed)
             self.flow_task_grid.setCellWidget(row, 2, thumb)
-            self.flow_task_grid.setRowHeight(row, max(56, self.flow_task_grid.rowHeight(row)))
+            self.flow_task_grid.setRowHeight(row, max(64, thumb.minimumHeight() + 10))
 
             # Col 3: Preview (ảnh đã tạo) - placeholder widget
             preview_label = QLabel("Chờ...")
@@ -9834,6 +10040,14 @@ class GoogleLabsFlowQt6(QMainWindow):
         """Callback khi thumbnail thay đổi - cập nhật FlowTaskData."""
         if 0 <= row_index < len(self.flow_tasks):
             self.flow_tasks[row_index].reference_images = list(image_paths)
+        if hasattr(self, "flow_task_grid") and 0 <= row_index < self.flow_task_grid.rowCount():
+            thumb = self.flow_task_grid.cellWidget(row_index, 2)
+            if isinstance(thumb, ThumbnailGridWidget):
+                self.flow_task_grid.setRowHeight(row_index, max(64, thumb.minimumHeight() + 10))
+
+    def _on_flow_thumbnail_height_changed(self, row_index: int, suggested_height: int):
+        if hasattr(self, "flow_task_grid") and 0 <= row_index < self.flow_task_grid.rowCount():
+            self.flow_task_grid.setRowHeight(row_index, max(64, suggested_height + 10))
 
     def _flow_update_summary_bar(self):
         """Cập nhật summary status bar dựa trên flow_tasks."""
@@ -13890,14 +14104,13 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
         self.tab_stack.addWidget(clone_widget)
     
     def build_left_panel(self):
-        """LEFT: Thiết lập + Batch + Hướng dẫn"""
-        # ✅ Tạo scroll area để có thể scroll khi nội dung dài (đặc biệt cho Expand + Reference)
+        """LEFT: compact web-like sidebar for all video modes."""
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
         scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         scroll_area.setFrameShape(QFrame.NoFrame)
-        scroll_area.setMinimumWidth(480)  # Đảm bảo sidebar đủ rộng để hiển thị nội dung
+        scroll_area.setMinimumWidth(420)
         scroll_area.setStyleSheet("""
             QScrollArea {
                 border: none;
@@ -13907,28 +14120,29 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
         
         widget = QWidget()
         layout = QVBoxLayout(widget)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(10)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(8)
         
         # ===== PROMPT INPUT (cho I2V/Start+End/Integrate/Extend) =====
         # T2V không cần section này (chỉ dùng Batch Job)
-        self.input_group = QGroupBox("Batch Job")
+        self.input_group = QGroupBox("Nguồn dữ liệu")
         input_layout = QVBoxLayout()
-        input_layout.setSpacing(8)
+        input_layout.setSpacing(6)
         
         # Text to Video inputs (CHỈ nhập 1 prompt, file nhiều prompt dùng Batch Job)
         self.txt_t2v_frame = QWidget()
+        self.txt_t2v_frame.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         t2v_layout = QVBoxLayout(self.txt_t2v_frame)
         t2v_layout.setContentsMargins(0, 0, 0, 0)
+        t2v_layout.setSpacing(0)
         
         # ❌ XÓA PHẦN PROMPT 1 DÒNG - CHỈ DÙNG BATCH JOB
         # Note: Bắt buộc sử dụng Batch Job (file .txt) - Không hỗ trợ nhập trực tiếp
         
-        self.txt_t2v_frame.setVisible(False)  # Luôn ẩn vì đã bỏ prompt 1 dòng
-        input_layout.addWidget(self.txt_t2v_frame)
         
         # Image to Video inputs (CHỈ hỗ trợ batch theo file .txt / folder)
         self.txt_i2v_frame = QWidget()
+        self.txt_i2v_frame.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         i2v_layout = QVBoxLayout(self.txt_i2v_frame)
         i2v_layout.setContentsMargins(0, 0, 0, 0)
         i2v_layout.setSpacing(6)
@@ -13943,6 +14157,12 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
         i2v_mode_col.addWidget(self.rb_i2v_mode_folder_txt)
         i2v_mode_col.addWidget(self.rb_i2v_mode_root_match)
         i2v_layout.addLayout(i2v_mode_col)
+
+        self.i2v_media_box, self.i2v_preview_label, self.i2v_preview_info = self._create_video_media_card(
+            "Ảnh ref",
+            "Chưa có ảnh ref"
+        )
+        i2v_layout.addWidget(self.i2v_media_box)
         
         # Thư mục ảnh (nhiều files)
         self.lbl_i2v_img_folder = QLabel("Thư mục ảnh (nhiều files):")
@@ -14013,14 +14233,27 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
         # Gọi 1 lần để set trạng thái ban đầu
         self.update_i2v_mode_ui()
         
-        self.txt_i2v_frame.setVisible(False)
-        input_layout.addWidget(self.txt_i2v_frame)
         
         # Start+End to Video inputs
         self.txt_start_end_frame = QWidget()
+        self.txt_start_end_frame.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         se_layout = QVBoxLayout(self.txt_start_end_frame)
         se_layout.setContentsMargins(0, 0, 0, 0)
         se_layout.setSpacing(6)
+
+        se_media_row = QHBoxLayout()
+        se_media_row.setSpacing(10)
+        self.start_media_box, self.start_preview_label, self.start_preview_info = self._create_video_media_card(
+            "Ảnh start",
+            "Chưa có ảnh start"
+        )
+        self.end_media_box, self.end_preview_label, self.end_preview_info = self._create_video_media_card(
+            "Ảnh end",
+            "Chưa có ảnh end"
+        )
+        se_media_row.addWidget(self.start_media_box)
+        se_media_row.addWidget(self.end_media_box)
+        se_layout.addLayout(se_media_row)
         
         # Thư mục ảnh Start-End
         se_layout.addWidget(QLabel("Thư mục ảnh (Start + End):"))
@@ -14063,11 +14296,10 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
         se_tip.setStyleSheet("color: #666666; font-size: 10px; font-style: italic;")
         se_layout.addWidget(se_tip)
         
-        self.txt_start_end_frame.setVisible(False)
-        input_layout.addWidget(self.txt_start_end_frame)
         
         # Extend Video inputs
         self.txt_extend_frame = QWidget()
+        self.txt_extend_frame.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         ext_layout = QVBoxLayout(self.txt_extend_frame)
         ext_layout.setContentsMargins(0, 0, 0, 0)
         ext_layout.setSpacing(6)
@@ -14122,11 +14354,10 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
         output_row.addWidget(btn_ext_output)
         ext_layout.addLayout(output_row)
         
-        self.txt_extend_frame.setVisible(False)
-        input_layout.addWidget(self.txt_extend_frame)
         
         # Integrate to Video inputs
         self.txt_integrate_frame = QWidget()
+        self.txt_integrate_frame.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         int_layout = QVBoxLayout(self.txt_integrate_frame)
         int_layout.setContentsMargins(0, 0, 0, 0)
         int_layout.setSpacing(6)
@@ -14155,9 +14386,15 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
         default_layout = QVBoxLayout(self.integrate_default_frame)
         default_layout.setContentsMargins(0, 0, 0, 0)
         default_layout.setSpacing(6)
+
+        self.integrate_media_box, self.integrate_preview_label, self.integrate_preview_info = self._create_video_media_card(
+            "Ảnh ref",
+            "Chưa có ảnh ref"
+        )
+        default_layout.addWidget(self.integrate_media_box)
         
         # Folder ảnh
-        default_layout.addWidget(QLabel("Thư mục chứa các ảnh:"))
+        default_layout.addWidget(QLabel("Thư mục ảnh tham chiếu:"))
         img_folder_row = QHBoxLayout()
         self.txt_integrate_images_folder = QLineEdit()
         self.txt_integrate_images_folder.setPlaceholderText("Chọn thư mục ảnh...")
@@ -14169,7 +14406,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
         default_layout.addLayout(img_folder_row)
         
         # File prompt
-        default_layout.addWidget(QLabel("File txt chứa prompt:"))
+        default_layout.addWidget(QLabel("File prompt (.txt):"))
         prompt_row = QHBoxLayout()
         self.txt_integrate_prompt_file = QLineEdit()
         self.txt_integrate_prompt_file.setPlaceholderText("Chọn file prompt...")
@@ -14182,10 +14419,10 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
         
         # Số ảnh mỗi nhóm
         group_size_row = QHBoxLayout()
-        group_size_row.addWidget(QLabel("Số ảnh mỗi nhóm (1 nhóm = 1 dòng prompt):"))
+        group_size_row.addWidget(QLabel("Số ảnh / nhóm:"))
         self.combo_integrate_images_per_group = QComboBox()
         self.combo_integrate_images_per_group.addItems(["1", "2", "3"])
-        self.combo_integrate_images_per_group.setCurrentText("3")
+        self.combo_integrate_images_per_group.setCurrentText("1")
         self.combo_integrate_images_per_group.setFixedWidth(60)
         group_size_row.addWidget(self.combo_integrate_images_per_group)
         group_size_row.addStretch()
@@ -14199,11 +14436,11 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
         default_layout.addWidget(separator_line)
         
         # ✅ FOLDER PROMPTS + NHÂN VẬT CỐ ĐỊNH MODE
-        folder_fixed_label = QLabel("📁 Folder Prompts + Nhân vật cố định:")
+        folder_fixed_label = QLabel("📁 Folder prompts + nhân vật cố định")
         folder_fixed_label.setStyleSheet("font-weight: bold; font-size: 13px; color: #1976D2; margin-top: 5px;")
         default_layout.addWidget(folder_fixed_label)
         
-        folder_fixed_tip = QLabel("Chọn 1 folder chứa nhiều file .txt, áp dụng 2-3 ảnh nhân vật cố định cho tất cả prompts")
+        folder_fixed_tip = QLabel("Chọn một folder prompt và áp dụng cùng bộ ảnh cố định cho toàn bộ prompt.")
         folder_fixed_tip.setStyleSheet("font-size: 11px; color: #666; margin-bottom: 5px;")
         folder_fixed_tip.setWordWrap(True)
         default_layout.addWidget(folder_fixed_tip)
@@ -14221,19 +14458,13 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
         default_layout.addLayout(folder_prompts_row)
         
         # Nhân vật cố định - ListWidget hiển thị ảnh đã chọn
-        default_layout.addWidget(QLabel("Ảnh nhân vật cố định (tối đa 3 ảnh):"))
+        default_layout.addWidget(QLabel("Ảnh nhân vật cố định:"))
+        self.expand_ref_fixed_images_grid = ThumbnailGridWidget(-1, max_images=3)
+        self.expand_ref_fixed_images_grid.images_changed.connect(self._on_expand_ref_fixed_images_grid_changed)
+        default_layout.addWidget(self.expand_ref_fixed_images_grid)
+
         self.expand_ref_fixed_images_list = QListWidget()
-        self.expand_ref_fixed_images_list.setFixedHeight(100)
-        self.expand_ref_fixed_images_list.setStyleSheet("""
-            QListWidget {
-                background: #fafafa;
-                border: 1px solid #ddd;
-                border-radius: 6px;
-            }
-            QListWidget::item {
-                padding: 4px;
-            }
-        """)
+        self.expand_ref_fixed_images_list.setVisible(False)
         default_layout.addWidget(self.expand_ref_fixed_images_list)
         
         # Buttons thêm/xóa ảnh
@@ -14293,25 +14524,48 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
         # Default: hiển thị default frame, ẩn custom frame (user có thể chuyển bằng radio button)
         self.integrate_default_frame.setVisible(True)
         self.integrate_custom_frame.setVisible(False)
+
+        # ===== SIMPLE MODE PAGES (giống web: chỉ giữ nhập txt/folder ở panel dưới) =====
+        def _build_simple_video_mode_page(title: str, action_row: Optional[QHBoxLayout] = None) -> QWidget:
+            page = QWidget()
+            page.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+            page_layout = QVBoxLayout(page)
+            page_layout.setContentsMargins(0, 0, 0, 0)
+            page_layout.setSpacing(6)
+            if action_row is not None:
+                page_layout.addLayout(action_row)
+            return page
+
+        self.txt_i2v_simple_frame = _build_simple_video_mode_page("Ảnh thành Video")
+        self.txt_start_end_simple_frame = _build_simple_video_mode_page("Đầu+Cuối thành Video")
+        self.txt_integrate_simple_frame = _build_simple_video_mode_page("Tham chiếu thành Video")
         
-        self.txt_integrate_frame.setVisible(False)
-        input_layout.addWidget(self.txt_integrate_frame)
+
+        self.video_mode_form_stack = QStackedWidget()
+        self.video_mode_form_stack.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        self.video_mode_form_stack.addWidget(self.txt_t2v_frame)
+        self.video_mode_form_stack.addWidget(self.txt_i2v_simple_frame)
+        self.video_mode_form_stack.addWidget(self.txt_start_end_simple_frame)
+        self.video_mode_form_stack.addWidget(self.txt_integrate_simple_frame)
+        self.video_mode_form_stack.addWidget(self.txt_extend_frame)
+        self.video_mode_form_stack.setCurrentWidget(self.txt_t2v_frame)
+        input_layout.addWidget(self.video_mode_form_stack)
         
         self.input_group.setLayout(input_layout)
-        self.input_group.setVisible(False)  # Ban đầu ẨN (default mode = Text to Video)
+        self.input_group.setVisible(True)
         layout.addWidget(self.input_group)
         
         # ===== THIẾT LẬP TẠO VIDEO =====
-        self.settings_box = QGroupBox("Thiết lập tạo Video")
+        self.settings_box = QGroupBox("Thiết lập")
         settings_layout = QGridLayout()
-        settings_layout.setSpacing(10)
+        settings_layout.setSpacing(8)
         settings_layout.setColumnStretch(1, 1)
         settings_layout.setColumnStretch(2, 0)
         
         row = 0
         
         # Model
-        settings_layout.addWidget(QLabel("Model:"), row, 0)
+        settings_layout.addWidget(QLabel("Model"), row, 0)
         self.combo_model = QComboBox()
         # Sắp xếp theo credits: Low Fast (0) < Fast (10) < Quality (100)
         # Bao gồm cả Portrait (9:16) và Landscape (16:9) variants
@@ -14372,7 +14626,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
         # self._load_video_delay_setting()  # Comment lại vì không dùng nữa
         
         # Upscale
-        settings_layout.addWidget(QLabel("Nâng cấp (Upscale):"), row, 0)
+        settings_layout.addWidget(QLabel("Upscale"), row, 0)
         self.combo_upscale = QComboBox()
         self.combo_upscale.addItems(["720P", "1080P", "4K"])  # 720P (mặc định, 5 task/cookie), 1080P/4K (upscale, 3 task/cookie)
         self.combo_upscale.setCurrentText("720P")  # Mặc định 720P = không upscale
@@ -14413,12 +14667,12 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
         layout.addWidget(self.settings_box)
         
         # ===== BATCH JOB (CHỈ cho T2V) =====
-        self.batch_job_group = QGroupBox("Batch Job (Ẩn)")
+        self.batch_job_group = QGroupBox("Batch Job")
         batch_layout = QVBoxLayout()
         batch_layout.setSpacing(8)
         
         # File TXT (chỉ chấp nhận file .txt)
-        txt_label = QLabel("File prompt (chỉ chấp nhận file .txt):")
+        txt_label = QLabel("File prompt (.txt)")
         txt_label.setStyleSheet("font-weight: bold;")
         batch_layout.addWidget(txt_label)
         
@@ -14435,7 +14689,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
         
         # Thư mục
         folder_row = QHBoxLayout()
-        folder_row.addWidget(QLabel("Thư mục:"))
+        folder_row.addWidget(QLabel("Thư mục"))
         self.batch_folder = QLineEdit()
         self.batch_folder.setPlaceholderText("C:\\Users\\PC Viettest")
         folder_row.addWidget(self.batch_folder)
@@ -14446,7 +14700,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
         batch_layout.addLayout(folder_row)
         
         # Folder Lưu (DÙNG CHUNG cho tất cả modes: T2V, I2V, Start+End)
-        folder_luu_label = QLabel("Folder Lưu (Output):")
+        folder_luu_label = QLabel("Folder lưu")
         folder_luu_label.setStyleSheet("font-weight: bold; margin-top: 8px;")
         batch_layout.addWidget(folder_luu_label)
         
@@ -14466,7 +14720,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
         batch_layout.addWidget(output_note)
         
         # Danh sách file batch table (label)
-        self.batch_table_label = QLabel("📋 Danh sách file batch:")
+        self.batch_table_label = QLabel("📋 Danh sách batch")
         self.batch_table_label.setStyleSheet("font-weight: bold; font-size: 13px; color: #1976D2;")
         batch_layout.addWidget(self.batch_table_label)
         
@@ -14508,11 +14762,12 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
         return scroll_area
     
     def build_center_panel(self):
-        """CENTER: Bảng prompts + buttons"""
+        """CENTER: prompts table and actions, styled like a web admin grid."""
         widget = QWidget()
+        widget.setObjectName("videoCenterPanel")
         layout = QVBoxLayout(widget)
-        layout.setContentsMargins(5, 5, 5, 5)
-        layout.setSpacing(10)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(8)
         
         # ✅ Pagination Controls cho Prompts Table
         pagination_row = QHBoxLayout()
@@ -14523,8 +14778,8 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
         
         pagination_row.addStretch()
         
-        self.btn_prompts_prev_page = QPushButton("◀ Trang trước")
-        self.btn_prompts_prev_page.setFixedSize(120, 30)
+        self.btn_prompts_prev_page = QPushButton("◀ Trước")
+        self.btn_prompts_prev_page.setFixedSize(96, 32)
         self.btn_prompts_prev_page.clicked.connect(self.go_to_prev_prompts_page)
         self.btn_prompts_prev_page.setEnabled(False)
         pagination_row.addWidget(self.btn_prompts_prev_page)
@@ -14533,11 +14788,17 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
         self.lbl_prompts_current_page.setStyleSheet("font-weight: bold; font-size: 13px; margin: 0 10px;")
         pagination_row.addWidget(self.lbl_prompts_current_page)
         
-        self.btn_prompts_next_page = QPushButton("Trang sau ▶")
-        self.btn_prompts_next_page.setFixedSize(120, 30)
+        self.btn_prompts_next_page = QPushButton("Sau ▶")
+        self.btn_prompts_next_page.setFixedSize(96, 32)
         self.btn_prompts_next_page.clicked.connect(self.go_to_next_prompts_page)
         self.btn_prompts_next_page.setEnabled(False)
         pagination_row.addWidget(self.btn_prompts_next_page)
+
+        self.btn_open_video_logs = QPushButton("Xem logs")
+        self.btn_open_video_logs.setFixedSize(102, 32)
+        self.btn_open_video_logs.clicked.connect(self.open_video_logs_dialog)
+        pagination_row.addSpacing(8)
+        pagination_row.addWidget(self.btn_open_video_logs)
         
         layout.addLayout(pagination_row)
         
@@ -14554,15 +14815,18 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
         self.prompts_table = QTableWidget()
         self.prompts_table.setColumnCount(6)  # Thêm cột Action
         self.prompts_table.setHorizontalHeaderLabels([
-            "☑", "Prompt (Lời nhắc)", "Tiến độ", "Trạng thái", "Review", "Chạy lại"
+            "STT", "Prompt (Lời nhắc)", "Tiến độ", "Trạng thái", "Review", "Chạy lại"
         ])
         
         # Column widths
-        self.prompts_table.setColumnWidth(0, 35)   # Checkbox
-        self.prompts_table.setColumnWidth(2, 200)  # Tiến độ (kéo dài thêm)
+        self.prompts_table.setColumnWidth(0, 52)   # STT
+        self.prompts_table.setColumnWidth(2, 180)
         self.prompts_table.setColumnWidth(3, 80)   # Trạng thái
         self.prompts_table.setColumnWidth(4, 80)   # Review
         self.prompts_table.setColumnWidth(5, 100)   # Chạy lại
+        self.prompts_table.setColumnHidden(0, True)
+        self.prompts_table.setColumnHidden(3, True)
+        self.prompts_table.setColumnHidden(5, True)
         
         self.prompts_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.prompts_table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -14571,7 +14835,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
         self.prompts_table.verticalHeader().setDefaultSectionSize(24)
         self.prompts_table.verticalHeader().setStyleSheet("QHeaderView::section { background: #F5F7FA; color: #333; }")
         
-        # ✅ CLICK HEADER CỘT CHECKBOX ĐỂ CHỌN TẤT CẢ
+        # Click header STT để chọn/bỏ chọn toàn bộ dòng
         self.prompts_table.horizontalHeader().sectionClicked.connect(self.on_header_clicked)
         
         # Disable word wrap để giữ UI gọn
@@ -14582,8 +14846,38 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
         
         # Stretch column 1 (Prompt)
         self.prompts_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self._sync_video_prompt_table_columns()
         
         layout.addWidget(self.prompts_table)
+
+        self.video_batch_image_actions_frame = QWidget()
+        batch_image_actions_layout = QHBoxLayout(self.video_batch_image_actions_frame)
+        batch_image_actions_layout.setContentsMargins(0, 0, 0, 0)
+        batch_image_actions_layout.setSpacing(8)
+
+        self.btn_video_add_all_images = QPushButton("Thêm tất cả ảnh")
+        self.btn_video_add_all_images.setFixedHeight(30)
+        self.btn_video_add_all_images.clicked.connect(self.add_all_images_to_video_rows)
+        batch_image_actions_layout.addWidget(self.btn_video_add_all_images)
+
+        self.btn_video_add_all_start_images = QPushButton("Thêm tất cả ảnh start")
+        self.btn_video_add_all_start_images.setFixedHeight(30)
+        self.btn_video_add_all_start_images.clicked.connect(self.add_all_start_images_to_video_rows)
+        batch_image_actions_layout.addWidget(self.btn_video_add_all_start_images)
+
+        self.btn_video_add_all_end_images = QPushButton("Thêm tất cả ảnh end")
+        self.btn_video_add_all_end_images.setFixedHeight(30)
+        self.btn_video_add_all_end_images.clicked.connect(self.add_all_end_images_to_video_rows)
+        batch_image_actions_layout.addWidget(self.btn_video_add_all_end_images)
+
+        self.btn_video_add_all_reference_images = QPushButton("Thêm tất cả ảnh tham chiếu")
+        self.btn_video_add_all_reference_images.setFixedHeight(30)
+        self.btn_video_add_all_reference_images.clicked.connect(self.add_all_reference_images_to_video_rows)
+        batch_image_actions_layout.addWidget(self.btn_video_add_all_reference_images)
+
+        batch_image_actions_layout.addStretch()
+        self.video_batch_image_actions_frame.setVisible(False)
+        layout.addWidget(self.video_batch_image_actions_frame)
         
         # ===== CONTROL BUTTONS (Normal modes) =====
         self.normal_control_frame = QWidget()
@@ -14592,29 +14886,29 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
         btn_layout.setSpacing(10)
         
         # Bắt đầu
-        self.btn_start = QPushButton("Bắt đầu")
-        self.btn_start.setFixedSize(120, 36)
+        self.btn_start = QPushButton("Chạy")
+        self.btn_start.setFixedSize(108, 38)
         self.btn_start.setObjectName("startButton")
         self.btn_start.clicked.connect(self.on_start)
         btn_layout.addWidget(self.btn_start)
         
         # Tạm dừng
-        self.btn_pause = QPushButton("Tạm dừng")
-        self.btn_pause.setFixedSize(120, 36)
+        self.btn_pause = QPushButton("Dừng")
+        self.btn_pause.setFixedSize(96, 38)
         self.btn_pause.setObjectName("pauseButton")
         self.btn_pause.clicked.connect(self.on_pause)
         btn_layout.addWidget(self.btn_pause)
         
         # Tiếp tục
-        self.btn_continue = QPushButton("Tiếp tục")
-        self.btn_continue.setFixedSize(120, 36)
+        self.btn_continue = QPushButton("Tiếp")
+        self.btn_continue.setFixedSize(96, 38)
         self.btn_continue.setObjectName("continueButton")
         self.btn_continue.clicked.connect(self.on_continue)
         btn_layout.addWidget(self.btn_continue)
         
         # Sửa All File Lỗi - CHỈ ENABLE KHI CÓ FAILED TASKS
-        self.btn_fix_all = QPushButton("Sửa All File Lỗi")
-        self.btn_fix_all.setFixedSize(140, 36)
+        self.btn_fix_all = QPushButton("Sửa file lỗi")
+        self.btn_fix_all.setFixedSize(118, 38)
         self.btn_fix_all.setObjectName("fixButton")
         self.btn_fix_all.setEnabled(False)  # Disable by default
         self.btn_fix_all.clicked.connect(self.on_fix_all_failed)
@@ -14623,14 +14917,14 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
         # ✅ BỎ NÚT "Chạy Lại" - chỉ giữ "Sửa All File Lỗi"
         
         # Xóa All Prompt
-        self.btn_clear_prompts = QPushButton("Xóa Prompt")
-        self.btn_clear_prompts.setFixedSize(120, 36)
+        self.btn_clear_prompts = QPushButton("Xóa prompt")
+        self.btn_clear_prompts.setFixedSize(108, 38)
         self.btn_clear_prompts.clicked.connect(self.on_clear_all_prompts)
         btn_layout.addWidget(self.btn_clear_prompts)
         
         # Mở Folder Video
-        self.btn_open_folder = QPushButton("Mở Folder Video")
-        self.btn_open_folder.setFixedSize(120, 36)
+        self.btn_open_folder = QPushButton("Mở thư mục")
+        self.btn_open_folder.setFixedSize(110, 38)
         self.btn_open_folder.clicked.connect(self.on_open_output_folder)
         btn_layout.addWidget(self.btn_open_folder)
         
@@ -14645,15 +14939,15 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
         ext_btn_layout.setSpacing(10)
         
         # Bắt đầu Extend
-        self.btn_extend_start = QPushButton("🚀 Bắt đầu Extend")
-        self.btn_extend_start.setFixedSize(140, 36)
+        self.btn_extend_start = QPushButton("Chạy Extend")
+        self.btn_extend_start.setFixedSize(118, 38)
         self.btn_extend_start.setObjectName("startButton")
         self.btn_extend_start.clicked.connect(self.on_extend_start)
         ext_btn_layout.addWidget(self.btn_extend_start)
         
         # Dừng Extend
-        self.btn_extend_stop = QPushButton("⏹️ Dừng")
-        self.btn_extend_stop.setFixedSize(120, 36)
+        self.btn_extend_stop = QPushButton("Dừng")
+        self.btn_extend_stop.setFixedSize(96, 38)
         self.btn_extend_stop.setObjectName("pauseButton")
         self.btn_extend_stop.setEnabled(False)
         self.btn_extend_stop.clicked.connect(self.on_extend_stop)
@@ -14812,33 +15106,648 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
             self.log(f"⚠️ Không thể mở Explorer: {e}")
     
     def build_logs_panel(self):
-        """BOTTOM: Logs panel (ngang, full width)"""
+        """BOTTOM: compact log panel."""
         widget = QWidget()
-        widget.setMaximumHeight(200)  # Giới hạn chiều cao
+        widget.setMaximumHeight(156)
         layout = QVBoxLayout(widget)
-        layout.setContentsMargins(5, 5, 5, 5)
-        layout.setSpacing(5)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
         
-        logs_box = QGroupBox("📋 Logs")
+        logs_box = QGroupBox("Logs")
         logs_layout = QVBoxLayout()
         
         self.logs_display = QTextEdit()
         self.logs_display.setReadOnly(True)
-        self.logs_display.setFont(QFont("Segoe UI", 11))
+        self.logs_display.setFont(QFont("Segoe UI", 10))
         self.logs_display.setObjectName("logsDisplay")
-        self.logs_display.setMaximumHeight(180)
-        
-        # Sample logs
-        sample_logs = """[2025-10-22 14:44:24] INFO: Video_17_1U downloaded
-[2025-10-22 14:53:40] INFO: ✓ All processing completed!"""
-        
-        self.logs_display.setPlainText(sample_logs)
+        self.logs_display.setMaximumHeight(132)
+        self.logs_display.setPlaceholderText("Logs xử lý video sẽ hiển thị tại đây...")
         
         logs_layout.addWidget(self.logs_display)
         logs_box.setLayout(logs_layout)
         layout.addWidget(logs_box)
         
         return widget
+
+    def _capture_current_video_grid_state(self) -> Dict[str, Any]:
+        """Lưu state của grid/batch hiện tại theo mode để không bị chảy dữ liệu giữa các tab."""
+        rows = []
+        if hasattr(self, 'prompts_table') and self.prompts_table:
+            for row in range(self.prompts_table.rowCount()):
+                prompt_item = self.prompts_table.item(row, 1)
+                status_item = self.prompts_table.item(row, 3)
+                progress_widget = self.prompts_table.cellWidget(row, 2)
+                rows.append({
+                    "display_text": prompt_item.text() if prompt_item else "",
+                    "full_prompt": prompt_item.data(Qt.UserRole + 1) if prompt_item else "",
+                    "global_index": prompt_item.data(Qt.UserRole) if prompt_item else row + 1,
+                    "status": status_item.text() if status_item else "Chờ xử lý",
+                    "progress": progress_widget.value() if isinstance(progress_widget, QProgressBar) else 0,
+                })
+
+        batch_rows = []
+        if hasattr(self, 'batch_table') and self.batch_table:
+            for row in range(self.batch_table.rowCount()):
+                batch_rows.append([
+                    self.batch_table.item(row, col).text() if self.batch_table.item(row, col) else ""
+                    for col in range(self.batch_table.columnCount())
+                ])
+
+        return {
+            "rows": rows,
+            "all_prompts_data": list(getattr(self, 'all_prompts_data', []) or []),
+            "global_task_progress": dict(getattr(self, 'global_task_progress', {}) or {}),
+            "video_prompt_file_mapping": dict(getattr(self, 'video_prompt_file_mapping', {}) or {}),
+            "video_prompt_local_mapping": dict(getattr(self, 'video_prompt_local_mapping', {}) or {}),
+            "video_batch_file_status": dict(getattr(self, 'video_batch_file_status', {}) or {}),
+            "current_video_batch_filter": getattr(self, 'current_video_batch_filter', None),
+            "batch_file_text": self.txt_file.text() if hasattr(self, 'txt_file') else "",
+            "batch_folder_text": self.batch_folder.text() if hasattr(self, 'batch_folder') else "",
+            "batch_rows": batch_rows,
+            "page": getattr(self, 'current_prompts_page', 1),
+            "total_pages": getattr(self, 'total_prompts_pages', 1),
+            "current_tasks": list(getattr(self, 'current_tasks', []) or []),
+        }
+
+    def _restore_video_grid_state(self, state: Optional[Dict[str, Any]]) -> None:
+        """Khôi phục grid/batch state cho mode đang mở."""
+        if not hasattr(self, 'prompts_table') or not self.prompts_table:
+            return
+
+        state = state or {}
+        self._sync_video_prompt_table_columns()
+        self.prompts_table.setRowCount(0)
+
+        self.all_prompts_data = list(state.get("all_prompts_data", []) or [])
+        self.global_task_progress = dict(state.get("global_task_progress", {}) or {})
+        self.video_prompt_file_mapping = dict(state.get("video_prompt_file_mapping", {}) or {})
+        self.video_prompt_local_mapping = dict(state.get("video_prompt_local_mapping", {}) or {})
+        self.video_batch_file_status = dict(state.get("video_batch_file_status", {}) or {})
+        self.current_video_batch_filter = state.get("current_video_batch_filter", None)
+        self.current_tasks = list(state.get("current_tasks", []) or [])
+        self.current_prompts_page = state.get("page", 1) or 1
+        self.total_prompts_pages = state.get("total_pages", 1) or 1
+
+        rows = state.get("rows", []) or []
+        for row_data in rows:
+            row = self.prompts_table.rowCount()
+            self.prompts_table.insertRow(row)
+            global_index = row_data.get("global_index", row + 1)
+            self.prompts_table.setItem(row, 0, self._create_prompt_stt_item(global_index))
+
+            prompt_item = QTableWidgetItem(row_data.get("display_text", ""))
+            prompt_item.setData(Qt.UserRole, global_index)
+            prompt_item.setData(Qt.UserRole + 1, row_data.get("full_prompt", ""))
+            self.prompts_table.setItem(row, 1, prompt_item)
+
+            progress_value = int(row_data.get("progress", 0) or 0)
+            self.prompts_table.setCellWidget(row, 2, self.create_progress_bar(progress_value))
+
+            status_text = row_data.get("status", "Chờ xử lý")
+            status_item = QTableWidgetItem(status_text)
+            status_item.setTextAlignment(Qt.AlignCenter)
+            if status_text == "Done":
+                status_item.setData(Qt.ForegroundRole, QColor("#4CAF50"))
+            elif status_text in ("Fail", "Error") or "Lỗi" in status_text:
+                status_item.setData(Qt.ForegroundRole, QColor("#F44336"))
+            else:
+                status_item.setData(Qt.ForegroundRole, QColor("#666666"))
+            self.prompts_table.setItem(row, 3, status_item)
+
+            review_btn = self.create_review_container(global_index)
+            self.prompts_table.setCellWidget(row, 4, review_btn)
+            self._apply_video_row_image_cells(row, global_index)
+
+        if hasattr(self, 'batch_table') and self.batch_table:
+            self.batch_table.setRowCount(0)
+            for batch_row in state.get("batch_rows", []) or []:
+                row = self.batch_table.rowCount()
+                self.batch_table.insertRow(row)
+                for col, value in enumerate(batch_row):
+                    self.batch_table.setItem(row, col, QTableWidgetItem(value))
+
+        if hasattr(self, 'txt_file'):
+            self.txt_file.setText(state.get("batch_file_text", ""))
+        if hasattr(self, 'batch_folder'):
+            self.batch_folder.setText(state.get("batch_folder_text", ""))
+
+        self.lbl_prompts_page_info.setText(
+            f"Trang {self.current_prompts_page}/{self.total_prompts_pages} ({len(rows)} prompts)"
+        )
+        self.lbl_prompts_current_page.setText(f"{self.current_prompts_page}/{self.total_prompts_pages}")
+        self.btn_prompts_prev_page.setEnabled(self.current_prompts_page > 1)
+        self.btn_prompts_next_page.setEnabled(self.current_prompts_page < self.total_prompts_pages)
+
+    def _ensure_video_mode_image_stores(self) -> None:
+        for mode in [
+            "Text to Video",
+            "Image to Video",
+            "Start+End to Video",
+            "Integrate to Video",
+            "Expand + Reference",
+            "Extend Video",
+        ]:
+            self.video_mode_row_ref_images.setdefault(mode, {})
+            self.video_mode_row_end_images.setdefault(mode, {})
+
+    def _get_video_prompt_image_specs(self, mode: Optional[str] = None) -> List[Tuple[str, str, int]]:
+        mode = mode or getattr(self, "current_video_mode", "Text to Video")
+        if mode == "Image to Video":
+            return [("ref", "Hình ảnh", 1)]
+        if mode == "Start+End to Video":
+            return [("ref", "Ảnh start", 1), ("end", "Ảnh end", 1)]
+        if mode in ("Integrate to Video", "Expand + Reference"):
+            return [("combined", "Hình ảnh", 3)]
+        return []
+
+    def _get_video_mode_image_store(self, role: str, mode: Optional[str] = None) -> Dict[int, List[str]]:
+        self._ensure_video_mode_image_stores()
+        mode = mode or getattr(self, "current_video_mode", "Text to Video")
+        if role == "end":
+            return self.video_mode_row_end_images.setdefault(mode, {})
+        return self.video_mode_row_ref_images.setdefault(mode, {})
+
+    def _clear_current_mode_row_image_store(self) -> None:
+        mode = getattr(self, "current_video_mode", "Text to Video")
+        self._get_video_mode_image_store("ref", mode).clear()
+        self._get_video_mode_image_store("end", mode).clear()
+
+    def _create_prompt_stt_item(self, index_value: int) -> QTableWidgetItem:
+        item = QTableWidgetItem(str(index_value))
+        item.setTextAlignment(Qt.AlignCenter)
+        item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+        return item
+
+    def _sync_video_prompt_table_columns(self, mode: Optional[str] = None) -> None:
+        if not hasattr(self, "prompts_table") or self.prompts_table is None:
+            return
+
+        mode = mode or getattr(self, "current_video_mode", "Text to Video")
+        specs = self._get_video_prompt_image_specs(mode)
+        headers = ["STT", "Prompt (Lời nhắc)", "Tiến độ", "Trạng thái", "Review", "Chạy lại"]
+        headers.extend(label for _, label, _ in specs)
+
+        self.prompts_table.setColumnCount(len(headers))
+        self.prompts_table.setHorizontalHeaderLabels(headers)
+        self.prompts_table.setColumnWidth(0, 52)
+        self.prompts_table.setColumnWidth(2, 165)
+        self.prompts_table.setColumnWidth(3, 96)
+        self.prompts_table.setColumnWidth(4, 72)
+        self.prompts_table.setColumnWidth(5, 100)
+        self.prompts_table.setColumnHidden(0, True)
+        self.prompts_table.setColumnHidden(3, True)
+        self.prompts_table.setColumnHidden(5, True)
+        self.prompts_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+
+        extra_column = 6
+        compact_image_modes = {"Image to Video", "Start+End to Video"}
+        for _role, _label, max_images in specs:
+            if mode in compact_image_modes:
+                column_width = 74
+            else:
+                column_width = 210 if max_images > 1 else 118
+            self.prompts_table.setColumnWidth(extra_column, column_width)
+            extra_column += 1
+
+    def _on_video_row_images_changed(self, role: str, global_index: int, image_paths: List[str]) -> None:
+        cleaned = [str(Path(path)) for path in image_paths if path]
+        mode = getattr(self, "current_video_mode", "Text to Video")
+
+        if role == "combined":
+            ref_store = self._get_video_mode_image_store("ref", mode)
+            end_store = self._get_video_mode_image_store("end", mode)
+
+            if mode == "Start+End to Video":
+                ref_images = cleaned[:1]
+                end_images = cleaned[1:2]
+
+                if ref_images:
+                    ref_store[global_index] = ref_images
+                else:
+                    ref_store.pop(global_index, None)
+
+                if end_images:
+                    end_store[global_index] = end_images
+                else:
+                    end_store.pop(global_index, None)
+            else:
+                if cleaned:
+                    ref_store[global_index] = cleaned
+                else:
+                    ref_store.pop(global_index, None)
+                end_store.pop(global_index, None)
+            return
+
+        store = self._get_video_mode_image_store(role, mode)
+        if cleaned:
+            store[global_index] = cleaned
+        else:
+            store.pop(global_index, None)
+
+    def _create_video_row_image_widget(self, global_index: int, role: str, max_images: int) -> ThumbnailGridWidget:
+        widget = ThumbnailGridWidget(global_index, max_images=max_images)
+        mode = getattr(self, "current_video_mode", "Text to Video")
+        if role == "combined":
+            ref_images = list(self._get_video_mode_image_store("ref", mode).get(global_index, []))
+            if mode == "Start+End to Video":
+                end_images = list(self._get_video_mode_image_store("end", mode).get(global_index, []))
+                widget.image_paths = (ref_images[:1] + end_images[:1])[:max_images]
+            else:
+                widget.image_paths = ref_images[:max_images]
+        else:
+            widget.image_paths = list(self._get_video_mode_image_store(role, mode).get(global_index, []))[:max_images]
+        widget._rebuild_layout()
+        widget.images_changed.connect(
+            lambda row_index, image_paths, image_role=role: self._on_video_row_images_changed(image_role, row_index, image_paths)
+        )
+        return widget
+
+    def _apply_video_row_image_cells(self, row: int, global_index: int) -> None:
+        specs = self._get_video_prompt_image_specs()
+        if not specs:
+            return
+
+        row_height = self.prompts_table.verticalHeader().defaultSectionSize()
+        base_column = 6
+        for offset, (role, _label, max_images) in enumerate(specs):
+            thumb = self._create_video_row_image_widget(global_index, role, max_images)
+            self.prompts_table.setCellWidget(row, base_column + offset, thumb)
+            row_height = max(row_height, 58)
+        self.prompts_table.setRowHeight(row, row_height)
+
+    def _get_all_video_prompt_indexes(self) -> List[int]:
+        if getattr(self, "all_prompts_data", None):
+            return list(range(1, len(self.all_prompts_data) + 1))
+
+        indexes: List[int] = []
+        if hasattr(self, "prompts_table") and self.prompts_table:
+            for row in range(self.prompts_table.rowCount()):
+                prompt_item = self.prompts_table.item(row, 1)
+                if prompt_item:
+                    global_index = prompt_item.data(Qt.UserRole)
+                    if isinstance(global_index, int):
+                        indexes.append(global_index)
+        return indexes
+
+    def _refresh_visible_video_row_image_cells(self) -> None:
+        if not hasattr(self, "prompts_table") or self.prompts_table is None:
+            return
+
+        for row in range(self.prompts_table.rowCount()):
+            prompt_item = self.prompts_table.item(row, 1)
+            if not prompt_item:
+                continue
+            global_index = prompt_item.data(Qt.UserRole)
+            if isinstance(global_index, int):
+                self._apply_video_row_image_cells(row, global_index)
+
+    def _prepare_existing_video_rows_for_run(self, task_indexes: List[int]) -> None:
+        if not hasattr(self, "prompts_table") or self.prompts_table is None:
+            return
+
+        task_index_set = set(task_indexes)
+        for row in range(self.prompts_table.rowCount()):
+            prompt_item = self.prompts_table.item(row, 1)
+            if not prompt_item:
+                continue
+
+            global_index = prompt_item.data(Qt.UserRole)
+            if not isinstance(global_index, int) or global_index not in task_index_set:
+                continue
+
+            progress_bar = self.prompts_table.cellWidget(row, 2)
+            if isinstance(progress_bar, QProgressBar):
+                progress_bar.setValue(0)
+
+            status_item = self.prompts_table.item(row, 3)
+            if status_item is None:
+                status_item = QTableWidgetItem()
+                status_item.setTextAlignment(Qt.AlignCenter)
+                self.prompts_table.setItem(row, 3, status_item)
+            status_item.setText("Đang xử lý...")
+            status_item.setForeground(QColor("#666666"))
+            status_item.setData(Qt.ForegroundRole, QColor("#666666"))
+
+    def _choose_video_image_folder_for_rows(self, title: str) -> List[str]:
+        folder = QFileDialog.getExistingDirectory(self, title)
+        if not folder:
+            return []
+        image_paths = self._collect_image_files_from_folder(folder)
+        if not image_paths:
+            QMessageBox.warning(self, "Cảnh báo", "Thư mục không có ảnh hợp lệ.")
+            return []
+        return image_paths
+
+    def _apply_distributed_images_to_video_rows(self, mode: str, role: str, image_paths: List[str], label: str) -> None:
+        target_indexes = self._get_all_video_prompt_indexes()
+        if not target_indexes:
+            QMessageBox.information(self, "Thông báo", "Chưa có prompt nào trong bảng.")
+            return
+
+        store = self._get_video_mode_image_store(role, mode)
+        applied = 0
+        for global_index, image_path in zip(target_indexes, image_paths):
+            if Path(image_path).exists():
+                store[global_index] = [str(Path(image_path))]
+                applied += 1
+
+        self._refresh_visible_video_row_image_cells()
+        self.log(f"🖼️ Đã thêm {applied} {label} cho {applied}/{len(target_indexes)} dòng ở mode {mode}")
+
+        if len(image_paths) < len(target_indexes):
+            self.log(f"⚠️ {label.capitalize()} ít hơn số prompt: {len(image_paths)}/{len(target_indexes)}")
+        elif len(image_paths) > len(target_indexes):
+            self.log(f"ℹ️ Dư {len(image_paths) - len(target_indexes)} {label}, chỉ dùng theo số prompt hiện có")
+
+    def _apply_reference_images_to_all_video_rows(self, mode: str, image_paths: List[str], label: str) -> None:
+        target_indexes = self._get_all_video_prompt_indexes()
+        if not target_indexes:
+            QMessageBox.information(self, "Thông báo", "Chưa có prompt nào trong bảng.")
+            return
+
+        max_images = 3 if mode in ("Integrate to Video", "Expand + Reference") else 1
+        normalized = [str(Path(path)) for path in image_paths[:max_images] if Path(path).exists()]
+        if not normalized:
+            return
+
+        store = self._get_video_mode_image_store("ref", mode)
+        for global_index in target_indexes:
+            store[global_index] = list(normalized)
+
+        self._refresh_visible_video_row_image_cells()
+        self.log(f"🖼️ Đã thêm {len(normalized)} {label} cho toàn bộ {len(target_indexes)} dòng ở mode {mode}")
+
+    def add_all_images_to_video_rows(self) -> None:
+        image_paths = self._choose_video_image_folder_for_rows("Chọn thư mục ảnh cho tất cả prompt")
+        if not image_paths:
+            return
+        self._apply_distributed_images_to_video_rows("Image to Video", "ref", image_paths, "ảnh")
+
+    def add_all_start_images_to_video_rows(self) -> None:
+        image_paths = self._choose_video_image_folder_for_rows("Chọn thư mục ảnh start cho tất cả prompt")
+        if not image_paths:
+            return
+        self._apply_distributed_images_to_video_rows("Start+End to Video", "ref", image_paths, "ảnh start")
+
+    def add_all_end_images_to_video_rows(self) -> None:
+        image_paths = self._choose_video_image_folder_for_rows("Chọn thư mục ảnh end cho tất cả prompt")
+        if not image_paths:
+            return
+        self._apply_distributed_images_to_video_rows("Start+End to Video", "end", image_paths, "ảnh end")
+
+    def add_all_reference_images_to_video_rows(self) -> None:
+        image_paths = self._choose_video_images_for_rows("Chọn ảnh tham chiếu cho tất cả prompt")
+        if not image_paths:
+            return
+        target_mode = getattr(self, "current_video_mode", "Integrate to Video")
+        if target_mode not in ("Integrate to Video", "Expand + Reference"):
+            target_mode = "Integrate to Video"
+        self._apply_reference_images_to_all_video_rows(target_mode, image_paths, "ảnh tham chiếu")
+
+    def _create_video_media_card(self, title: str, empty_text: str):
+        """Tạo card preview ảnh kiểu web cho tab video."""
+        box = QGroupBox(title)
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(6)
+
+        preview = QLabel(empty_text)
+        preview.setAlignment(Qt.AlignCenter)
+        preview.setWordWrap(True)
+        preview.setMinimumSize(180, 120)
+        preview.setStyleSheet("""
+            QLabel {
+                background: #f8fafc;
+                border: 1px dashed #cbd5e1;
+                border-radius: 12px;
+                color: #64748b;
+                font-size: 12px;
+                padding: 8px;
+            }
+        """)
+        layout.addWidget(preview)
+
+        info = QLabel("Chưa chọn dữ liệu")
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #64748b; font-size: 11px;")
+        layout.addWidget(info)
+
+        return box, preview, info
+
+    def _create_video_media_action_row(self, add_handler, clear_handler):
+        row = QHBoxLayout()
+        row.setSpacing(8)
+
+        btn_add = QPushButton("➕ Thêm ảnh")
+        btn_add.setFixedSize(110, 30)
+        btn_add.clicked.connect(add_handler)
+        row.addWidget(btn_add)
+
+        btn_clear = QPushButton("🗑️ Xóa tất cả")
+        btn_clear.setFixedSize(120, 30)
+        btn_clear.clicked.connect(clear_handler)
+        row.addWidget(btn_clear)
+
+        row.addStretch()
+        return row
+
+    def clear_i2v_media_inputs(self):
+        if hasattr(self, 'txt_image_folder'):
+            self.txt_image_folder.clear()
+        if hasattr(self, 'txt_image_root_folder'):
+            self.txt_image_root_folder.clear()
+        if hasattr(self, 'txt_image_prompt_file'):
+            self.txt_image_prompt_file.clear()
+        if hasattr(self, 'txt_image_prompt_folder'):
+            self.txt_image_prompt_folder.clear()
+        self._refresh_i2v_media_preview()
+        self.log("🗑️ Đã xóa dữ liệu ảnh của Ảnh thành Video")
+
+    def clear_start_end_media_inputs(self):
+        if hasattr(self, 'txt_start_end_folder'):
+            self.txt_start_end_folder.clear()
+        if hasattr(self, 'txt_start_end_prompt'):
+            self.txt_start_end_prompt.clear()
+        self._refresh_start_end_media_preview()
+        self.log("🗑️ Đã xóa dữ liệu ảnh của Đầu+Cuối thành Video")
+
+    def clear_integrate_media_inputs(self):
+        if hasattr(self, 'txt_integrate_images_folder'):
+            self.txt_integrate_images_folder.clear()
+        if hasattr(self, 'txt_integrate_prompt_file'):
+            self.txt_integrate_prompt_file.clear()
+        if hasattr(self, 'txt_expand_ref_folder_prompts'):
+            self.txt_expand_ref_folder_prompts.clear()
+        self.clear_expand_ref_fixed_images()
+        self._refresh_integrate_media_preview()
+        self.log("🗑️ Đã xóa dữ liệu ảnh của Tham chiếu thành Video")
+
+    def _collect_image_files_from_folder(self, folder_path: str):
+        """Lấy danh sách ảnh trong folder theo thứ tự tự nhiên."""
+        if not folder_path:
+            return []
+        folder = Path(folder_path)
+        if not folder.exists() or not folder.is_dir():
+            return []
+        image_paths = []
+        for ext in ['*.jpg', '*.jpeg', '*.png', '*.bmp', '*.gif', '*.webp']:
+            image_paths.extend(folder.glob(ext))
+        return natural_sort_paths(image_paths)
+
+    def _apply_video_media_preview(self, preview_label, info_label, image_path: str, empty_text: str):
+        """Hiển thị preview ảnh cho card."""
+        if not preview_label or not info_label:
+            return
+
+        if image_path and Path(image_path).exists():
+            pixmap = QPixmap(str(image_path))
+            if not pixmap.isNull():
+                scaled = pixmap.scaled(220, 140, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                preview_label.setPixmap(scaled)
+                preview_label.setText("")
+                preview_label.setStyleSheet("""
+                    QLabel {
+                        background: #ffffff;
+                        border: 1px solid #dbe3ef;
+                        border-radius: 12px;
+                        padding: 6px;
+                    }
+                """)
+                info_label.setText(Path(image_path).name)
+                info_label.setToolTip(str(image_path))
+                return
+
+        preview_label.setPixmap(QPixmap())
+        preview_label.setText(empty_text)
+        preview_label.setStyleSheet("""
+            QLabel {
+                background: #f8fafc;
+                border: 1px dashed #cbd5e1;
+                border-radius: 12px;
+                color: #64748b;
+                font-size: 12px;
+                padding: 8px;
+            }
+        """)
+        info_label.setText("Chưa chọn dữ liệu")
+        info_label.setToolTip("")
+
+    def _refresh_i2v_media_preview(self):
+        image_path = None
+        root_folder = self.txt_image_root_folder.text().strip() if hasattr(self, 'txt_image_root_folder') else ""
+        image_folder = self.txt_image_folder.text().strip() if hasattr(self, 'txt_image_folder') else ""
+
+        if root_folder:
+            root = Path(root_folder)
+            txt_files = sorted(root.glob("*.txt"))
+            for txt_file in txt_files:
+                matched_folder = root / txt_file.stem
+                images = self._collect_image_files_from_folder(str(matched_folder))
+                if images:
+                    image_path = str(images[0])
+                    break
+        elif image_folder:
+            images = self._collect_image_files_from_folder(image_folder)
+            if images:
+                image_path = str(images[0])
+
+        self._apply_video_media_preview(
+            getattr(self, 'i2v_preview_label', None),
+            getattr(self, 'i2v_preview_info', None),
+            image_path,
+            "Chưa có ảnh ref"
+        )
+
+    def _refresh_start_end_media_preview(self):
+        images = self._collect_image_files_from_folder(
+            self.txt_start_end_folder.text().strip() if hasattr(self, 'txt_start_end_folder') else ""
+        )
+        start_path = str(images[0]) if len(images) > 0 else ""
+        end_path = str(images[1]) if len(images) > 1 else ""
+
+        self._apply_video_media_preview(
+            getattr(self, 'start_preview_label', None),
+            getattr(self, 'start_preview_info', None),
+            start_path,
+            "Chưa có ảnh start"
+        )
+        self._apply_video_media_preview(
+            getattr(self, 'end_preview_label', None),
+            getattr(self, 'end_preview_info', None),
+            end_path,
+            "Chưa có ảnh end"
+        )
+
+    def _refresh_integrate_media_preview(self):
+        images = self._collect_image_files_from_folder(
+            self.txt_integrate_images_folder.text().strip() if hasattr(self, 'txt_integrate_images_folder') else ""
+        )
+        image_path = str(images[0]) if images else ""
+        self._apply_video_media_preview(
+            getattr(self, 'integrate_preview_label', None),
+            getattr(self, 'integrate_preview_info', None),
+            image_path,
+            "Chưa có ảnh ref"
+        )
+
+    def _refresh_video_mode_media_previews(self):
+        self._refresh_i2v_media_preview()
+        self._refresh_start_end_media_preview()
+        self._refresh_integrate_media_preview()
+
+    def _on_expand_ref_fixed_images_grid_changed(self, _row_index: int, image_paths: list):
+        """Đồng bộ grid ảnh cố định với state hiện tại."""
+        self.expand_ref_fixed_images_paths = list(image_paths)
+        self.refresh_expand_ref_fixed_images_list()
+
+    def open_video_logs_dialog(self):
+        """Mở popup log thay cho panel log cố định."""
+        if not hasattr(self, 'video_logs_dialog') or self.video_logs_dialog is None:
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Logs Video")
+            dialog.resize(900, 520)
+
+            layout = QVBoxLayout(dialog)
+            layout.setContentsMargins(12, 12, 12, 12)
+            layout.setSpacing(10)
+
+            viewer = QTextEdit()
+            viewer.setReadOnly(True)
+            viewer.setFont(QFont("Consolas", 10))
+            viewer.setObjectName("videoLogsPopup")
+            layout.addWidget(viewer)
+
+            button_row = QHBoxLayout()
+            button_row.addStretch()
+
+            btn_clear = QPushButton("Xóa logs")
+            btn_clear.clicked.connect(self.clear_video_logs)
+            button_row.addWidget(btn_clear)
+
+            btn_close = QPushButton("Đóng")
+            btn_close.clicked.connect(dialog.close)
+            button_row.addWidget(btn_close)
+
+            layout.addLayout(button_row)
+
+            self.video_logs_dialog = dialog
+            self.video_logs_dialog_text = viewer
+
+        if hasattr(self, 'logs_display') and self.logs_display:
+            self.video_logs_dialog_text.setPlainText(self.logs_display.toPlainText())
+            scrollbar = self.video_logs_dialog_text.verticalScrollBar()
+            scrollbar.setValue(scrollbar.maximum())
+
+        self.video_logs_dialog.show()
+        self.video_logs_dialog.raise_()
+        self.video_logs_dialog.activateWindow()
+
+    def clear_video_logs(self):
+        """Xóa nội dung log ở cả store ẩn và popup."""
+        if hasattr(self, 'logs_display') and self.logs_display:
+            self.logs_display.clear()
+        if hasattr(self, 'video_logs_dialog_text') and self.video_logs_dialog_text:
+            self.video_logs_dialog_text.clear()
     
     def get_device_info(self):
         """Lấy device_info từ database"""
@@ -15539,8 +16448,13 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
             btn_display_text = btn.text()
             btn_logic_mode = self.video_mode_display_to_logic.get(btn_display_text, btn_display_text)
             btn.setChecked(btn_logic_mode == mode)
+
+        previous_mode = getattr(self, 'current_video_mode', None)
+        if previous_mode:
+            self.video_mode_grid_states[previous_mode] = self._capture_current_video_grid_state()
         
         self.current_video_mode = mode
+        self._sync_video_prompt_table_columns(mode)
         
         # Show/hide input panels based on mode
         is_exp_ref = (mode == "Expand + Reference")
@@ -15550,68 +16464,82 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
         is_int = (mode == "Integrate to Video")
         is_ext = (mode == "Extend Video")
         
-        # ẨN toàn bộ "Ảnh đầu vào" section khi ở Text to Video
-        # (vì T2V chỉ dùng Batch Job, không cần ảnh đầu vào)
-        # Expand + Reference sẽ hiển thị integrate frame (giống Integrate to Video)
         if hasattr(self, 'input_group'):
-            self.input_group.setVisible(not is_t2v)
-        
-        # txt_t2v_frame luôn ẩn (đã bỏ prompt 1 dòng - chỉ dùng batch job)
-        if hasattr(self, 'txt_t2v_frame'):
-            self.txt_t2v_frame.setVisible(False)
-        
-        # Các frame khác hiện theo mode
-        if hasattr(self, 'txt_i2v_frame'):
-            self.txt_i2v_frame.setVisible(is_i2v)
-        if hasattr(self, 'txt_start_end_frame'):
-            self.txt_start_end_frame.setVisible(is_se)
-        if hasattr(self, 'txt_integrate_frame'):
-            # ✅ Hiển thị integrate frame cho cả Integrate to Video và Expand + Reference
-            self.txt_integrate_frame.setVisible(is_int or is_exp_ref)
-            # ✅ DEBUG: Log để kiểm tra
-            self.log(f"🔍 Integrate frame visibility: {is_int or is_exp_ref}, mode: {mode}")
-            
-            # ✅ Khi chuyển sang Integrate mode hoặc Expand + Reference, đảm bảo hiển thị đúng frame (default hoặc custom)
-            if (is_int or is_exp_ref) and hasattr(self, 'rb_integrate_default'):
-                try:
-                    if self.rb_integrate_custom.isChecked():
-                        self.integrate_default_frame.setVisible(False)
-                        self.integrate_custom_frame.setVisible(True)
-                    else:
-                        self.integrate_default_frame.setVisible(True)
-                        self.integrate_custom_frame.setVisible(False)
-                except Exception as e:
-                    # Fallback: hiển thị default frame
-                    if hasattr(self, 'integrate_default_frame'):
-                        self.integrate_default_frame.setVisible(True)
-                    if hasattr(self, 'integrate_custom_frame'):
-                        self.integrate_custom_frame.setVisible(False)
-        if hasattr(self, 'txt_extend_frame'):
-            self.txt_extend_frame.setVisible(is_ext)
+            self.input_group.setVisible(True)
+            title_map = {
+                "Text to Video": "Văn bản thành Video",
+                "Image to Video": "Ảnh thành Video",
+                "Start+End to Video": "Đầu+Cuối thành Video",
+                "Integrate to Video": "Tham chiếu thành Video",
+                "Expand + Reference": "Tham chiếu thành Video",
+                "Extend Video": "Nối Video",
+            }
+            self.input_group.setTitle(title_map.get(mode, "Nguồn dữ liệu"))
+
+        if hasattr(self, 'video_mode_form_stack'):
+            if is_t2v:
+                self.video_mode_form_stack.setCurrentWidget(self.txt_t2v_frame)
+            elif is_i2v:
+                self.video_mode_form_stack.setCurrentWidget(self.txt_i2v_simple_frame)
+            elif is_se:
+                self.video_mode_form_stack.setCurrentWidget(self.txt_start_end_simple_frame)
+            elif is_ext:
+                self.video_mode_form_stack.setCurrentWidget(self.txt_extend_frame)
+            else:
+                self.video_mode_form_stack.setCurrentWidget(self.txt_integrate_simple_frame)
+            current_page = self.video_mode_form_stack.currentWidget()
+            if current_page is not None:
+                page_hint = current_page.layout().sizeHint().height() if current_page.layout() else current_page.sizeHint().height()
+                target_height = max(0, page_hint)
+                self.video_mode_form_stack.setMaximumHeight(target_height)
+                self.video_mode_form_stack.updateGeometry()
+
+        if hasattr(self, 'video_batch_image_actions_frame'):
+            show_any_image_actions = is_i2v or is_se or is_int or is_exp_ref
+            self.video_batch_image_actions_frame.setVisible(show_any_image_actions)
+            if hasattr(self, 'btn_video_add_all_images'):
+                self.btn_video_add_all_images.setVisible(is_i2v)
+            if hasattr(self, 'btn_video_add_all_start_images'):
+                self.btn_video_add_all_start_images.setVisible(is_se)
+            if hasattr(self, 'btn_video_add_all_end_images'):
+                self.btn_video_add_all_end_images.setVisible(is_se)
+            if hasattr(self, 'btn_video_add_all_reference_images'):
+                self.btn_video_add_all_reference_images.setVisible(is_int or is_exp_ref)
+
+        if hasattr(self, 'txt_integrate_frame') and (is_int or is_exp_ref) and hasattr(self, 'rb_integrate_default'):
+            try:
+                if self.rb_integrate_custom.isChecked():
+                    self.integrate_default_frame.setVisible(False)
+                    self.integrate_custom_frame.setVisible(True)
+                else:
+                    self.integrate_default_frame.setVisible(True)
+                    self.integrate_custom_frame.setVisible(False)
+            except Exception:
+                if hasattr(self, 'integrate_default_frame'):
+                    self.integrate_default_frame.setVisible(True)
+                if hasattr(self, 'integrate_custom_frame'):
+                    self.integrate_custom_frame.setVisible(False)
         
         # Show/hide Batch Job widgets
         if hasattr(self, 'batch_job_group'):
-            # Batch Job group ẩn khi ở Extend Video (vì Extend có folder output riêng)
-            self.batch_job_group.setVisible(not is_ext)
-            
-            # Nhưng ẩn File TXT và Thư mục batch với I2V/Start+End/Expand+Reference
+            uses_batch_sources = is_t2v or is_i2v or is_se or is_int or is_exp_ref
+            self.batch_job_group.setVisible(uses_batch_sources)
+
             if hasattr(self, 'batch_file_widgets'):
                 for widget in self.batch_file_widgets:
                     if widget:
-                        widget.setVisible(is_t2v or is_exp_ref)
-            
+                        widget.setVisible(uses_batch_sources)
+
             if hasattr(self, 'batch_folder_widgets'):
                 for widget in self.batch_folder_widgets:
                     if widget:
-                        widget.setVisible(is_t2v or is_exp_ref)
-            
-            # Ẩn/hiện batch table (chỉ cho T2V và Expand+Reference)
+                        widget.setVisible(uses_batch_sources)
+
             if hasattr(self, 'batch_table'):
-                self.batch_table.setVisible(is_t2v or is_exp_ref)
-            
-            # Ẩn/hiện label "Danh sách file batch"
+                self.batch_table.setVisible(uses_batch_sources)
+
             if hasattr(self, 'batch_table_label'):
-                self.batch_table_label.setVisible(is_t2v or is_exp_ref)
+                self.batch_table_label.setVisible(uses_batch_sources)
         
         # Show/hide Extend Video controls và table
         if hasattr(self, 'extend_control_frame'):
@@ -15643,6 +16571,8 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
         
         # KHÔNG clear bảng - giữ nguyên data khi chuyển tab
         # User có thể chuyển qua lại giữa các mode
+        self._restore_video_grid_state(self.video_mode_grid_states.get(mode))
+        self._refresh_video_mode_media_previews()
         
         self.log(f"Mode: {mode}")
     
@@ -15704,10 +16634,25 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                 # ✅ Clear mappings nếu có
                 if hasattr(self, 'video_prompt_file_mapping'):
                     self.video_prompt_file_mapping.clear()
+                else:
+                    self.video_prompt_file_mapping = {}
                 if hasattr(self, 'video_prompt_local_mapping'):
                     self.video_prompt_local_mapping.clear()
+                else:
+                    self.video_prompt_local_mapping = {}
                 if hasattr(self, 'video_batch_file_status'):
                     self.video_batch_file_status.clear()
+                else:
+                    self.video_batch_file_status = {}
+
+                file_stem = Path(file_path).stem
+                for prompt_index, _line in enumerate(lines, 1):
+                    self.video_prompt_file_mapping[prompt_index] = file_stem
+                    self.video_prompt_local_mapping[prompt_index] = prompt_index
+                self.video_batch_file_status[file_stem] = {
+                    "total": len(lines),
+                    "completed": 0,
+                }
                 
             except Exception as e:
                 self.log(f"❌ Lỗi đọc file: {e}")
@@ -15721,6 +16666,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
         try:
             # ✅ Store all prompts data
             self.all_prompts_data = prompts
+            self._clear_current_mode_row_image_store()
             
             # Calculate pagination
             total_prompts = len(prompts)
@@ -15764,6 +16710,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
             
             # Clear table
             self.prompts_table.setRowCount(0)
+            self._sync_video_prompt_table_columns()
             
             if not self.all_prompts_data:
                 self.lbl_prompts_page_info.setText("Trang 1/1 (0 prompts)")
@@ -15807,16 +16754,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                 idx = page_indices[i]  # ✅ Use actual global index from filtered list
                 row_pos = self.prompts_table.rowCount()
                 self.prompts_table.insertRow(row_pos)
-                
-                # Checkbox
-                chk = QCheckBox()
-                chk.setChecked(False)
-                chk_widget = QWidget()
-                chk_layout = QHBoxLayout(chk_widget)
-                chk_layout.addWidget(chk)
-                chk_layout.setAlignment(Qt.AlignCenter)
-                chk_layout.setContentsMargins(0, 0, 0, 0)
-                self.prompts_table.setCellWidget(row_pos, 0, chk_widget)
+                self.prompts_table.setItem(row_pos, 0, self._create_prompt_stt_item(idx))
                 
                 # ✅ HIỂN THỊ local index khi filter theo file, global index khi xem tất cả
                 max_display_length = 120
@@ -15830,13 +16768,14 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                     display_idx = idx
                 
                 if len(prompt_text) > max_display_length:
-                    display_text = f'{display_idx}: {prompt_text[:max_display_length]}...'
+                    display_text = f'{prompt_text[:max_display_length]}...'
                 else:
-                    display_text = f'{display_idx}: {prompt_text}'
+                    display_text = prompt_text
                 
                 prompt_item = QTableWidgetItem(display_text)
                 prompt_item.setData(Qt.UserRole, idx)  # Store global index
                 prompt_item.setData(Qt.UserRole + 1, prompt_text)  # Store full text
+                prompt_item.setData(Qt.UserRole + 2, display_idx)  # Store display index
                 self.prompts_table.setItem(row_pos, 1, prompt_item)
                 
                 # ✅ Tiến độ (progress bar) - RESTORE from global storage
@@ -15885,6 +16824,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                 # Review button (column 4)
                 review_container = self.create_review_container(idx)
                 self.prompts_table.setCellWidget(row_pos, 4, review_container)
+                self._apply_video_row_image_cells(row_pos, idx)
             
             # ✅ Update pagination UI với filter info
             if hasattr(self, 'current_video_batch_filter') and self.current_video_batch_filter:
@@ -15963,6 +16903,92 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
             self.current_prompts_page += 1
             self.refresh_prompts_table_page()
             self.log(f"▶ Chuyển sang trang {self.current_prompts_page}")
+
+    def _build_i2v_tasks_from_row_images(self, output_folder: str):
+        row_refs = self._get_video_mode_image_store("ref", "Image to Video")
+        if not self.all_prompts_data or not row_refs:
+            return []
+
+        self.i2v_task_mapping.clear()
+        tasks = []
+        for idx, prompt_text in enumerate(self.all_prompts_data, 1):
+            images = row_refs.get(idx) or []
+            image_path = images[0] if images else ""
+            if not image_path or not Path(image_path).exists():
+                continue
+
+            task = ImageTask(image_path=str(image_path), prompt_text=prompt_text, task_index=idx)
+            tasks.append(task)
+            self.i2v_task_mapping[idx] = {
+                "image_path": str(image_path),
+                "prompt": prompt_text,
+                "source_file": self.video_prompt_file_mapping.get(idx, Path(image_path).stem),
+                "local_index": self.video_prompt_local_mapping.get(idx, idx),
+                "output_folder": output_folder,
+            }
+        return tasks
+
+    def _build_start_end_tasks_from_row_images(self):
+        row_starts = self._get_video_mode_image_store("ref", "Start+End to Video")
+        row_ends = self._get_video_mode_image_store("end", "Start+End to Video")
+        if not self.all_prompts_data or not row_starts or not row_ends:
+            return []
+
+        self.start_end_task_mapping.clear()
+        tasks = []
+        for idx, prompt_text in enumerate(self.all_prompts_data, 1):
+            start_images = row_starts.get(idx) or []
+            end_images = row_ends.get(idx) or []
+            start_path = start_images[0] if start_images else ""
+            end_path = end_images[0] if end_images else ""
+            if not start_path or not end_path:
+                continue
+            if not Path(start_path).exists() or not Path(end_path).exists():
+                continue
+
+            task = ImageTask(
+                image_path=str(start_path),
+                prompt_text=prompt_text,
+                task_index=idx,
+                end_image_path=str(end_path)
+            )
+            tasks.append(task)
+            self.start_end_task_mapping[idx] = {
+                "image_path": str(start_path),
+                "end_image_path": str(end_path),
+                "prompt": prompt_text,
+                "source_file": self.video_prompt_file_mapping.get(idx, f"task_{idx}"),
+                "local_index": self.video_prompt_local_mapping.get(idx, idx),
+            }
+        return tasks
+
+    def _build_integrate_tasks_from_row_images(self, mode_name: str):
+        row_refs = self._get_video_mode_image_store("ref", mode_name)
+        if not self.all_prompts_data or not row_refs:
+            return []
+
+        self.integrate_task_mapping.clear()
+        tasks = []
+        for idx, prompt_text in enumerate(self.all_prompts_data, 1):
+            images = [str(Path(path)) for path in (row_refs.get(idx) or []) if path and Path(path).exists()]
+            task = PromptTask(
+                prompt_text=prompt_text,
+                prompt_index=idx,
+                output_folder=None
+            )
+            if images:
+                task.integrate_images = images[:3]
+            if mode_name == "Expand + Reference":
+                task.is_expand_reference = True
+            tasks.append(task)
+            self.integrate_task_mapping[idx] = {
+                "prompt": prompt_text,
+                "integrate_images": list(images[:3]),
+                "output_folder": None,
+                "is_custom_integrate": False,
+                "is_expand_reference": mode_name == "Expand + Reference",
+            }
+        return tasks
     
     def browse_batch_folder(self):
         """Browse folder và load TẤT CẢ file .txt vào batch table + prompts table"""
@@ -16458,6 +17484,17 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
             QPushButton:hover { background-color: #138496; }
         """)
         action_row_1.addWidget(btn_add_account)
+
+        btn_proxy_config = QPushButton("🌐 Proxy")
+        btn_proxy_config.setStyleSheet("""
+            QPushButton {
+                background-color: #20c997; color: white; font-weight: bold;
+                padding: 6px 10px; border-radius: 4px; font-size: 11px;
+                min-width: 70px;
+            }
+            QPushButton:hover { background-color: #1aa179; }
+        """)
+        action_row_1.addWidget(btn_proxy_config)
         
         # Paste Cookie button
         btn_paste_cookie = QPushButton("📋 Paste Cookie")
@@ -16942,20 +17979,29 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
             
             if path and os.path.exists(path):
                 try:
+                    profile_info = resolve_chrome_profile(path)
+                    user_data_dir = profile_info["user_data_dir"] or path
+                    profile_directory = profile_info["profile_directory"]
                     self.log(f"🚀 Opening Chrome for {email} (Path: {path})...")
                     if sys.platform == 'darwin':
                         # macOS: Use 'open -n' to force new instance with args
                         cmd = [
                             "open", "-n", "-a", "Google Chrome",
                             "--args",
-                            f"--user-data-dir={path}",
+                            f"--user-data-dir={user_data_dir}",
                             "--no-first-run",
                             "https://labs.google.com"
                         ]
+                        if profile_directory:
+                            cmd.insert(5, f"--profile-directory={profile_directory}")
                         subprocess.Popen(cmd)
                     elif sys.platform == 'win32':
                         # Windows simplified support
-                        subprocess.Popen(["start", "chrome", f"--user-data-dir={path}", "https://labs.google.com"], shell=True)
+                        cmd = ["start", "chrome", f"--user-data-dir={user_data_dir}"]
+                        if profile_directory:
+                            cmd.append(f"--profile-directory={profile_directory}")
+                        cmd.append("https://labs.google.com")
+                        subprocess.Popen(cmd, shell=True)
                     else:
                         self.log("⚠️ Linux/Other not fully supported for Edit Profile yet.")
                 except Exception as e:
@@ -16991,8 +18037,12 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                     
                     # 1. Xóa Profile Folder
                     if path and os.path.exists(path):
-                        shutil.rmtree(path)
-                        self.log(f"🗑️ Đã xóa folder profile: {path}")
+                        from cookiauto import PROFILES_DIR
+                        if is_managed_profile_path(str(path), str(PROFILES_DIR)):
+                            shutil.rmtree(path)
+                            self.log(f"🗑️ Đã xóa folder profile: {path}")
+                        else:
+                            self.log(f"🛡️ Bỏ qua xóa profile ngoài tool: {path}")
                     
                     # 2. Xóa DB Local
                     try:
@@ -17176,6 +18226,25 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                         QMessageBox.warning(dialog, "Lỗi", "Không thể lưu proxy config!")
             except Exception as e:
                 QMessageBox.warning(dialog, "Lỗi", f"Lỗi quản lý proxy: {e}")
+
+        def _open_proxy_for_selected_account():
+            """Mở config proxy cho account đang chọn hoặc account đầu tiên có sẵn."""
+            target_email = None
+            current_row = table.currentRow()
+            if 0 <= current_row < len(accounts):
+                target_email = accounts[current_row].get('email')
+            if not target_email:
+                for acc in accounts:
+                    if acc.get('selected'):
+                        target_email = acc.get('email')
+                        if target_email:
+                            break
+            if not target_email and accounts:
+                target_email = accounts[0].get('email')
+            if not target_email:
+                QMessageBox.warning(dialog, "Lỗi", "Chưa có tài khoản để cấu hình proxy!")
+                return
+            _manage_proxy(target_email)
         
         def _fetch_credits_for_account(email: str, force: bool = False):
             """Fetch credits for an account (async in background thread) - 使用 logic from check_cookie_credits"""
@@ -17609,7 +18678,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                 return
             try:
                 import openpyxl
-                from cookiauto import PROFILES_DIR, db_add_account
+                from cookiauto import db_add_account
                 wb = openpyxl.load_workbook(file_path, read_only=True)
                 sheet = wb.active
                 accounts.clear()
@@ -17621,9 +18690,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                     password = str(row[1]).strip() if len(row) > 1 and row[1] else ''
                     if not email:
                         continue
-                    safe_email = email.replace("@", "_at_").replace(".", "_")
-                    profile_path = str(PROFILES_DIR / safe_email)
-                    Path(profile_path).mkdir(exist_ok=True)
+                    profile_path = get_tool_account_profile_path(email)
                     try:
                         db_add_account(email, password, profile_path)
                         saved_count += 1
@@ -17657,7 +18724,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                 return
             try:
                 import csv
-                from cookiauto import PROFILES_DIR, db_add_account
+                from cookiauto import db_add_account
                 accounts.clear()
                 saved_count = 0
                 with open(file_path, 'r', encoding='utf-8') as f:
@@ -17678,9 +18745,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                             email = first_row[0].strip() if len(first_row) > 0 and first_row[0] else ''
                             password = first_row[1].strip() if len(first_row) > 1 and first_row[1] else ''
                             if email:
-                                safe_email = email.replace("@", "_at_").replace(".", "_")
-                                profile_path = str(PROFILES_DIR / safe_email)
-                                Path(profile_path).mkdir(exist_ok=True)
+                                profile_path = get_tool_account_profile_path(email)
                                 try:
                                     db_add_account(email, password, profile_path)
                                     saved_count += 1
@@ -17699,9 +18764,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                         password = row[1].strip() if len(row) > 1 and row[1] else ''
                         if not email:
                             continue
-                        safe_email = email.replace("@", "_at_").replace(".", "_")
-                        profile_path = str(PROFILES_DIR / safe_email)
-                        Path(profile_path).mkdir(exist_ok=True)
+                        profile_path = get_tool_account_profile_path(email)
                         try:
                             db_add_account(email, password, profile_path)
                             saved_count += 1
@@ -17733,7 +18796,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
             if not file_path:
                 return
             try:
-                from cookiauto import PROFILES_DIR, db_add_account
+                from cookiauto import db_add_account
                 accounts.clear()
                 saved_count = 0
                 with open(file_path, 'r', encoding='utf-8') as f:
@@ -17758,9 +18821,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                         if '@' not in email:
                             self.log(f"⚠️ Dòng {line_num}: '{email}' không phải email hợp lệ, bỏ qua")
                             continue
-                        safe_email = email.replace("@", "_at_").replace(".", "_")
-                        profile_path = str(PROFILES_DIR / safe_email)
-                        Path(profile_path).mkdir(exist_ok=True)
+                        profile_path = get_tool_account_profile_path(email)
                         try:
                             db_add_account(email, password, profile_path)
                             saved_count += 1
@@ -17787,14 +18848,15 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
             account_dialog = AddAccountDialog(dialog)
             if account_dialog.exec() != QDialog.Accepted:
                 return
-            email, password = account_dialog.get_data()
+            email, password, selected_profile_path = account_dialog.get_data()
             if not email:
                 QMessageBox.warning(dialog, "Lỗi", "Email không được để trống!")
                 return
-            from cookiauto import PROFILES_DIR, db_add_account
-            safe_email = email.replace("@", "_at_").replace(".", "_")
-            profile_path = str(PROFILES_DIR / safe_email)
-            Path(profile_path).mkdir(exist_ok=True)
+            from cookiauto import db_add_account
+            if selected_profile_path:
+                profile_path = str(Path(selected_profile_path).expanduser())
+            else:
+                profile_path = get_tool_account_profile_path(email)
             try:
                 db_add_account(email, password, profile_path)
                 self.log(f"💾 Đã lưu account vào DB: {email}")
@@ -17881,11 +18943,59 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                 delay=delay,
                 screen_size=screen_size
             )
+
+            def _persist_worker_cookies(email_key: str, cookies: list) -> bool:
+                """Save worker cookies to DB and read them back into dialog memory."""
+                try:
+                    from cookiauto import db_update_account_cookies, db_get_account_cookies
+                    import json
+
+                    REQUIRED_COOKIE_NAMES = {
+                        "__Host-next-auth.csrf-token",
+                        "__Secure-next-auth.callback-url",
+                        "__Secure-next-auth.session-token",
+                    }
+
+                    filtered_cookies = [
+                        c for c in (cookies or [])
+                        if c.get("name", "") in REQUIRED_COOKIE_NAMES
+                        and ("labs.google" in c.get("domain", "").lower() or c.get("domain", "") == "")
+                    ]
+
+                    if not filtered_cookies:
+                        self.log(f"⚠️ [{email_key}] Không có cookie hợp lệ để lưu vào DB")
+                        return False
+
+                    cookie_json_str = convert_cookies_to_json_string(filtered_cookies)
+                    if not db_update_account_cookies(email_key, cookie_json_str):
+                        self.log(f"⚠️ [{email_key}] db_update_account_cookies trả về False")
+                        return False
+
+                    saved_cookie_json = db_get_account_cookies(email_key)
+                    if not saved_cookie_json:
+                        self.log(f"⚠️ [{email_key}] DB không trả cookie sau khi vừa lưu")
+                        return False
+
+                    try:
+                        cookies_result[email_key] = json.loads(saved_cookie_json)
+                    except Exception:
+                        cookies_result[email_key] = filtered_cookies
+
+                    self.log(f"✅ Đã lưu 3 cookies vào DB cho {email_key} (len={len(saved_cookie_json)})")
+                    return True
+                except Exception as e:
+                    self.log(f"⚠️ Lỗi persist cookies cho {email_key}: {e}")
+                    import traceback
+                    self.log(traceback.format_exc())
+                    return False
+
             def on_worker_progress(current: int, total: int, email: str):
                 progress.setValue(current)
                 progress.setFormat(f"{current}/{total} - {email}")
             def on_worker_finished(results: dict):
-                cookies_result.update(results)
+                for email_key, cookies in (results or {}).items():
+                    if not _persist_worker_cookies(email_key, cookies):
+                        cookies_result[email_key] = cookies
                 progress.setVisible(False)
                 _refresh_table()
                 _update_status()
@@ -17909,8 +19019,10 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                 failed_accounts.add(email_key)
                 _refresh_table()
             def on_account_done(email_key: str, cookies: list):
-                cookies_result[email_key] = cookies
+                if not _persist_worker_cookies(email_key, cookies):
+                    cookies_result[email_key] = cookies
                 _refresh_table()
+                _update_status()
                 try:
                     _fetch_credits_for_account(email_key)
                 except Exception as e:
@@ -18097,9 +19209,14 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
             for email, profile_path in selected_profiles:
                 try:
                     if profile_path and profile_path.is_dir():
-                        shutil.rmtree(profile_path)
-                        deleted += 1
-                        self.log(f"🗑️ Đã xóa folder profile: {email}")
+                        from cookiauto import PROFILES_DIR
+                        if is_managed_profile_path(str(profile_path), str(PROFILES_DIR)):
+                            shutil.rmtree(profile_path)
+                            deleted += 1
+                            self.log(f"🗑️ Đã xóa folder profile: {email}")
+                        else:
+                            deleted += 1
+                            self.log(f"🛡️ Bỏ qua xóa profile ngoài tool cho: {email}")
                     elif profile_path is None:
                         self.log(f"🗑️ Account {email} không có profile folder")
                         deleted += 1
@@ -18267,6 +19384,10 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                 btn_credits.setStyleSheet("background-color: #ffc107; color: black; padding: 3px; font-size: 11px;")
                 btn_credits.clicked.connect(lambda checked=False, e=email: _fetch_credits_for_account(e, force=True))
 
+                btn_proxy = QPushButton("🌐 Proxy")
+                btn_proxy.setStyleSheet("background-color: #20c997; color: white; padding: 3px; font-size: 11px;")
+                btn_proxy.clicked.connect(lambda checked=False, e=email: _manage_proxy(e))
+
                 btn_del_prof = QPushButton("🗑️ Xóa Profile")
                 btn_del_prof.setStyleSheet("background-color: #dc3545; color: white; padding: 3px; font-size: 11px;")
                 btn_del_prof.setToolTip("Xóa thư mục profile")
@@ -18274,6 +19395,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
 
                 actions_layout.addWidget(btn_edit)
                 actions_layout.addWidget(btn_credits)
+                actions_layout.addWidget(btn_proxy)
                 actions_layout.addWidget(btn_del_prof)
                 table.setCellWidget(row, 6, actions_widget)
 
@@ -18342,6 +19464,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
         btn_import_csv.clicked.connect(_on_import_csv)
         btn_import_txt.clicked.connect(_on_import_txt)
         btn_add_account.clicked.connect(_on_add_account)
+        btn_proxy_config.clicked.connect(_open_proxy_for_selected_account)
         btn_paste_cookie.clicked.connect(_on_paste_cookie_clicked) # ✅ Connect new button
         btn_get_cookies.clicked.connect(_on_get_cookies)  # ✅ Fixed: use _on_get_cookies instead of _start_getting_cookies
         btn_export.clicked.connect(_on_export_txt)
@@ -18377,6 +19500,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
             parsed_cookies = []
             parsed_profile_paths = []  # ✅ Lưu profile_path song song với cookies
             parsed_emails = []  # ✅ Lưu email song song với cookies (cho proxy per-account)
+            parsed_passwords = []  # ✅ Lưu password song song với cookies (cho auto-renew/proxy-first)
             
             # Debug: Log cookies_result
             self.log(f"🔍 cookies_result có {len(cookies_result)} entries")
@@ -18389,12 +19513,15 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                         parsed_cookies.append(cookie_json_str)
                         # ✅ Tìm profile_path cho email này
                         email_profile_path = None
+                        email_password = ""
                         for acc in accounts:
                             if acc.get('email') == email_key:
                                 email_profile_path = acc.get('profile_path', '')
+                                email_password = acc.get('password', '')
                                 break
                         parsed_profile_paths.append(email_profile_path or '')
                         parsed_emails.append(email_key)
+                        parsed_passwords.append(email_password or '')
                         self.log(f"✅ Đã convert cookie cho {email_key}")
                     except Exception as e:
                         self.log(f"❌ Lỗi convert cookie cho {email_key}: {e}")
@@ -18427,6 +19554,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
             self.cookies_list = parsed_cookies
             self.cookie_profile_paths = parsed_profile_paths  # ✅ Lưu profile_path song song
             self.cookie_emails = parsed_emails  # ✅ Lưu email song song (cho proxy per-account)
+            self.cookie_passwords = parsed_passwords  # ✅ Lưu password song song
             self._apply_plan_cookie_limit()
             self.cookie_value = self.cookies_list[0] if self.cookies_list else ""
             
@@ -19136,6 +20264,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                     with open(prompt_file, 'r', encoding='utf-8') as f:
                         prompts = [line.strip() for line in f if line.strip()]
                     self.load_i2v_preview(prompts)
+                self._refresh_i2v_media_preview()
                 
             except Exception as e:
                 self.log(f"⚠️ Lỗi đếm ảnh: {e}")
@@ -19220,6 +20349,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
         self.txt_image_prompt_file.clear()
         self.txt_image_prompt_folder.clear()
         self.log(f"📁 Folder gốc I2V: {len(txt_files)} file .txt, {valid_pairs} cặp txt + folder ảnh trùng tên")
+        self._refresh_i2v_media_preview()
 
     def update_i2v_mode_ui(self):
         """Ẩn/hiện các input I2V theo mode đang chọn."""
@@ -19277,6 +20407,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                         "- Cấu trúc: 1.txt, 2.txt, ..., và các folder '1', '2', ...\n"
                         "- Ảnh trong folder 'N' ↔ từng dòng trong N.txt (theo STT)."
                     )
+            self._refresh_i2v_media_preview()
         except Exception:
             # Không để UI crash nếu có lỗi nhỏ
             pass
@@ -19314,21 +20445,15 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                 row = self.prompts_table.rowCount()
                 self.prompts_table.insertRow(row)
                 
-                # Checkbox
-                chk = QCheckBox()
-                chk_widget = QWidget()
-                chk_layout = QHBoxLayout(chk_widget)
-                chk_layout.addWidget(chk)
-                chk_layout.setAlignment(Qt.AlignCenter)
-                chk_layout.setContentsMargins(0, 0, 0, 0)
-                self.prompts_table.setCellWidget(row, 0, chk_widget)
+                # STT
+                self.prompts_table.setItem(row, 0, self._create_prompt_stt_item(idx))
                 
                 # Display: Image name + Prompt (50 chars)
                 max_prompt_length = 50
                 if len(prompt_text) > max_prompt_length:
-                    display_text = f'{idx}: {img_path.name} + {prompt_text[:max_prompt_length]}...'
+                    display_text = f'{img_path.name} + {prompt_text[:max_prompt_length]}...'
                 else:
-                    display_text = f'{idx}: {img_path.name} + {prompt_text}'
+                    display_text = f'{img_path.name} + {prompt_text}'
                 prompt_item = self._create_prompt_table_item(display_text, prompt_text, idx)
                 self.prompts_table.setItem(row, 1, prompt_item)
                 
@@ -19724,12 +20849,36 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
         
         # Removed DEBUG log
         
-        # ✅ Thêm tasks vào prompts_table trước khi start
-        self.prompts_table.setRowCount(0)
-        for idx, task in enumerate(tasks, 1):
-            self.signals.add_task.emit(task, idx)
-        
-        self.log("📋 Bắt đầu xử lý các tasks trong bảng...")
+        # ✅ Giữ nguyên bảng hiện tại nếu đã khớp với tasks đang chạy
+        visible_task_indexes = []
+        for row in range(self.prompts_table.rowCount()):
+            prompt_item = self.prompts_table.item(row, 1)
+            if prompt_item:
+                global_idx = prompt_item.data(Qt.UserRole)
+                if isinstance(global_idx, int):
+                    visible_task_indexes.append(global_idx)
+
+        task_indexes = []
+        for task in tasks:
+            task_idx = getattr(task, "task_index", None) or getattr(task, "prompt_index", None)
+            if isinstance(task_idx, int):
+                task_indexes.append(task_idx)
+
+        visible_task_indexes_filtered = [idx for idx in visible_task_indexes if idx in set(task_indexes)]
+        preserve_existing_table = bool(
+            visible_task_indexes
+            and task_indexes
+            and visible_task_indexes_filtered == task_indexes
+        )
+
+        if preserve_existing_table:
+            self.log("📋 Giữ nguyên giao diện bảng hiện tại khi bắt đầu chạy...")
+            self._prepare_existing_video_rows_for_run(task_indexes)
+        else:
+            self.prompts_table.setRowCount(0)
+            for idx, task in enumerate(tasks, 1):
+                self.signals.add_task.emit(task, idx)
+            self.log("📋 Bắt đầu xử lý các tasks trong bảng...")
         
         # Store tasks
         self.current_tasks = tasks
@@ -19923,6 +21072,10 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                 
                 # Lấy output folder từ UI
                 output_folder = self.output_folder.text().strip() if self.output_folder.text().strip() else str(Path.home() / "Downloads")
+                row_tasks = self._build_i2v_tasks_from_row_images(output_folder)
+                if row_tasks:
+                    self.log(f"✅ {len(row_tasks)} Image-to-Video tasks từ ảnh theo từng dòng trong bảng")
+                    return row_tasks
                 
                 # ✅ MODE 3: Folder gốc (file .txt + folder ảnh trùng tên)
                 if root_folder and Path(root_folder).exists() and hasattr(self, "rb_i2v_mode_root_match") and self.rb_i2v_mode_root_match.isChecked():
@@ -20118,6 +21271,11 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                 # Start+End tasks: hỗ trợ 2 mode
                 # - 2 ảnh / 1 prompt (cũ)
                 # - Nối frame: (1,2), (2,3), (3,4), ...
+                row_tasks = self._build_start_end_tasks_from_row_images()
+                if row_tasks:
+                    self.log(f"✅ {len(row_tasks)} Start+End tasks từ ảnh theo từng dòng trong bảng")
+                    return row_tasks
+
                 se_folder = self.txt_start_end_folder.text().strip()
                 prompt_file = self.txt_start_end_prompt.text().strip()
                 
@@ -20187,6 +21345,11 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                     self.log(f"✅ {len(tasks)} Start+End tasks (mode 2 ẢNH/1 PROMPT, {len(image_paths)} ảnh)")
             
             elif mode == "Integrate to Video":
+                row_tasks = self._build_integrate_tasks_from_row_images("Integrate to Video")
+                if row_tasks and any(getattr(task, 'integrate_images', None) for task in row_tasks):
+                    self.log(f"✅ {len(row_tasks)} Integrate tasks từ ảnh tham chiếu theo từng dòng trong bảng")
+                    return row_tasks
+
                 # ✅ Kiểm tra chế độ: Mặc Định hoặc Tùy Chỉnh
                 is_custom_mode = False
                 try:
@@ -20318,7 +21481,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                     try:
                         images_per_group = int(self.combo_integrate_images_per_group.currentText())
                     except:
-                        images_per_group = 3
+                        images_per_group = 1
                     
                     # Collect images (sorted by number prefix)
                     image_paths = []
@@ -20366,6 +21529,11 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                     self.log(f"✅ {len(tasks)} Integrate tasks")
             
             elif mode == "Expand + Reference":
+                row_tasks = self._build_integrate_tasks_from_row_images("Expand + Reference")
+                if row_tasks and any(getattr(task, 'integrate_images', None) for task in row_tasks):
+                    self.log(f"✅ {len(row_tasks)} Expand + Reference tasks từ ảnh tham chiếu theo từng dòng trong bảng")
+                    return row_tasks
+
                 # ✅ Expand + Reference mode: Dùng logic tương tự Integrate to Video
                 # Nhưng sẽ tạo nhiều video bằng integrate to video, lấy mediaGenerationId, concat và download
                 
@@ -20604,7 +21772,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                         try:
                             images_per_group = int(self.combo_integrate_images_per_group.currentText())
                         except:
-                            images_per_group = 3
+                            images_per_group = 1
                         
                         image_paths = []
                         for file in sorted(Path(int_folder).iterdir()):
@@ -21453,6 +22621,86 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
             self.log(f"❌ Traceback: {traceback.format_exc()}")
             return status  # Return original status on error
     
+    def _get_cookie_account_context(self, cookie_index=None, cookie_str=None):
+        """Lấy metadata account song song với cookie để proxy/runtime dùng thống nhất."""
+        resolved_index = cookie_index
+        if resolved_index is None and cookie_str and getattr(self, "cookies_list", None):
+            try:
+                resolved_index = self.cookies_list.index(cookie_str)
+            except ValueError:
+                resolved_index = None
+
+        email = ""
+        profile_path = None
+        password = ""
+
+        if resolved_index is not None:
+            if hasattr(self, 'cookie_emails') and resolved_index < len(self.cookie_emails):
+                email = self.cookie_emails[resolved_index] or ""
+            if hasattr(self, 'cookie_profile_paths') and resolved_index < len(self.cookie_profile_paths):
+                profile_path = self.cookie_profile_paths[resolved_index] or None
+            if hasattr(self, 'cookie_passwords') and resolved_index < len(self.cookie_passwords):
+                password = self.cookie_passwords[resolved_index] or ""
+
+        if email and not password:
+            try:
+                from cookiauto import db_get_all_accounts
+                for acc in db_get_all_accounts() or []:
+                    if acc.get("email") == email:
+                        password = acc.get("password", "") or ""
+                        if not profile_path:
+                            profile_path = acc.get("profile_path", "") or None
+                        break
+            except Exception:
+                pass
+
+        return {
+            "cookie_index": resolved_index,
+            "email": email,
+            "password": password,
+            "profile_path": profile_path,
+        }
+
+    def _build_client_from_cookie_str(self, cookie_str, cookie_index=None, check_active=False):
+        """Tạo LabsFlowClient với đầy đủ email/profile/proxy context cho runtime."""
+        if not cookie_str:
+            return None
+
+        if check_active and cookie_index is not None:
+            self._init_cookie_status()
+            if not self._is_cookie_active(cookie_index):
+                return None
+
+        cookies = _parse_cookie_string(cookie_str)
+        if not cookies:
+            return None
+
+        ctx = self._get_cookie_account_context(cookie_index=cookie_index, cookie_str=cookie_str)
+        client = LabsFlowClient(cookies, profile_path=ctx["profile_path"])
+
+        email = ctx["email"]
+        if email:
+            try:
+                LabsFlowClient.register_account_info(
+                    client._cookie_hash,
+                    email,
+                    ctx["password"] or "",
+                    ctx["profile_path"] or "",
+                )
+            except Exception:
+                pass
+
+            try:
+                from cookiauto import db_get_account_proxy_config
+                proxy_cfg = db_get_account_proxy_config(email)
+                if proxy_cfg:
+                    client.proxy_config = proxy_cfg
+                    client._apply_proxy_to_session(proxy_cfg)
+            except Exception:
+                pass
+
+        return client
+
     def build_client(self, cookie_index=0):
         """Build LabsFlowClient từ cookie (hỗ trợ nhiều cookies)"""
         try:
@@ -21461,10 +22709,6 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                 return None
             if hasattr(self, "stop_event") and self.stop_event.is_set():
                 return None
-            self._init_cookie_status()
-            # Bỏ qua cookie không còn hoạt động
-            if cookie_index is not None and not self._is_cookie_active(cookie_index):
-                return None
             # Nếu có nhiều cookies, dùng round-robin
             if self.cookies_list and len(self.cookies_list) > cookie_index:
                 cookie_str = self.cookies_list[cookie_index]
@@ -21472,34 +22716,15 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                 cookie_str = self.cookie_value
             else:
                 return None
-            
-            cookies = _parse_cookie_string(cookie_str)
-            if not cookies:
+
+            client = self._build_client_from_cookie_str(
+                cookie_str,
+                cookie_index=cookie_index,
+                check_active=True,
+            )
+            if not client:
                 self.log(f"❌ Cookie {cookie_index+1} không hợp lệ")
                 return None
-            
-            # ✅ Lấy profile_path cho cookie này (nếu có)
-            profile_path = None
-            if hasattr(self, 'cookie_profile_paths') and self.cookie_profile_paths:
-                if cookie_index < len(self.cookie_profile_paths):
-                    profile_path = self.cookie_profile_paths[cookie_index] or None
-            
-            client = LabsFlowClient(cookies, profile_path=profile_path)
-            
-            # ✅ Áp dụng proxy per-account (nếu có)
-            if hasattr(self, 'cookie_emails') and self.cookie_emails:
-                if cookie_index < len(self.cookie_emails):
-                    email = self.cookie_emails[cookie_index]
-                    if email:
-                        try:
-                            from cookiauto import db_get_account_proxy_config
-                            proxy_cfg = db_get_account_proxy_config(email)
-                            if proxy_cfg:
-                                client.proxy_config = proxy_cfg
-                                client._apply_proxy_to_session(proxy_cfg)
-                        except Exception:
-                            pass
-            
             return client
         except Exception as e:
             self.log(f"❌ Lỗi tạo client: {e}")
@@ -25292,6 +26517,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                 
                 tasks_count = image_count // 2
                 self.log(f"📁 Start+End: {image_count} ảnh → {tasks_count} tasks")
+                self._refresh_start_end_media_preview()
             except Exception as e:
                 self.log(f"⚠️ Lỗi: {e}")
     
@@ -25358,13 +26584,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                     self.prompts_table.insertRow(row)
                     
                     # Checkbox
-                    chk = QCheckBox()
-                    chk_widget = QWidget()
-                    chk_layout = QHBoxLayout(chk_widget)
-                    chk_layout.addWidget(chk)
-                    chk_layout.setAlignment(Qt.AlignCenter)
-                    chk_layout.setContentsMargins(0, 0, 0, 0)
-                    self.prompts_table.setCellWidget(row, 0, chk_widget)
+                    self.prompts_table.setItem(row, 0, self._create_prompt_stt_item(task_idx))
                     
                     # Display - hiển thị RÕ RÀNG 2 ảnh + prompt
                     # ✅ Rút ngắn tên ảnh để hiển thị rõ hơn
@@ -25373,9 +26593,9 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                     
                     max_prompt_length = 40  # Giảm xuống để ưu tiên hiển thị tên ảnh
                     if len(prompt_text) > max_prompt_length:
-                        display_text = f'{task_idx}: [{start_name}] → [{end_name}] | {prompt_text[:max_prompt_length]}...'
+                        display_text = f'[{start_name}] → [{end_name}] | {prompt_text[:max_prompt_length]}...'
                     else:
-                        display_text = f'{task_idx}: [{start_name}] → [{end_name}] | {prompt_text}'
+                        display_text = f'[{start_name}] → [{end_name}] | {prompt_text}'
                     prompt_item = self._create_prompt_table_item(display_text, prompt_text, task_idx)
                     self.prompts_table.setItem(row, 1, prompt_item)
                     
@@ -25411,13 +26631,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                     self.prompts_table.insertRow(row)
                     
                     # Checkbox
-                    chk = QCheckBox()
-                    chk_widget = QWidget()
-                    chk_layout = QHBoxLayout(chk_widget)
-                    chk_layout.addWidget(chk)
-                    chk_layout.setAlignment(Qt.AlignCenter)
-                    chk_layout.setContentsMargins(0, 0, 0, 0)
-                    self.prompts_table.setCellWidget(row, 0, chk_widget)
+                    self.prompts_table.setItem(row, 0, self._create_prompt_stt_item(task_idx))
                     
                     # Display - hiển thị RÕ RÀNG 2 ảnh + prompt
                     # ✅ Rút ngắn tên ảnh để hiển thị rõ hơn
@@ -25426,9 +26640,9 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                     
                     max_prompt_length = 40  # Giảm xuống để ưu tiên hiển thị tên ảnh
                     if len(prompt_text) > max_prompt_length:
-                        display_text = f'{task_idx}: [{start_name}] → [{end_name}] | {prompt_text[:max_prompt_length]}...'
+                        display_text = f'[{start_name}] → [{end_name}] | {prompt_text[:max_prompt_length]}...'
                     else:
-                        display_text = f'{task_idx}: [{start_name}] → [{end_name}] | {prompt_text}'
+                        display_text = f'[{start_name}] → [{end_name}] | {prompt_text}'
                     prompt_item = self._create_prompt_table_item(display_text, prompt_text, task_idx)
                     self.prompts_table.setItem(row, 1, prompt_item)
                     
@@ -25481,17 +26695,12 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
             
             print(f"DEBUG: Inserted row {row}, total rows: {self.prompts_table.rowCount()}")  # Debug
             
-            # Column 0: Checkbox
-            chk = QCheckBox()
-            chk_widget = QWidget()
-            chk_layout = QHBoxLayout(chk_widget)
-            chk_layout.addWidget(chk)
-            chk_layout.setAlignment(Qt.AlignCenter)
-            chk_layout.setContentsMargins(0, 0, 0, 0)
-            self.prompts_table.setCellWidget(row, 0, chk_widget)
+            # Column 0: STT
+            self.prompts_table.setItem(row, 0, self._create_prompt_stt_item(index))
             
             # Column 1: Prompt (Lời nhắc) - HIỂN THỊ ~50 ký tự đầu
-            if isinstance(task, PromptTask):
+            image_modes = {"Image to Video", "Start+End to Video", "Integrate to Video", "Expand + Reference"}
+            if isinstance(task, PromptTask) or getattr(self, "current_video_mode", "") in image_modes:
                 # Hiển thị 100 ký tự đầu - KHÔNG có # prefix
                 max_display_length = 100
                 if len(task.prompt_text) > max_display_length:
@@ -25548,6 +26757,8 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
             btn_retry.setEnabled(False)  # Mặc định disabled, chỉ enable khi task fail hoàn toàn hoặc done
             btn_retry.clicked.connect(lambda checked, idx=index: self.retry_single_video_task(idx))
             self.prompts_table.setCellWidget(row, 5, btn_retry)
+
+            self._apply_video_row_image_cells(row, index)
             
         except Exception as e:
             self.log(f"❌ Lỗi add task to table: {e}")
@@ -27528,6 +28739,10 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                 self.logs_display.append(text)
                 scrollbar = self.logs_display.verticalScrollBar()
                 scrollbar.setValue(scrollbar.maximum())
+                if hasattr(self, 'video_logs_dialog_text') and self.video_logs_dialog_text:
+                    self.video_logs_dialog_text.append(text)
+                    popup_scrollbar = self.video_logs_dialog_text.verticalScrollBar()
+                    popup_scrollbar.setValue(popup_scrollbar.maximum())
             else:
                 # Fallback: print to console nếu logs_display chưa sẵn sàng
                 print(f"[LOG] {text}")
@@ -27658,6 +28873,12 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
         # Xóa cookies trong memory
         if hasattr(self, 'cookies_list') and self.cookies_list:
             self.cookies_list = []
+        if hasattr(self, 'cookie_profile_paths'):
+            self.cookie_profile_paths = []
+        if hasattr(self, 'cookie_emails'):
+            self.cookie_emails = []
+        if hasattr(self, 'cookie_passwords'):
+            self.cookie_passwords = []
         if hasattr(self, 'cookie_value') and self.cookie_value:
             self.cookie_value = ""
         if hasattr(self, 'accounts') and self.accounts:
@@ -27700,36 +28921,15 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
 
     def _wrap_cli_full_recovery(self, job_idx=None):
         """
-        Workflow đầy đủ khi bị 403 nhiều lần:
-        1. Đổi IP bằng WRAP CLI
-        2. Xóa cookie cũ
-        3. Đăng nhập lại lấy cookie mới
-        4. User tự nhấn Run lại
+        Legacy recovery đã bị vô hiệu hóa.
+
+        Flow mới chỉ chấp nhận proxy thật và để complete_flow xử lý 403 theo
+        chiến lược proxy-first. Giữ hàm này để tránh vỡ call-site cũ.
         """
-        self.log("=" * 60)
-        self.log("🚨 [_RECOVERY] BẮT ĐẦU QUY TRÌNH KHẮC PHỤC 403")
-        self.log("=" * 60)
-
-        # Bước 1: Đổi IP
-        warp_ok = self._rotate_warp_ip()
-        if warp_ok:
-            self.log("✅ Đổi IP thành công")
-        else:
-            self.log("⚠️ Đổi IP thất bại hoặc IP không đổi")
-            # Vẫn tiếp tục xóa cookie để thử
-
-        # Bước 2: Xóa cookie cũ + login lại
-        self._clear_all_cookies_and_relogin(job_idx)
-
-        self.log("=" * 60)
-        self.log("📋 [_RECOVERY] HƯỚNG DẪN:")
-        self.log("   1. Đăng nhập lại tài khoản Google")
-        self.log("   2. Nhấn 'Lấy Cookie' để lấy cookie mới")
-        self.log("   3. Nhấn 'Chạy Flow' để tiếp tục")
-        self.log("=" * 60)
+        self.log("ℹ️ [_RECOVERY] Legacy WARP recovery đã tắt. Hãy cấu hình proxy hợp lệ cho account này.")
 
     def _on_403_detected(self, job_idx=None):
-        """Gọi mỗi khi phát hiện 403. Hiển thị cảnh báo + tự động chạy recovery."""
+        """Gọi mỗi khi phát hiện 403. Chỉ log cảnh báo, không dùng WARP/Tor recovery nữa."""
         now = time.time()
         if now - self._403_last_reset_time > 300:
             self._403_count = 0
@@ -27737,20 +28937,9 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
 
         self._403_count += 1
         self.log(f"⚠️ [_403] Phát hiện 403 lần thứ {self._403_count} (job_idx={job_idx})")
-
-        # Mỗi lần phát hiện 403, tự động chạy recovery (đổi IP + xóa cookie + login lại)
-        if self._403_count >= 2:
-            if not self._wrap_cli_dismissed:
-                self._wrap_cli_dismissed = True
-                # Chạy recovery trong thread riêng để không block UI
-                import threading
-                t = threading.Thread(target=self._wrap_cli_full_recovery, args=(job_idx,), daemon=True)
-                t.start()
-            elif self._403_count >= 4:
-                # Nếu đã dismiss rồi nhưng vẫn 403 tiếp, vẫn đổi IP (không hiện dialog)
-                warp_t = threading.Thread(target=self._rotate_warp_ip, daemon=True)
-                warp_t.start()
-    # ==================== END WRAP CLI HELPERS ====================
+        if self._403_count == 2:
+            self.log("ℹ️ [_403] Auto-recovery bằng WARP/Tor đã tắt. Chỉ retry qua proxy đã cấu hình.")
+    # ==================== END LEGACY 403 HELPERS ====================
 
     def _update_task_metadata_cache(self, tasks=None, reset=False):
         """Snapshot task metadata for retry flows (integrate, custom modes, etc.)."""
@@ -32143,22 +33332,15 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                 row = self.prompts_table.rowCount()
                 self.prompts_table.insertRow(row)
                 
-                # Checkbox
-                chk = QCheckBox()
-                chk_widget = QWidget()
-                chk_layout = QHBoxLayout(chk_widget)
-                chk_layout.addWidget(chk)
-                chk_layout.setAlignment(Qt.AlignCenter)
-                chk_layout.setContentsMargins(0, 0, 0, 0)
-                self.prompts_table.setCellWidget(row, 0, chk_widget)
+                self.prompts_table.setItem(row, 0, self._create_prompt_stt_item(i))
                 
                 # Prompt - hiển thị ~50 ký tự đầu
                 segment_text = segment.text if hasattr(segment, 'text') else str(segment)
                 max_display_length = 100  # TĂNG TỪ 50 → 100 KÝ TỰ
                 if len(segment_text) > max_display_length:
-                    display_text = f'{i}: {segment_text[:max_display_length]}...'
+                    display_text = f'{segment_text[:max_display_length]}...'
                 else:
-                    display_text = f'{i}: {segment_text}'
+                    display_text = segment_text
                 
                 prompt_item = self._create_prompt_table_item(display_text, segment_text, segment_index)
                 self.prompts_table.setItem(row, 1, prompt_item)
@@ -32248,14 +33430,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                 row = self.prompts_table.rowCount()
                 self.prompts_table.insertRow(row)
                 
-                # Checkbox
-                chk = QCheckBox()
-                chk_widget = QWidget()
-                chk_layout = QHBoxLayout(chk_widget)
-                chk_layout.addWidget(chk)
-                chk_layout.setAlignment(Qt.AlignCenter)
-                chk_layout.setContentsMargins(0, 0, 0, 0)
-                self.prompts_table.setCellWidget(row, 0, chk_widget)
+                self.prompts_table.setItem(row, 0, self._create_prompt_stt_item(segment_index))
                 
                 # Prompt - hiển thị segment index và text
                 segment_text = segment.text if hasattr(segment, 'text') else str(segment)
@@ -32263,9 +33438,9 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                 
                 max_display_length = 100  # TĂNG TỪ 50 → 100 KÝ TỰ
                 if len(segment_text) > max_display_length:
-                    display_text = f'{segment_index}: {segment_text[:max_display_length]}...'
+                    display_text = f'{segment_text[:max_display_length]}...'
                 else:
-                    display_text = f'{segment_index}: {segment_text}'
+                    display_text = segment_text
                 
                 # ✅ Sửa: dùng segment_text và segment_index thay vì prompt_text và prompt_idx
                 prompt_item = self._create_prompt_table_item(display_text, segment_text, segment_index)
@@ -33524,6 +34699,7 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
                     image_count += len(list(Path(folder).glob(f"*{ext}")))
                 
                 self.log(f"📁 Integrate: {image_count} ảnh")
+                self._refresh_integrate_media_preview()
             except Exception as e:
                 self.log(f"⚠️ Lỗi: {e}")
     
@@ -33609,6 +34785,12 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
         
         if not hasattr(self, 'expand_ref_fixed_images_paths'):
             self.expand_ref_fixed_images_paths = []
+
+        if hasattr(self, 'expand_ref_fixed_images_grid') and self.expand_ref_fixed_images_grid is not None:
+            grid_paths = list(self.expand_ref_fixed_images_grid.image_paths)
+            if grid_paths != list(self.expand_ref_fixed_images_paths):
+                self.expand_ref_fixed_images_grid.image_paths = list(self.expand_ref_fixed_images_paths)
+                self.expand_ref_fixed_images_grid._rebuild_layout()
         
         for idx, path in enumerate(self.expand_ref_fixed_images_paths, 1):
             filename = Path(path).name
@@ -34327,7 +35509,7 @@ QUAN TRỌNG:
             try:
                 images_per_group = int(self.combo_integrate_images_per_group.currentText())
             except:
-                images_per_group = 3
+                images_per_group = 1
             
             # Collect images (sorted by number prefix)
             image_files = []
@@ -34368,14 +35550,7 @@ QUAN TRỌNG:
                 row = self.prompts_table.rowCount()
                 self.prompts_table.insertRow(row)
                 
-                # Checkbox
-                chk = QCheckBox()
-                chk_widget = QWidget()
-                chk_layout = QHBoxLayout(chk_widget)
-                chk_layout.addWidget(chk)
-                chk_layout.setAlignment(Qt.AlignCenter)
-                chk_layout.setContentsMargins(0, 0, 0, 0)
-                self.prompts_table.setCellWidget(row, 0, chk_widget)
+                self.prompts_table.setItem(row, 0, self._create_prompt_stt_item(prompt_idx + 1))
                 
                 # Display
                 img_names = ", ".join([img.name for img in group_images[:3]])
@@ -34384,9 +35559,9 @@ QUAN TRỌNG:
                 # Hiển thị 50 chars prompt
                 max_prompt_length = 50
                 if len(prompt_text) > max_prompt_length:
-                    display_text = f'{prompt_idx+1}: [{img_names}] + {prompt_text[:max_prompt_length]}...'
+                    display_text = f'[{img_names}] + {prompt_text[:max_prompt_length]}...'
                 else:
-                    display_text = f'{prompt_idx+1}: [{img_names}] + {prompt_text}'
+                    display_text = f'[{img_names}] + {prompt_text}'
                 prompt_item = self._create_prompt_table_item(display_text, prompt_text, prompt_idx + 1)
                 self.prompts_table.setItem(row, 1, prompt_item)
                 
@@ -35553,52 +36728,57 @@ QUAN TRỌNG:
                     "videoModelKey": reference_model_key
                 })
             
-            # ✅ Thêm sessionId theo format: ";timestamp"
-            import time
-            session_id = f";{int(time.time() * 1000)}"
-            client_context = {
-                "projectId": str(uuid.uuid4()),
-                "tool": tool,
-                "userPaygateTier": tier,
-                "sessionId": session_id,  # ✅ Thêm sessionId theo format WebUI
-            }
-            # ✅ recaptchaToken cho generate video (không phải log / operation)
-            try:
-                # ✅ Dùng trực tiếp client hiện tại để inject recaptchaToken (đã có session và cookies đúng)
-                if hasattr(client, '_maybe_inject_recaptcha'):
-                    self.log(f"🔐 Đang inject recaptchaToken cho task {idx}...")
-                    client._maybe_inject_recaptcha(client_context)
-                    if "recaptchaToken" in client_context:
-                        self.log(f"✅ Đã inject recaptchaToken thành công (length: {len(client_context.get('recaptchaToken', ''))})")
-                    else:
-                        self.log(f"⚠️ recaptchaToken không được inject vào client_context")
-                else:
-                    self.log(f"⚠️ Client không có method _maybe_inject_recaptcha")
-            except Exception as e:
-                # Log lỗi để debug
-                import traceback
-                self.log(f"❌ Lỗi inject recaptchaToken: {e}")
-                self.log(f"   Traceback: {traceback.format_exc()[:300]}")
-
-            payload = {
-                "mediaGenerationContext": {"batchId": str(uuid.uuid4())},
-                "clientContext": client_context,
-                "requests": requests_body,  # num_videos requests
-                "useV2ModelConfig": True,
-            }
-            
             self.log(f"📹 Tạo {num_videos} video(s) với Integrate mode")
             self.log(f"📋 Payload info: {len(limited_media_ids)} ảnh, prompt length={len(prompt_text)}, aspect={aspect_value}, model={reference_model_key}")
-            
-            headers = client._aisandbox_headers()
-            # ✅ Dùng data thay vì json để giữ Content-Type text/plain;charset=UTF-8 từ headers
+
             import json as json_module
-            payload_json = json_module.dumps(payload)
-            
-            response = client.session.post(url, headers=headers, data=payload_json, timeout=120)
-            
-            if response.status_code != 200:
-                # ✅ Lưu error detail để check cookie error
+            result = None
+            max_ref_retries = 4
+            for ref_attempt in range(max_ref_retries):
+                session_id = f";{int(time.time() * 1000)}"
+                client_context = {
+                    "projectId": str(uuid.uuid4()),
+                    "tool": tool,
+                    "userPaygateTier": tier,
+                    "sessionId": session_id,
+                }
+                try:
+                    if hasattr(client, '_maybe_inject_recaptcha'):
+                        self.log(f"🔐 Đang inject recaptchaToken cho task {idx}...")
+                        client._maybe_inject_recaptcha(client_context)
+                        if hasattr(client, '_convert_to_recaptcha_context'):
+                            client._convert_to_recaptcha_context(client_context)
+                except Exception as e:
+                    import traceback
+                    self.log(f"❌ Lỗi inject recaptchaToken: {e}")
+                    self.log(f"   Traceback: {traceback.format_exc()[:300]}")
+                    return False
+
+                payload = {
+                    "mediaGenerationContext": {"batchId": str(uuid.uuid4())},
+                    "clientContext": client_context,
+                    "requests": requests_body,
+                    "useV2ModelConfig": True,
+                }
+
+                headers = client._aisandbox_headers()
+                payload_json = json_module.dumps(payload)
+                response = client.session.post(url, headers=headers, data=payload_json, timeout=120)
+
+                if response.status_code == 200:
+                    try:
+                        result = response.json()
+                        break
+                    except Exception as e:
+                        error_msg = f"Lỗi parse JSON: {str(e)}"
+                        self.log(f"❌ Integrate parse JSON error: {error_msg}")
+                        try:
+                            setattr(client, "last_error_detail", error_msg)
+                            setattr(client, "last_error", error_msg)
+                        except Exception:
+                            pass
+                        return False
+
                 error_text = ""
                 try:
                     error_text = response.text[:500] if hasattr(response, 'text') else ""
@@ -35606,28 +36786,27 @@ QUAN TRỌNG:
                         error_text = str(response.content[:500]) if hasattr(response, 'content') else ""
                 except Exception:
                     pass
-                
+
+                if response.status_code == 403 and hasattr(client, '_handle_403_with_proxy_priority'):
+                    self.log(f"⚠️ Integrate API 403 - ưu tiên rotate/apply proxy (attempt {ref_attempt + 1}/{max_ref_retries})")
+                    if client._handle_403_with_proxy_priority(error_text[:200]):
+                        time.sleep(0.5)
+                        continue
+                    if hasattr(client, '_refresh_cookie_on_403'):
+                        client._refresh_cookie_on_403()
+                        time.sleep(1)
+                        continue
+
                 error_detail = f"API error {response.status_code}: {error_text}"
                 self.log(f"❌ Integrate API error {response.status_code}")
-                
                 try:
                     setattr(client, "last_error_detail", error_detail)
                     setattr(client, "last_error", f"API error {response.status_code}")
                 except Exception:
                     pass
                 return False
-            
-            # ✅ Parse JSON response với error handling
-            try:
-                result = response.json()
-            except Exception as e:
-                error_msg = f"Lỗi parse JSON: {str(e)}"
-                self.log(f"❌ Integrate parse JSON error: {error_msg}")
-                try:
-                    setattr(client, "last_error_detail", error_msg)
-                    setattr(client, "last_error", error_msg)
-                except Exception:
-                    pass
+
+            if result is None:
                 return False
             
             operations = result.get('operations', [])
@@ -35929,52 +37108,60 @@ QUAN TRỌNG:
                     "videoModelKey": reference_model_key
                 })
             
-            # ✅ Thêm sessionId theo format: ";timestamp"
-            session_id = f";{int(time.time() * 1000)}"
-            client_context = {
-                "projectId": str(uuid.uuid4()),
-                "tool": tool,
-                "userPaygateTier": tier,
-                "sessionId": session_id,  # ✅ Thêm sessionId theo format WebUI
-            }
-            # ✅ recaptchaToken cho generate video (không phải log / operation)
-            try:
-                # ✅ Dùng trực tiếp client hiện tại để inject recaptchaToken (đã có session và cookies đúng)
-                if hasattr(client, '_maybe_inject_recaptcha'):
-                    self.log(f"🔐 Đang inject recaptchaToken cho task {idx}...")
-                    client._maybe_inject_recaptcha(client_context)
-                    if "recaptchaToken" in client_context:
-                        self.log(f"✅ Đã inject recaptchaToken thành công (length: {len(client_context.get('recaptchaToken', ''))})")
-                    else:
-                        self.log(f"⚠️ recaptchaToken không được inject vào client_context")
-                else:
-                    self.log(f"⚠️ Client không có method _maybe_inject_recaptcha")
-            except Exception as e:
-                # Log lỗi để debug
-                import traceback
-                self.log(f"❌ Lỗi inject recaptchaToken: {e}")
-                self.log(f"   Traceback: {traceback.format_exc()[:300]}")
-
-            payload = {
-                "mediaGenerationContext": {"batchId": str(uuid.uuid4())},
-                "clientContext": client_context,
-                "requests": requests_body,
-                "useV2ModelConfig": True,
-            }
-            
-            headers = client._aisandbox_headers()
-            # ✅ Dùng data thay vì json để giữ Content-Type text/plain;charset=UTF-8 từ headers
             import json as json_module
-            payload_json = json_module.dumps(payload)
-            
-            response = client.session.post(url, headers=headers, data=payload_json, timeout=120)
-            
-            if response.status_code != 200:
+            result = None
+            max_ref_retries = 4
+            for ref_attempt in range(max_ref_retries):
+                session_id = f";{int(time.time() * 1000)}"
+                client_context = {
+                    "projectId": str(uuid.uuid4()),
+                    "tool": tool,
+                    "userPaygateTier": tier,
+                    "sessionId": session_id,
+                }
+                try:
+                    if hasattr(client, '_maybe_inject_recaptcha'):
+                        self.log(f"🔐 Đang inject recaptchaToken cho task {idx}...")
+                        client._maybe_inject_recaptcha(client_context)
+                        if hasattr(client, '_convert_to_recaptcha_context'):
+                            client._convert_to_recaptcha_context(client_context)
+                except Exception as e:
+                    import traceback
+                    self.log(f"❌ Lỗi inject recaptchaToken: {e}")
+                    self.log(f"   Traceback: {traceback.format_exc()[:300]}")
+                    return None
+
+                payload = {
+                    "mediaGenerationContext": {"batchId": str(uuid.uuid4())},
+                    "clientContext": client_context,
+                    "requests": requests_body,
+                    "useV2ModelConfig": True,
+                }
+
+                headers = client._aisandbox_headers()
+                payload_json = json_module.dumps(payload)
+                response = client.session.post(url, headers=headers, data=payload_json, timeout=120)
+
+                if response.status_code == 200:
+                    result = response.json()
+                    break
+
                 error_text = response.text[:500] if hasattr(response, 'text') else ""
+                if response.status_code == 403 and hasattr(client, '_handle_403_with_proxy_priority'):
+                    self.log(f"⚠️ Integrate API 403 - ưu tiên rotate/apply proxy (attempt {ref_attempt + 1}/{max_ref_retries})")
+                    if client._handle_403_with_proxy_priority(error_text[:200]):
+                        time.sleep(0.5)
+                        continue
+                    if hasattr(client, '_refresh_cookie_on_403'):
+                        client._refresh_cookie_on_403()
+                        time.sleep(1)
+                        continue
+
                 self.log(f"❌ Integrate API error {response.status_code}")
                 return None
-            
-            result = response.json()
+
+            if result is None:
+                return None
             operations = result.get('operations', [])
             
             if not operations:
@@ -39463,55 +40650,72 @@ OUTPUT: Định dạng plain text, không có JSON, không có markdown, không 
             
             ref_limit = self.get_plan_limit("reference_images_per_prompt")
             limited_media_ids = media_ids[:ref_limit] if (ref_limit and media_ids) else media_ids
-            # ✅ Thêm sessionId theo format: ";timestamp"
-            session_id = f";{int(_time.time() * 1000)}"
-            client_context = {
-                "tool": tool,
-                "userPaygateTier": "PAYGATE_TIER_TWO",
-                "sessionId": session_id,  # ✅ Thêm sessionId theo format WebUI
-            }
-            # ✅ recaptchaToken cho reference images (không phải log / operation)
-            try:
-                # ✅ Dùng trực tiếp client hiện tại để inject recaptchaToken (đã có session và cookies đúng)
-                if hasattr(client, '_maybe_inject_recaptcha'):
-                    client._maybe_inject_recaptcha(client_context)
-            except Exception as e:
-                # Log lỗi để debug
-                self._sync_log_warning(f"⚠️ Lỗi inject recaptchaToken: {e}")
-
             prompt_text = prompt_text or ''
-            payload = {
-                "mediaGenerationContext": {"batchId": str(uuid.uuid4())},
-                "clientContext": client_context,
-                "requests": [{
-                    "aspectRatio": aspect_value,
-                    "metadata": {},  # ✅ Metadata rỗng theo format WebUI
-                    "referenceImages": [
-                        {
-                            "imageUsageType": "IMAGE_USAGE_TYPE_ASSET",
-                            "mediaId": mid
-                        } for mid in limited_media_ids
-                    ] if media_ids else [],
-                    "seed": int(_time.time()) % 100000,
-                    "textInput": {
-                        "structuredPrompt": {
-                            "parts": [{"text": prompt_text.strip()}]
-                        }
-                    },  # ✅ Dùng structuredPrompt theo format WebUI
-                    "videoModelKey": reference_model_key
-                }],
-                "useV2ModelConfig": True,
-            }
-            
-            self._sync_log_info(f"🚀 Đang gửi request tạo video {index}...")
-            headers = client._aisandbox_headers()
-            response = client.session.post(url, headers=headers, json=payload, timeout=120)
-            
-            if response.status_code != 200:
+            result = None
+            max_ref_retries = 4
+            for ref_attempt in range(max_ref_retries):
+                session_id = f";{int(_time.time() * 1000)}"
+                client_context = {
+                    "tool": tool,
+                    "userPaygateTier": "PAYGATE_TIER_TWO",
+                    "sessionId": session_id,
+                }
+                try:
+                    if hasattr(client, '_maybe_inject_recaptcha'):
+                        client._maybe_inject_recaptcha(client_context)
+                        if hasattr(client, '_convert_to_recaptcha_context'):
+                            client._convert_to_recaptcha_context(client_context)
+                except Exception as e:
+                    self._sync_log_warning(f"⚠️ Lỗi inject recaptchaToken: {e}")
+                    return None
+
+                payload = {
+                    "mediaGenerationContext": {"batchId": str(uuid.uuid4())},
+                    "clientContext": client_context,
+                    "requests": [{
+                        "aspectRatio": aspect_value,
+                        "metadata": {},
+                        "referenceImages": [
+                            {
+                                "imageUsageType": "IMAGE_USAGE_TYPE_ASSET",
+                                "mediaId": mid
+                            } for mid in limited_media_ids
+                        ] if media_ids else [],
+                        "seed": int(_time.time()) % 100000,
+                        "textInput": {
+                            "structuredPrompt": {
+                                "parts": [{"text": prompt_text.strip()}]
+                            }
+                        },
+                        "videoModelKey": reference_model_key
+                    }],
+                    "useV2ModelConfig": True,
+                }
+                
+                self._sync_log_info(f"🚀 Đang gửi request tạo video {index}...")
+                headers = client._aisandbox_headers()
+                response = client.session.post(url, headers=headers, json=payload, timeout=120)
+
+                if response.status_code == 200:
+                    result = response.json()
+                    break
+
+                error_text = response.text[:500] if hasattr(response, 'text') else ""
+                if response.status_code == 403 and hasattr(client, '_handle_403_with_proxy_priority'):
+                    self._sync_log_warning(f"⚠️ R2V API 403 - ưu tiên rotate/apply proxy (attempt {ref_attempt + 1}/{max_ref_retries})")
+                    if client._handle_403_with_proxy_priority(error_text[:200]):
+                        _time.sleep(0.5)
+                        continue
+                    if hasattr(client, '_refresh_cookie_on_403'):
+                        client._refresh_cookie_on_403()
+                        _time.sleep(1)
+                        continue
+
                 self._sync_log_error(f"❌ API error: {response.status_code}")
                 return None
-            
-            result = response.json()
+
+            if result is None:
+                return None
             operations = result.get('operations', [])
             
             if not operations:
@@ -42304,15 +43508,7 @@ Requirements:
                     row = self.prompts_table.rowCount()
                     self.prompts_table.insertRow(row)
                     
-                    # Checkbox
-                    chk = QCheckBox()
-                    chk.setChecked(False)
-                    chk_widget = QWidget()
-                    chk_layout = QHBoxLayout(chk_widget)
-                    chk_layout.addWidget(chk)
-                    chk_layout.setAlignment(Qt.AlignCenter)
-                    chk_layout.setContentsMargins(0, 0, 0, 0)
-                    self.prompts_table.setCellWidget(row, 0, chk_widget)
+                    self.prompts_table.setItem(row, 0, self._create_prompt_stt_item(i))
                     
                     # Prompt text (read from JSON file)
                     try:
@@ -42323,9 +43519,9 @@ Requirements:
                         max_display_length = 120
                     if prompt_text:
                         if len(prompt_text) > max_display_length:
-                            display_text = f'Video {i:02d}: {prompt_text[:max_display_length]}...'
+                            display_text = f'{prompt_text[:max_display_length]}...'
                         else:
-                            display_text = f'Video {i:02d}: {prompt_text}'
+                            display_text = prompt_text
                     else:
                         display_text = f'Video {i:02d}: {vid_file.name}'
                     
@@ -44469,17 +45665,12 @@ Requirements:
                 self.log(f"✅ Rebuilt: {len(self.current_tasks)} tasks từ table")
                 self._update_task_metadata_cache(self.current_tasks, reset=True)
             
-            # Collect all tasks with checkbox
+            # Collect all tasks from table rows
             all_tasks = []
             
             for row in range(self.prompts_table.rowCount()):
-                # Get checkbox
-                chk_widget = self.prompts_table.cellWidget(row, 0)
-                if chk_widget:
-                    chk = chk_widget.findChild(QCheckBox)
-                
-                    # Get FULL prompt từ current_tasks (không bị truncate)
-                    task_index = row + 1
+                chk = None
+                task_index = row + 1
                 if task_index <= len(self.current_tasks):
                     task_obj = self.current_tasks[task_index - 1]
                     prompt_text = task_obj.prompt_text  # FULL prompt text
@@ -45674,6 +46865,9 @@ Requirements:
                     
                     # Lưu cookies sau khi validate
                     self.cookies_list = parsed_cookies
+                    self.cookie_profile_paths = []
+                    self.cookie_emails = []
+                    self.cookie_passwords = []
                     
                     # Apply plan cookie limit nếu có
                     if hasattr(self, '_apply_plan_cookie_limit'):
@@ -46773,10 +47967,9 @@ Requirements:
             self.log(traceback.format_exc())
     
     def on_header_clicked(self, logical_index):
-        """Xử lý click vào header - cột 0 (checkbox) để chọn tất cả"""
+        """Xử lý click vào header cột STT để chọn/bỏ chọn tất cả"""
         try:
-            if logical_index == 0:  # Cột checkbox
-                # Kiểm tra xem có prompts nào không
+            if logical_index == 0:  # Cột STT
                 if self.prompts_table.rowCount() == 0:
                     QMessageBox.information(
                         self,
@@ -46785,52 +47978,30 @@ Requirements:
                         "💡 Vui lòng chọn file input trước."
                     )
                     return
-                
-                # Toggle tất cả checkboxes
-                all_checked = True
-                for row in range(self.prompts_table.rowCount()):
-                    chk_widget = self.prompts_table.cellWidget(row, 0)
-                    if chk_widget:
-                        chk = chk_widget.findChild(QCheckBox)
-                        if chk and not chk.isChecked():
-                            all_checked = False
-                            break
-                
-                # Nếu tất cả đã checked thì uncheck, ngược lại thì check
-                for row in range(self.prompts_table.rowCount()):
-                    chk_widget = self.prompts_table.cellWidget(row, 0)
-                    if chk_widget:
-                        chk = chk_widget.findChild(QCheckBox)
-                        if chk:
-                            chk.setChecked(not all_checked)
-                
-                action = "Bỏ chọn" if all_checked else "Chọn"
-                self.log(f"✅ Đã {action} tất cả {self.prompts_table.rowCount()} prompts")
+                selected_count = len(self.prompts_table.selectionModel().selectedRows())
+                if selected_count == self.prompts_table.rowCount():
+                    self.prompts_table.clearSelection()
+                    self.log(f"✅ Đã bỏ chọn {self.prompts_table.rowCount()} prompts")
+                else:
+                    self.prompts_table.selectAll()
+                    self.log(f"✅ Đã chọn {self.prompts_table.rowCount()} prompts")
             
         except Exception as e:
             self.log(f"❌ Lỗi header click: {e}")
     
     
     def on_clear_all_prompts(self):
-        """Xóa các prompts đã được chọn (checkbox) trong table"""
+        """Xóa các prompts đang được chọn trong table"""
         try:
-            # Collect selected rows (checked checkboxes)
-            selected_rows = []
-            
-            for row in range(self.prompts_table.rowCount()):
-                # Get checkbox
-                chk_widget = self.prompts_table.cellWidget(row, 0)
-                if chk_widget:
-                    chk = chk_widget.findChild(QCheckBox)
-                    if chk and chk.isChecked():
-                        selected_rows.append(row)
+            selection_model = self.prompts_table.selectionModel()
+            selected_rows = sorted({index.row() for index in selection_model.selectedRows()}) if selection_model else []
             
             if not selected_rows:
                 QMessageBox.information(
                     self,
                     "ℹ️ Thông Báo",
                     "Chưa chọn prompt nào để xóa!\n\n"
-                    "💡 Tick vào checkbox của các dòng muốn xóa rồi thử lại."
+                    "💡 Chọn các dòng trong bảng rồi thử lại."
                 )
                 return
             
@@ -47453,6 +48624,9 @@ Requirements:
                     if cookie_strings:
                         # Update app cookies với tất cả cookies
                         self.cookies_list = cookie_strings
+                        self.cookie_profile_paths = []
+                        self.cookie_emails = []
+                        self.cookie_passwords = []
                         self._apply_plan_cookie_limit()
                         self.cookie_value = cookie_strings[0] if cookie_strings else ""  # Giữ backward compatibility
                         
@@ -47473,6 +48647,9 @@ Requirements:
                         
                         if cookie_string:
                             self.cookies_list = [cookie_string]
+                            self.cookie_profile_paths = []
+                            self.cookie_emails = []
+                            self.cookie_passwords = []
                             self._apply_plan_cookie_limit()
                             self.cookie_value = cookie_string
                             

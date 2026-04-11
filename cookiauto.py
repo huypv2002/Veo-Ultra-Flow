@@ -23,12 +23,28 @@ def _disable_beep():
     """Disable beep sounds (no-op on macOS)"""
     pass
 
-# Add parent path for imports (only in development mode)
+# Ưu tiên import module cùng thư mục gui_app_clone trước, rồi mới tới parent.
+# Điều này tránh ăn nhầm các file trùng tên ở thư mục root (vd: proxy_manager.py cũ).
 try:
-    sys.path.insert(0, str(Path(__file__).parent.parent))
+    current_dir = str(Path(__file__).parent)
+    parent_dir = str(Path(__file__).parent.parent)
+    if current_dir not in sys.path:
+        sys.path.insert(0, current_dir)
+    if parent_dir not in sys.path:
+        sys.path.insert(1, parent_dir)
 except NameError:
     # __file__ doesn't exist in Nuitka compiled mode
     pass
+
+from chrome_profile_utils import (
+    resolve_chrome_profile,
+    get_cookie_db_candidates,
+    is_managed_profile_path,
+    get_default_system_chrome_profile_path,
+    get_tool_system_chrome_profile_path,
+    get_tool_account_profile_path,
+    is_shared_system_chrome_profile_path,
+)
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -157,6 +173,11 @@ except NameError:
 PROFILES_DIR = APP_DATA_DIR / "profiles"
 CONFIG_FILE = APP_DATA_DIR / "config.json"
 DB_FILE = APP_DATA_DIR / "accounts.db"
+
+
+def _resolved_profile_storage_path(profile_path: str) -> Path:
+    info = resolve_chrome_profile(profile_path)
+    return Path(info["profile_storage_path"] or profile_path).expanduser()
 DEFAULT_EXPORT_NAME = "cookies_export.txt"
 
 # === ENSURE ALL REQUIRED DIRECTORIES AND FILES EXIST ===
@@ -244,14 +265,23 @@ def init_db():
         print(f"DB Init Error: {e}")
 
 def db_add_account(email: str, password: str, profile_path: str):
-    """Add or update account in DB"""
+    """Add or update account in DB while preserving cookies/credits/api_key/proxy_config."""
     try:
         import sqlite3
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
         created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        c.execute("INSERT OR REPLACE INTO accounts (email, password, profile_path, created_at) VALUES (?, ?, ?, ?)",
-                  (email, password, profile_path, created_at))
+        email = (email or "").strip()
+        password = password or ""
+        profile_path = profile_path or ""
+        c.execute("""
+            INSERT INTO accounts (email, password, profile_path, created_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(email) DO UPDATE SET
+                password = excluded.password,
+                profile_path = excluded.profile_path,
+                created_at = excluded.created_at
+        """, (email, password, profile_path, created_at))
         conn.commit()
         conn.close()
     except Exception as e:
@@ -267,10 +297,40 @@ def db_get_all_accounts() -> List[dict]:
         
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
+
+        def _normalize_profile_path(email_value: str, raw_profile_path: str) -> str:
+            current = (raw_profile_path or "").strip()
+            if not current:
+                migrated = get_tool_account_profile_path(email_value)
+                try:
+                    c.execute(
+                        "UPDATE accounts SET profile_path = ? WHERE email = ?",
+                        (migrated, email_value),
+                    )
+                    conn.commit()
+                    print(f"[DB MIGRATE EMPTY] {email_value}: -> {migrated}")
+                except Exception as migrate_err:
+                    print(f"[DB MIGRATE EMPTY ERROR] {email_value}: {migrate_err}")
+                return migrated
+            if is_shared_system_chrome_profile_path(current):
+                migrated = get_tool_account_profile_path(email_value)
+                try:
+                    c.execute(
+                        "UPDATE accounts SET profile_path = ? WHERE email = ?",
+                        (migrated, email_value),
+                    )
+                    conn.commit()
+                    print(f"[DB MIGRATE] {email_value}: {current} -> {migrated}")
+                except Exception as migrate_err:
+                    print(f"[DB MIGRATE ERROR] {email_value}: {migrate_err}")
+                return migrated
+            return current
+
         # Try to select credits and proxy_config as well
         try:
             c.execute("SELECT email, password, profile_path, credits, proxy_config FROM accounts ORDER BY created_at DESC")
             for row in c.fetchall():
+                normalized_profile_path = _normalize_profile_path(row[0], row[2])
                 proxy_config = None
                 if row[4]:  # proxy_config column
                     try:
@@ -280,7 +340,7 @@ def db_get_all_accounts() -> List[dict]:
                 accounts.append({
                     'email': row[0],
                     'password': row[1],
-                    'profile_path': row[2],
+                    'profile_path': normalized_profile_path,
                     'credits': row[3] if row[3] is not None else 0,
                     'proxy_config': proxy_config,
                     'selected': True,
@@ -291,10 +351,11 @@ def db_get_all_accounts() -> List[dict]:
              try:
                  c.execute("SELECT email, password, profile_path, credits FROM accounts ORDER BY created_at DESC")
                  for row in c.fetchall():
+                    normalized_profile_path = _normalize_profile_path(row[0], row[2])
                     accounts.append({
                         'email': row[0],
                         'password': row[1],
-                        'profile_path': row[2],
+                        'profile_path': normalized_profile_path,
                         'credits': row[3] if row[3] is not None else 0,
                         'proxy_config': None,
                         'selected': True,
@@ -303,10 +364,11 @@ def db_get_all_accounts() -> List[dict]:
              except sqlite3.OperationalError:
                  c.execute("SELECT email, password, profile_path FROM accounts ORDER BY created_at DESC")
                  for row in c.fetchall():
+                    normalized_profile_path = _normalize_profile_path(row[0], row[2])
                     accounts.append({
                         'email': row[0],
                         'password': row[1],
-                        'profile_path': row[2],
+                        'profile_path': normalized_profile_path,
                         'credits': 0,
                         'proxy_config': None,
                         'selected': True,
@@ -449,7 +511,7 @@ class AddAccountDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Thêm Tài Khoản Mới")
-        self.setMinimumWidth(400)
+        self.setMinimumWidth(560)
         
         layout = QVBoxLayout(self)
         
@@ -460,9 +522,18 @@ class AddAccountDialog(QDialog):
         self.txt_password = QLineEdit()
         self.txt_password.setEchoMode(QLineEdit.Password)
         self.txt_password.setPlaceholderText("Password (tùy chọn)")
+        self.txt_profile_path = QLineEdit()
+        self.txt_profile_path.setPlaceholderText("Để trống = tự tạo profile riêng cố định cho account này (khuyên dùng)")
+        self.txt_profile_path.setText("")
+        self.btn_browse_profile = QPushButton("Chọn...")
+        self.btn_browse_profile.clicked.connect(self._browse_profile_path)
+        profile_row = QHBoxLayout()
+        profile_row.addWidget(self.txt_profile_path)
+        profile_row.addWidget(self.btn_browse_profile)
         
         form.addRow("Email:", self.txt_email)
         form.addRow("Password:", self.txt_password)
+        form.addRow("Profile Chrome:", profile_row)
         layout.addLayout(form)
         
         # Buttons
@@ -479,9 +550,22 @@ class AddAccountDialog(QDialog):
         btn_box.addWidget(self.btn_cancel)
         btn_box.addWidget(self.btn_add_run)
         layout.addLayout(btn_box)
+
+    def _browse_profile_path(self):
+        selected = QFileDialog.getExistingDirectory(
+            self,
+            "Chọn thư mục profile Chrome",
+            str(Path.home() / "Library" / "Application Support" / "Google" / "Chrome")
+        )
+        if selected:
+            self.txt_profile_path.setText(selected)
         
     def get_data(self):
-        return self.txt_email.text().strip(), self.txt_password.text().strip()
+        return (
+            self.txt_email.text().strip(),
+            self.txt_password.text().strip(),
+            self.txt_profile_path.text().strip(),
+        )
 
 
 class ManualCookieDialog(QDialog):
@@ -663,7 +747,7 @@ class ManualCookieDialog(QDialog):
 
 
 class ProxyDialog(QDialog):
-    """Dialog cấu hình proxy cho account - hỗ trợ 5 loại proxy."""
+    """Dialog cấu hình proxy cho account - chỉ hỗ trợ proxy thật."""
 
     def __init__(self, parent=None, email: str = "", current_proxy: Optional[Dict[str, str]] = None):
         super().__init__(parent)
@@ -694,7 +778,7 @@ class ProxyDialog(QDialog):
         layout.setSpacing(8)
         layout.setContentsMargins(15, 12, 15, 12)
 
-        # ── Radio buttons cho 5 loại proxy ──
+        # ── Radio buttons cho các loại proxy được hỗ trợ ──
         from PySide6.QtWidgets import QButtonGroup
         self._radio_group = QButtonGroup(self)
 
@@ -702,8 +786,7 @@ class ProxyDialog(QDialog):
             ("none",     "🚫 Không dùng (IP gốc)"),
             ("static",   "📌 Proxy Tĩnh"),
             ("rotating", "🔄 Proxy Xoay"),
-            ("warp",     "☁ WARP (Cloudflare 1.1.1.1)"),
-            ("tor",      "🧅 Tor Network"),
+            ("proxyvn",  "🇻🇳 Proxy.vn Key Xoay"),
         ]
         self._radios: Dict[str, Any] = {}
         for idx, (key, label) in enumerate(radio_data):
@@ -775,39 +858,32 @@ class ProxyDialog(QDialog):
         rl.addWidget(info_r)
         self._stack.addWidget(page_rotating)
 
-        # Page 3: WARP
-        page_warp = QWidget()
-        wl = QVBoxLayout(page_warp)
-        wl.setContentsMargins(0, 5, 0, 0)
-        wl.addWidget(QLabel("WARP sử dụng Cloudflare 1.1.1.1 qua SOCKS5 local."))
-        form_w = QFormLayout()
-        self.spin_warp_port = QSpinBox()
-        self.spin_warp_port.setRange(1024, 65535)
-        self.spin_warp_port.setValue(40000)
-        form_w.addRow("SOCKS5 Port:", self.spin_warp_port)
-        wl.addLayout(form_w)
-        info_w = QLabel("ℹ Cần cài warp-cli và chạy: warp-cli connect\n   Proxy mode: warp-cli set-mode proxy --port 40000")
-        info_w.setStyleSheet("color: #888; font-size: 10px; font-style: italic;")
-        wl.addWidget(info_w)
-        wl.addStretch()
-        self._stack.addWidget(page_warp)
-
-        # Page 4: Tor
-        page_tor = QWidget()
-        tl = QVBoxLayout(page_tor)
-        tl.setContentsMargins(0, 5, 0, 0)
-        tl.addWidget(QLabel("Tor Network qua SOCKS5 local."))
-        form_t = QFormLayout()
-        self.spin_tor_port = QSpinBox()
-        self.spin_tor_port.setRange(1024, 65535)
-        self.spin_tor_port.setValue(9050)
-        form_t.addRow("SOCKS5 Port:", self.spin_tor_port)
-        tl.addLayout(form_t)
-        info_t = QLabel("ℹ Cần cài Tor và chạy tor service.\n   macOS: brew install tor && brew services start tor")
-        info_t.setStyleSheet("color: #888; font-size: 10px; font-style: italic;")
-        tl.addWidget(info_t)
-        tl.addStretch()
-        self._stack.addWidget(page_tor)
+        # Page 3: proxy.vn key xoay
+        page_proxyvn = QWidget()
+        pvl = QVBoxLayout(page_proxyvn)
+        pvl.setContentsMargins(0, 5, 0, 0)
+        form_pv = QFormLayout()
+        self.txt_proxyvn_key = QLineEdit()
+        self.txt_proxyvn_key.setPlaceholderText("Nhập key xoay từ proxy.vn")
+        form_pv.addRow("Key xoay:", self.txt_proxyvn_key)
+        self.txt_proxyvn_nhamang = QLineEdit()
+        self.txt_proxyvn_nhamang.setPlaceholderText("Random | viettel | fpt | vnpt")
+        form_pv.addRow("Nhà mạng:", self.txt_proxyvn_nhamang)
+        self.txt_proxyvn_tinhthanh = QLineEdit()
+        self.txt_proxyvn_tinhthanh.setPlaceholderText("0 = Random, hoặc mã tỉnh theo docs proxy.vn")
+        form_pv.addRow("Tỉnh/thành:", self.txt_proxyvn_tinhthanh)
+        self.txt_proxyvn_whitelist = QLineEdit()
+        self.txt_proxyvn_whitelist.setPlaceholderText("IPv4 whitelist (tuỳ chọn)")
+        form_pv.addRow("Whitelist:", self.txt_proxyvn_whitelist)
+        self.txt_proxyvn_protocol = QLineEdit()
+        self.txt_proxyvn_protocol.setPlaceholderText("http hoặc socks5")
+        form_pv.addRow("Protocol:", self.txt_proxyvn_protocol)
+        pvl.addLayout(form_pv)
+        info_pv = QLabel("ℹ Proxy.vn key xoay: app sẽ gọi API get.php để lấy proxy mới ở lần dùng proxy đầu tiên hoặc khi cần rotate sau 403.")
+        info_pv.setWordWrap(True)
+        info_pv.setStyleSheet("color: #888; font-size: 10px; font-style: italic;")
+        pvl.addWidget(info_pv)
+        self._stack.addWidget(page_proxyvn)
 
         # ── Status + Buttons ──
         self.lbl_status = QLabel("")
@@ -841,8 +917,11 @@ class ProxyDialog(QDialog):
         self.txt_rotating_server.setText(c.rotating_server)
         self.txt_rotating_user.setText(c.rotating_username)
         self.txt_rotating_pass.setText(c.rotating_password)
-        self.spin_warp_port.setValue(c.warp_port)
-        self.spin_tor_port.setValue(c.tor_port)
+        self.txt_proxyvn_key.setText(c.proxyvn_key)
+        self.txt_proxyvn_nhamang.setText(c.proxyvn_nhamang)
+        self.txt_proxyvn_tinhthanh.setText(c.proxyvn_tinhthanh)
+        self.txt_proxyvn_whitelist.setText(c.proxyvn_whitelist)
+        self.txt_proxyvn_protocol.setText(c.proxyvn_protocol)
         self._on_type_changed()
 
     def _get_selected_type(self) -> str:
@@ -852,7 +931,7 @@ class ProxyDialog(QDialog):
         return "none"
 
     def _on_type_changed(self):
-        type_map = {"none": 0, "static": 1, "rotating": 2, "warp": 3, "tor": 4}
+        type_map = {"none": 0, "static": 1, "rotating": 2, "proxyvn": 3}
         idx = type_map.get(self._get_selected_type(), 0)
         self._stack.setCurrentIndex(idx)
 
@@ -914,8 +993,11 @@ class ProxyDialog(QDialog):
             rotating_server=self.txt_rotating_server.text().strip(),
             rotating_username=self.txt_rotating_user.text().strip(),
             rotating_password=self.txt_rotating_pass.text().strip(),
-            warp_port=self.spin_warp_port.value(),
-            tor_port=self.spin_tor_port.value(),
+            proxyvn_key=self.txt_proxyvn_key.text().strip(),
+            proxyvn_nhamang=self.txt_proxyvn_nhamang.text().strip() or "Random",
+            proxyvn_tinhthanh=self.txt_proxyvn_tinhthanh.text().strip() or "0",
+            proxyvn_whitelist=self.txt_proxyvn_whitelist.text().strip(),
+            proxyvn_protocol=(self.txt_proxyvn_protocol.text().strip() or "http").lower(),
         )
 
     def get_data(self) -> Optional[Dict[str, str]]:
@@ -1342,8 +1424,6 @@ async def _get_global_browser_async(headless: bool = False) -> Any:
                         '--disable-blink-features=AutomationControlled',
                         '--disable-extensions',
                         '--disable-infobars',
-                        '--disable-sync',
-                        '--disable-signin-promo',
                         '--disable-features=Translate,OptimizationGuideModelDownloading,OptimizationHints,InteractiveWindowOcclusion',
                         '--password-store=basic',
                         '--use-mock-keychain',
@@ -1471,16 +1551,19 @@ class CookieWorker(QThread):
                 
                 # Profile path
                 if not profile_path:
-                    safe_email = email.replace("@", "_at_").replace(".", "_")
-                    profile_path = str(PROFILES_DIR / safe_email)
-                    self.log.emit(f"   ⚠️ [{email}] Tạo profile mới: {profile_path}")
-                elif not Path(profile_path).exists():
-                    self.log.emit(f"   ❌ [{email}] Profile không tồn tại: {profile_path}")
-                    self.account_failed.emit(email)
-                    self.progress.emit(idx + 1, total, email)
-                    return
-                
-                Path(profile_path).mkdir(parents=True, exist_ok=True)
+                    profile_path = get_tool_account_profile_path(email)
+                    self.log.emit(f"   ⚠️ [{email}] Dùng profile Chrome riêng cho tool: {profile_path}")
+
+                profile_dir = Path(profile_path)
+                if not profile_dir.exists():
+                    try:
+                        profile_dir.mkdir(parents=True, exist_ok=True)
+                        self.log.emit(f"   📁 [{email}] Đã tạo profile dir: {profile_path}")
+                    except Exception as mkdir_err:
+                        self.log.emit(f"   ❌ [{email}] Không thể tạo profile dir: {profile_path} ({mkdir_err})")
+                        self.account_failed.emit(email)
+                        self.progress.emit(idx + 1, total, email)
+                        return
                 
                 # Tính vị trí cửa sổ
                 win_w, win_h = 500, 600
@@ -1501,6 +1584,7 @@ class CookieWorker(QThread):
                 )
                 
                 try:
+                    keep_session_alive = False
                     cookies = session.extract_cookies(
                         email=email,
                         password=password,
@@ -1510,7 +1594,9 @@ class CookieWorker(QThread):
                     if cookies:
                         with results_lock:
                             results[email] = cookies
+                        keep_session_alive = True
                         self.log.emit(f"   ✅ [{email}] Lấy được {len(cookies)} cookies!")
+                        self.log.emit(f"   🔗 [{email}] Giữ Chrome/profile đang mở để tái dùng cho reCAPTCHA token")
                         self.ui_log.emit(f"🍪 Done - {email}")
                         self.account_done.emit(email, cookies)
                     else:
@@ -1523,7 +1609,10 @@ class CookieWorker(QThread):
                     self.ui_log.emit(f"🍪 Fail - {email}")
                     self.account_failed.emit(email)
                 finally:
-                    session.close()
+                    try:
+                        session.close(keep_process=keep_session_alive)
+                    except Exception:
+                        pass
                     
                     if self.delay > 0:
                         time.sleep(self.delay)
@@ -1640,26 +1729,25 @@ class CookieWorker(QThread):
                 self.log.emit(f"📂 [{idx+1}/{total}] Bắt đầu: {email}")
                 self.ui_log.emit(f"📂 [{idx+1}/{total}] Bắt đầu: {email}")
                 
-                # ✅ CRITICAL: Đảm bảo dùng đúng profile_path từ account dict (KHÔNG tự tạo mới)
-                # Nếu profile_path không tồn tại → báo lỗi (không tự tạo)
-                safe_email = email.replace("@", "_at_").replace(".", "_")
+                # ✅ CRITICAL: Đảm bảo dùng đúng profile_path từ account dict
                 if not profile_path:
-                    # Nếu không có profile_path trong account dict → tạo mới (chỉ cho account mới)
-                    profile_path = str(PROFILES_DIR / safe_email)
-                    self.log.emit(f"   ⚠️ [{email}] Không có profile_path trong account dict → Tạo mới: {profile_path}")
-                elif not Path(profile_path).exists():
-                    # Profile path không tồn tại → báo lỗi
-                    self.log.emit(f"   ❌ [{email}] Profile path không tồn tại: {profile_path}")
-                    self.ui_log.emit(f"🍪 Fail - {email} (Profile không tồn tại)")
-                    self.account_failed.emit(email)
-                    self.progress.emit(idx + 1, total, email)
-                    return
+                    profile_path = get_tool_account_profile_path(email)
+                    self.log.emit(f"   ⚠️ [{email}] Không có profile_path trong account dict → dùng profile Chrome riêng cho tool: {profile_path}")
+
+                profile_dir = Path(profile_path)
+                if not profile_dir.exists():
+                    try:
+                        profile_dir.mkdir(parents=True, exist_ok=True)
+                        self.log.emit(f"   📁 [{email}] Đã tạo profile dir: {profile_path}")
+                    except Exception as mkdir_err:
+                        self.log.emit(f"   ❌ [{email}] Không thể tạo profile dir: {profile_path} ({mkdir_err})")
+                        self.ui_log.emit(f"🍪 Fail - {email} (Không tạo được profile)")
+                        self.account_failed.emit(email)
+                        self.progress.emit(idx + 1, total, email)
+                        return
                 else:
                     # ✅ Profile path tồn tại → dùng đúng profile này
                     self.log.emit(f"   ✅ [{email}] Dùng profile đã có: {profile_path}")
-                
-                # Đảm bảo thư mục tồn tại (nếu là profile mới)
-                Path(profile_path).mkdir(parents=True, exist_ok=True)
                 
                 # ✅ BƯỚC 1: Check if need login
                 # need_login = True nếu: force_login được bật HOẶC profile không có cookies
@@ -1669,6 +1757,79 @@ class CookieWorker(QThread):
                     self.log.emit(f"   🔐 [{email}] CẦN ĐĂNG NHẬP → Browser sẽ hiển thị (headless=False)")
                 else:
                     self.log.emit(f"   🍪 [{email}] KHÔNG CẦN ĐĂNG NHẬP → Browser sẽ chạy ngầm (headless=True)")
+
+                # ✅ Ưu tiên Chrome thật + CDP giống web_app:
+                # 1 account = 1 folder profile
+                # Login lưu vào chính profile đó
+                # Lấy cookie/token cũng mở lại đúng profile đó
+                try:
+                    from web_app.backend.chrome_cdp_cookie import ChromeCDPSession
+
+                    self.log.emit(f"   🚀 [{email}] Dùng Chrome CDP profile thật (ưu tiên, cùng cơ chế với web_app)...")
+
+                    proxy_server = None
+                    proxy_username = None
+                    proxy_password = None
+                    if self.use_proxy_pool:
+                        try:
+                            from proxy_manager import ProxyManager
+                            pm = ProxyManager.get_instance()
+                            if pm.is_enabled():
+                                proxy = pm.get_current_proxy()
+                                if proxy:
+                                    proxy_server = getattr(proxy, "server", None)
+                                    proxy_username = getattr(proxy, "username", None)
+                                    proxy_password = getattr(proxy, "password", None)
+                                    self.log.emit(f"   🌐 [{email}] Using proxy (CDP): {proxy_server}")
+                        except Exception as e:
+                            self.log.emit(f"   ⚠️ [{email}] Proxy pool error (CDP): {e}")
+
+                    def _cdp_log(msg: str):
+                        self.log.emit(msg)
+
+                    session = ChromeCDPSession(
+                        profile_path=profile_path,
+                        headless=not need_login,
+                        window_pos=(pos_x, pos_y),
+                        window_size=(500, 600),
+                        log_fn=_cdp_log,
+                        proxy_server=proxy_server,
+                        proxy_username=proxy_username,
+                        proxy_password=proxy_password,
+                    )
+
+                    try:
+                        keep_session_alive = False
+                        valid_cookies = await asyncio.to_thread(
+                            session.extract_cookies,
+                            email,
+                            password,
+                            self.force_login,
+                        )
+                        if valid_cookies:
+                            keep_session_alive = True
+                    finally:
+                        try:
+                            await asyncio.to_thread(session.close, keep_session_alive)
+                        except Exception:
+                            pass
+
+                    if valid_cookies:
+                        results[email] = valid_cookies
+                        self.log.emit(f"   ✅ [{email}] Lấy cookie bằng Chrome CDP thành công ({len(valid_cookies)} cookies)")
+                        self.log.emit(f"   🔗 [{email}] Giữ Chrome/profile đang mở để dùng lại lúc lấy reCAPTCHA token")
+                        self.ui_log.emit(f"🍪 Done - {email}")
+                        self.account_done.emit(email, valid_cookies)
+                    else:
+                        self.log.emit(f"   ❌ [{email}] Chrome CDP không lấy được cookie!")
+                        self.ui_log.emit(f"🍪 Fail - {email}")
+                        self.account_failed.emit(email)
+
+                    self.progress.emit(idx + 1, total, email)
+                    return
+
+                except Exception as cdp_err:
+                    self.log.emit(f"   ⚠️ [{email}] Chrome CDP flow lỗi, fallback Playwright: {str(cdp_err)[:80]}")
                 
                 context = None
                 
@@ -1707,8 +1868,6 @@ class CookieWorker(QThread):
                             '--disable-blink-features=AutomationControlled',
                             '--disable-extensions',
                             '--disable-infobars',
-                            '--disable-sync',
-                            '--disable-signin-promo',
                             '--disable-features=Translate,OptimizationGuideModelDownloading,OptimizationHints,InteractiveWindowOcclusion',
                             '--password-store=basic',
                             '--use-mock-keychain',
@@ -2022,32 +2181,19 @@ class CookieWorker(QThread):
     def _check_profile_has_cookies(self, profile_path: str) -> bool:
         """Check if profile already has valid Google cookies"""
         try:
-            profile = Path(profile_path)
-            
-            # Check for Local State (exists after browser first run)
-            local_state = profile / "Local State"
+            info = resolve_chrome_profile(profile_path)
+            user_data_dir = Path(info["user_data_dir"] or profile_path)
+
+            local_state = user_data_dir / "Local State"
             if not local_state.exists():
-                self.log.emit(f"   📋 No Local State - need login")
+                self.log.emit("   📋 No Local State - need login")
                 return False
-            
-            # Check Default folder
-            default_folder = profile / "Default"
-            if not default_folder.exists():
-                self.log.emit(f"   📋 No Default folder - need login")
-                return False
-            
-            # Check cookies file - Playwright stores at Default/Network/Cookies
-            cookies_file = default_folder / "Network" / "Cookies"
-            if cookies_file.exists() and cookies_file.stat().st_size > 1000:
-                self.log.emit(f"   📋 Has cookies ({cookies_file.stat().st_size} bytes) - headless OK")
-                return True
-            
-            # Also check old path just in case
-            old_cookies = default_folder / "Cookies"
-            if old_cookies.exists() and old_cookies.stat().st_size > 1000:
-                self.log.emit(f"   📋 Has cookies (old path, {old_cookies.stat().st_size} bytes) - headless OK")
-                return True
-            
+
+            for cookies_file in get_cookie_db_candidates(profile_path):
+                if cookies_file.exists() and cookies_file.stat().st_size > 1000:
+                    self.log.emit(f"   📋 Has cookies ({cookies_file.stat().st_size} bytes) - headless OK")
+                    return True
+
             self.log.emit(f"   📋 No/small cookies file - need login")
             return False
         except Exception as e:
@@ -2058,15 +2204,17 @@ class CookieWorker(QThread):
         """Kill any Chrome/Chromium process using this profile and clean locks"""
         import subprocess
         import platform
-        
-        profile_name = Path(profile_path).name
+
+        info = resolve_chrome_profile(profile_path)
+        user_data_dir = info["user_data_dir"] or profile_path
+        profile_name = Path(info["profile_storage_path"] or profile_path).name
         
         # Delete lock files first
         try:
             lock_files = [
-                Path(profile_path) / "SingletonLock",
-                Path(profile_path) / "SingletonSocket",
-                Path(profile_path) / "SingletonCookie",
+                Path(user_data_dir) / "SingletonLock",
+                Path(user_data_dir) / "SingletonSocket",
+                Path(user_data_dir) / "SingletonCookie",
             ]
             for lock_file in lock_files:
                 if lock_file.exists():
@@ -2112,7 +2260,7 @@ class CookieWorker(QThread):
                         )
                         
                         for line in result.stdout.split('\n'):
-                            if browser in line and profile_path in line:
+                            if browser in line and (user_data_dir in line or profile_name in line):
                                 parts = line.split()
                                 if len(parts) > 1:
                                     try:
@@ -2666,11 +2814,7 @@ class GetCookieJSWindow(QMainWindow):
                 if not email:
                     continue
                 
-                # Auto-generate profile path in AppData profiles folder
-                safe_email = email.replace("@", "_at_").replace(".", "_")
-                profile_path = PROFILES_DIR / safe_email
-                # Note: Profiles are now stored in fixed AppData location
-                # No fallback needed
+                profile_path = Path(get_tool_account_profile_path(email))
 
                 
                 self.accounts.append({
@@ -2707,11 +2851,9 @@ class GetCookieJSWindow(QMainWindow):
                 
                 # Tạo profile_path nếu chưa có
                 if not profile_path:
-                    safe_email = email.replace("@", "_at_").replace(".", "_")
-                    profile_path = str(PROFILES_DIR / safe_email)
+                    profile_path = get_tool_account_profile_path(email)
                     acc['profile_path'] = profile_path
-                    Path(profile_path).mkdir(parents=True, exist_ok=True)
-                    self._log(f"📂 [{email}] Tạo profile path mới: {profile_path}")  # Terminal only
+                    self._log(f"📂 [{email}] Dùng profile Chrome riêng cho tool: {profile_path}")  # Terminal only
                 
                 # Mở browser với profile này
                 self._open_browser_for_login(email, password, profile_path)
@@ -3822,15 +3964,15 @@ class GetCookieJSWindow(QMainWindow):
         """Add new account by opening custom dialog"""
         dialog = AddAccountDialog(self)
         if dialog.exec():
-            email, password = dialog.get_data()
+            email, password, selected_profile_path = dialog.get_data()
             if not email:
                 SilentMessageBox.warning(self, "Lỗi", "Email không được để trống!")
                 return
             
-            # Create profile path
-            safe_email = email.replace("@", "_at_").replace(".", "_")
-            profile_path = PROFILES_DIR / safe_email
-            profile_path.mkdir(exist_ok=True)
+            if selected_profile_path:
+                profile_path = Path(selected_profile_path).expanduser()
+            else:
+                profile_path = Path(get_tool_account_profile_path(email))
             
             # Save to DB
             db_add_account(email, password, str(profile_path))
@@ -4059,15 +4201,21 @@ class GetCookieJSWindow(QMainWindow):
         if not chrome_exe:
             SilentMessageBox.warning(self, "Lỗi", "Không tìm thấy Chrome!")
             return
+
+        profile_info = resolve_chrome_profile(profile_path)
+        user_data_dir = profile_info["user_data_dir"] or profile_path
+        profile_directory = profile_info["profile_directory"]
         
         # Launch Chrome with profile
         args = [
             chrome_exe,
-            f"--user-data-dir={profile_path}",
+            f"--user-data-dir={user_data_dir}",
             "--no-first-run",
             "--disable-blink-features=AutomationControlled",
             "https://accounts.google.com"
         ]
+        if profile_directory:
+            args.insert(2, f"--profile-directory={profile_directory}")
         
         try:
             if system == "Windows":
@@ -4083,10 +4231,14 @@ class GetCookieJSWindow(QMainWindow):
         """Kill Chrome processes đang dùng profile này (dùng ngoài CookieWorker)."""
         import subprocess as sp
         import platform
+
+        info = resolve_chrome_profile(profile_path)
+        user_data_dir = info["user_data_dir"] or profile_path
+        profile_name = Path(info["profile_storage_path"] or profile_path).name
         
         # Xóa lock files
         for lock_name in ["SingletonLock", "SingletonSocket", "SingletonCookie"]:
-            lock_file = Path(profile_path) / lock_name
+            lock_file = Path(user_data_dir) / lock_name
             try:
                 if lock_file.exists():
                     lock_file.unlink()
@@ -4094,7 +4246,6 @@ class GetCookieJSWindow(QMainWindow):
                 pass
         
         system = platform.system()
-        profile_name = Path(profile_path).name
         try:
             if system == "Windows":
                 for browser in ['chrome.exe', 'chromium.exe']:
@@ -4104,7 +4255,7 @@ class GetCookieJSWindow(QMainWindow):
                             capture_output=True, text=True, timeout=10, creationflags=0x08000000
                         )
                         for line in result.stdout.split('\n'):
-                            if profile_name in line or profile_path in line:
+                            if profile_name in line or user_data_dir in line:
                                 parts = line.strip().split()
                                 if parts:
                                     try:
@@ -4120,7 +4271,7 @@ class GetCookieJSWindow(QMainWindow):
                     ['ps', 'aux'], capture_output=True, text=True, timeout=10
                 )
                 for line in result.stdout.split('\n'):
-                    if ('Google Chrome' in line or 'Chromium' in line) and profile_path in line:
+                    if ('Google Chrome' in line or 'Chromium' in line) and (user_data_dir in line or profile_name in line):
                         parts = line.split()
                         if len(parts) > 1:
                             try:
@@ -4254,8 +4405,11 @@ class GetCookieJSWindow(QMainWindow):
         # 1. Xóa profile folder
         if profile_path and Path(profile_path).exists():
             try:
-                shutil.rmtree(profile_path)
-                self._log(f"🗑️ Đã xóa profile: {email}")
+                if is_managed_profile_path(profile_path, str(PROFILES_DIR)):
+                    shutil.rmtree(profile_path)
+                    self._log(f"🗑️ Đã xóa profile: {email}")
+                else:
+                    self._log(f"🛡️ Bỏ qua xóa profile ngoài tool: {profile_path}")
             except Exception as e:
                 self._log(f"⚠️ Lỗi xóa profile: {e}")
         
@@ -4302,8 +4456,11 @@ class GetCookieJSWindow(QMainWindow):
             # Xóa profile folder
             if profile_path and Path(profile_path).exists():
                 try:
-                    shutil.rmtree(profile_path)
-                    self._log(f"🗑️ Đã xóa profile: {email}")
+                    if is_managed_profile_path(profile_path, str(PROFILES_DIR)):
+                        shutil.rmtree(profile_path)
+                        self._log(f"🗑️ Đã xóa profile: {email}")
+                    else:
+                        self._log(f"🛡️ Bỏ qua xóa profile ngoài tool: {profile_path}")
                 except Exception as e:
                     self._log(f"⚠️ Lỗi xóa profile {email}: {e}")
             

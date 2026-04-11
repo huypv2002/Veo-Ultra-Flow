@@ -26,6 +26,8 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from chrome_profile_utils import resolve_chrome_profile, get_cookie_db_candidates
+
 try:
     import requests
 except ImportError:
@@ -66,6 +68,69 @@ LABS_DOMAIN = "labs.google"
 
 # Default profiles directory
 PROFILES_DIR = Path(os.path.dirname(os.path.abspath(__file__))) / "chrome_profiles"
+ACTIVE_CDP_SESSIONS: Dict[str, Dict[str, Any]] = {}
+ACTIVE_CDP_LOCK = threading.Lock()
+
+
+def _profile_key(profile_path: str) -> str:
+    return str(Path(profile_path).expanduser().resolve())
+
+
+def get_active_cdp_session_info(profile_path: str) -> Optional[Dict[str, Any]]:
+    key = _profile_key(profile_path)
+    with ACTIVE_CDP_LOCK:
+        info = ACTIVE_CDP_SESSIONS.get(key)
+        if not info:
+            return None
+        port = info.get("port")
+        if not port or requests is None:
+            ACTIVE_CDP_SESSIONS.pop(key, None)
+            return None
+    try:
+        resp = requests.get(f"http://127.0.0.1:{port}/json/version", timeout=1)
+        if resp.status_code == 200:
+            return dict(info)
+    except Exception:
+        pass
+    with ACTIVE_CDP_LOCK:
+        ACTIVE_CDP_SESSIONS.pop(key, None)
+    return None
+
+
+def register_active_cdp_session(profile_path: str, port: int, headless: bool, pid: Optional[int] = None):
+    key = _profile_key(profile_path)
+    with ACTIVE_CDP_LOCK:
+        ACTIVE_CDP_SESSIONS[key] = {
+            "profile_path": str(Path(profile_path).expanduser()),
+            "port": port,
+            "headless": headless,
+            "pid": pid,
+            "updated_at": time.time(),
+        }
+
+
+def unregister_active_cdp_session(profile_path: str):
+    key = _profile_key(profile_path)
+    with ACTIVE_CDP_LOCK:
+        ACTIVE_CDP_SESSIONS.pop(key, None)
+
+
+def _has_running_chrome_process() -> bool:
+    system = platform.system()
+    try:
+        if system == "Windows":
+            result = subprocess.run(
+                ['wmic', 'process', 'where', "name='chrome.exe'", 'get', 'processid'],
+                capture_output=True, text=True, timeout=5, creationflags=0x08000000,
+            )
+            return any(line.strip().isdigit() for line in result.stdout.splitlines())
+        if system == "Darwin":
+            result = subprocess.run(['pgrep', '-x', 'Google Chrome'], capture_output=True, text=True, timeout=5)
+            return bool(result.stdout.strip())
+        result = subprocess.run(['pgrep', '-f', 'google-chrome|chromium'], capture_output=True, text=True, timeout=5)
+        return bool(result.stdout.strip())
+    except Exception:
+        return False
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -123,17 +188,12 @@ def get_profile_dir(email: str, base_dir: Optional[Path] = None) -> Path:
 def check_profile_has_cookies(profile_path: str) -> bool:
     """Check xem profile đã có cookies chưa."""
     try:
-        profile = Path(profile_path)
-        local_state = profile / "Local State"
+        info = resolve_chrome_profile(profile_path)
+        user_data_dir = Path(info["user_data_dir"] or profile_path)
+        local_state = user_data_dir / "Local State"
         if not local_state.exists():
             return False
-        default_folder = profile / "Default"
-        if not default_folder.exists():
-            return False
-        for cookies_path in [
-            default_folder / "Network" / "Cookies",
-            default_folder / "Cookies",
-        ]:
+        for cookies_path in get_cookie_db_candidates(profile_path):
             if cookies_path.exists() and cookies_path.stat().st_size > 1000:
                 return True
         return False
@@ -143,9 +203,14 @@ def check_profile_has_cookies(profile_path: str) -> bool:
 
 def kill_chrome_for_profile(profile_path: str):
     """Kill Chrome processes đang dùng profile này và xóa lock files."""
+    unregister_active_cdp_session(profile_path)
+    info = resolve_chrome_profile(profile_path)
+    user_data_dir = info["user_data_dir"] or profile_path
+    profile_name = Path(info["profile_storage_path"] or profile_path).name
+
     # Xóa lock files
     for lock_name in ["SingletonLock", "SingletonSocket", "SingletonCookie"]:
-        lock_file = Path(profile_path) / lock_name
+        lock_file = Path(user_data_dir) / lock_name
         try:
             if lock_file.exists():
                 lock_file.unlink()
@@ -154,7 +219,6 @@ def kill_chrome_for_profile(profile_path: str):
 
     # Kill processes
     system = platform.system()
-    profile_name = Path(profile_path).name
     try:
         if system == "Windows":
             # Dùng wmic để tìm Chrome process theo command line chứa profile path
@@ -166,7 +230,7 @@ def kill_chrome_for_profile(profile_path: str):
                 )
                 for line in result.stdout.split('\n'):
                     # Match cả full path lẫn tên folder (tăng khả năng kill đúng)
-                    if profile_name in line or profile_path in line:
+                    if profile_name in line or user_data_dir in line:
                         parts = line.strip().split()
                         if parts:
                             try:
@@ -187,7 +251,7 @@ def kill_chrome_for_profile(profile_path: str):
                 )
         elif system == "Darwin":
             result = subprocess.run(
-                ["pgrep", "-f", f"--user-data-dir={profile_path}"],
+                ["pgrep", "-f", f"--user-data-dir={user_data_dir}"],
                 capture_output=True, text=True, timeout=5,
             )
             for pid_str in result.stdout.strip().split("\n"):
@@ -226,6 +290,7 @@ class ChromeCDPSession:
         proxy_password: Optional[str] = None,
     ):
         self.profile_path = profile_path
+        self.profile_info = resolve_chrome_profile(profile_path)
         self.port = port or self._find_free_port()
         self.headless = headless
         self.chrome_path = chrome_path or find_chrome_binary()
@@ -254,27 +319,40 @@ class ChromeCDPSession:
         if not self.chrome_path:
             raise RuntimeError("Không tìm thấy Chrome binary!")
 
-        Path(self.profile_path).mkdir(parents=True, exist_ok=True)
+        active_info = get_active_cdp_session_info(self.profile_path)
+        if active_info and active_info.get("port"):
+            self.port = int(active_info["port"])
+            self.process = None
+            self.headless = bool(active_info.get("headless", self.headless))
+            self.log_fn(f"   🔗 Reuse Chrome CDP đang mở trên port={self.port}")
+            return
+
+        Path(self.profile_info["user_data_dir"] or self.profile_path).mkdir(parents=True, exist_ok=True)
 
         cmd = [
             self.chrome_path,
             f"--remote-debugging-port={self.port}",
-            f"--user-data-dir={self.profile_path}",
+            f"--user-data-dir={self.profile_info['user_data_dir'] or self.profile_path}",
             "--remote-allow-origins=*",
             "--no-first-run",
             "--no-default-browser-check",
-            "--disable-extensions",
             "--disable-infobars",
-            "--disable-sync",
-            "--disable-signin-promo",
-            "--disable-features=Translate,OptimizationGuideModelDownloading",
-            "--password-store=basic",
-            "--use-mock-keychain",
             "--hide-crash-restore-bubble",
-            "--restore-last-session",
             f"--window-size={self.window_size[0]},{self.window_size[1]}",
             f"--window-position={self.window_pos[0]},{self.window_pos[1]}",
         ]
+        if not self.profile_info.get("is_real_chrome_profile"):
+            cmd.extend([
+                "--disable-extensions",
+                "--disable-sync",
+                "--disable-signin-promo",
+                "--disable-features=Translate,OptimizationGuideModelDownloading",
+                "--password-store=basic",
+                "--use-mock-keychain",
+                "--restore-last-session",
+            ])
+        if self.profile_info.get("profile_directory"):
+            cmd.append(f"--profile-directory={self.profile_info['profile_directory']}")
 
         if self.headless:
             cmd.extend(["--headless=new", "--disable-gpu", "--no-sandbox"])
@@ -308,7 +386,25 @@ class ChromeCDPSession:
 
         # Đợi Chrome sẵn sàng
         if not self._wait_for_cdp_ready(timeout=15):
+            if self.process:
+                try:
+                    self.process.terminate()
+                except Exception:
+                    pass
+                self.process = None
+            if self.profile_info.get("is_real_chrome_profile") and _has_running_chrome_process():
+                raise RuntimeError(
+                    "Chrome đang mở sẵn với profile thật nên Chrome không bật được cổng CDP. "
+                    "Hãy dùng một Chrome profile riêng của hệ thống cho tool (ví dụ Profile 1), "
+                    "hoặc đóng Chrome thường trước khi bấm Lấy Cookies."
+                )
             raise RuntimeError(f"Chrome không khởi động được trên port {self.port}")
+        register_active_cdp_session(
+            self.profile_path,
+            self.port,
+            self.headless,
+            pid=self.process.pid if self.process else None,
+        )
 
         # Setup proxy auth qua CDP Fetch nếu proxy cần authentication
         if self.proxy_server and self.proxy_username and self.proxy_password:
@@ -432,7 +528,7 @@ class ChromeCDPSession:
             time.sleep(0.5)
         return False
 
-    def close(self):
+    def close(self, keep_process: bool = False):
         """Đóng Chrome process và cleanup."""
         # Stop proxy auth listener
         self._proxy_auth_listener_active = False
@@ -457,6 +553,16 @@ class ChromeCDPSession:
                 pass
             self._ws = None
 
+        if keep_process:
+            register_active_cdp_session(
+                self.profile_path,
+                self.port,
+                self.headless,
+                pid=self.process.pid if self.process else None,
+            )
+            return
+
+        unregister_active_cdp_session(self.profile_path)
         if self.process:
             try:
                 self.process.terminate()
@@ -826,9 +932,17 @@ class ChromeCDPSession:
         Returns list of cookie dicts (Cookie Editor format) hoặc [] nếu thất bại.
         """
         try:
-            # Bước 1: Kill Chrome cũ cho profile này
-            kill_chrome_for_profile(self.profile_path)
-            time.sleep(1)
+            # Bước 1: Với profile nội bộ thì reset sạch trước khi chạy.
+            # Với profile Chrome thật thì giữ nguyên tab/session hiện có để không làm người dùng bị đá ra.
+            if not self.profile_info.get("is_real_chrome_profile"):
+                kill_chrome_for_profile(self.profile_path)
+                time.sleep(1)
+            else:
+                active_info = get_active_cdp_session_info(self.profile_path)
+                if active_info and active_info.get("port"):
+                    self.port = int(active_info["port"])
+                    self.process = None
+                    self.log_fn(f"   🔗 Dùng lại Chrome/profile đang mở trên port={self.port}")
 
             # Bước 2: Check cần login không
             need_login = force_login or not check_profile_has_cookies(self.profile_path)
@@ -964,6 +1078,12 @@ class ChromeCDPSession:
             if has_session:
                 cookie_names = [c["name"] for c in labs_cookies]
                 self.log_fn(f"   ✅ Lấy được {len(labs_cookies)} cookies: {', '.join(cookie_names)}")
+                register_active_cdp_session(
+                    self.profile_path,
+                    self.port,
+                    self.headless,
+                    pid=self.process.pid if self.process else None,
+                )
             else:
                 self.log_fn(f"   ❌ Thiếu session-token trong cookies!")
                 labs_cookies = []
