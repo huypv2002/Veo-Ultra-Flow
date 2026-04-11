@@ -4001,6 +4001,7 @@ class GoogleLabsFlowQt6(QMainWindow):
         self.flow_upsample_combo.addItem("2K", "UPSAMPLE_IMAGE_RESOLUTION_2K")
         self.flow_upsample_combo.addItem("4K", "UPSAMPLE_IMAGE_RESOLUTION_4K")
         self.flow_upsample_combo.setCurrentIndex(0)
+        self.flow_upsample_combo.currentIndexChanged.connect(self.update_flow_concurrent_range)
         config_form.addWidget(upsample_label, 1, 0)
         config_form.addWidget(self.flow_upsample_combo, 1, 1)
 
@@ -4021,11 +4022,13 @@ class GoogleLabsFlowQt6(QMainWindow):
         variations_label = QLabel("Số ảnh / prompt")
         variations_label.setStyleSheet("color: #0f172a; font-weight: 600;")
         self.flow_variations_spin = QSpinBox()
-        self.flow_variations_spin.setRange(1, 10)
+        self.flow_variations_spin.setRange(1, 1)
         self.flow_variations_spin.setValue(1)
-        self.flow_variations_spin.setToolTip("Số ảnh cần tạo cho mỗi prompt")
+        self.flow_variations_spin.setToolTip("Cố định 1 ảnh cho mỗi prompt")
         config_form.addWidget(variations_label, 3, 0)
         config_form.addWidget(self.flow_variations_spin, 3, 1)
+        variations_label.setVisible(False)
+        self.flow_variations_spin.setVisible(False)
 
         # Row 4: Concurrent (ẩn khỏi UI, vẫn giữ cho logic cũ)
         concurrent_label = QLabel("Số công việc đồng thời")
@@ -4043,13 +4046,14 @@ class GoogleLabsFlowQt6(QMainWindow):
         delay_label = QLabel("Delay (giây)")
         delay_label.setStyleSheet("color: #0f172a; font-weight: 600;")
         self.flow_delay_spin = QSpinBox()
-        self.flow_delay_spin.setRange(1, 300)
-        self.flow_delay_spin.setValue(8)
+        self.flow_delay_spin.setRange(3, 3)
+        self.flow_delay_spin.setValue(3)
         self.flow_delay_spin.setSuffix(" s")
-        self.flow_delay_spin.setToolTip("Delay giữa các prompt (1-300 giây)")
+        self.flow_delay_spin.setToolTip("Cố định 3 giây giữa các prompt")
         config_form.addWidget(delay_label, 5, 0)
         config_form.addWidget(self.flow_delay_spin, 5, 1)
-        self._load_flow_delay_setting()
+        delay_label.setVisible(False)
+        self.flow_delay_spin.setVisible(False)
 
         # Row 6: Reference Mode (ẩn khỏi UI)
         ref_mode_label = QLabel("Chế độ tham chiếu")
@@ -4078,7 +4082,7 @@ class GoogleLabsFlowQt6(QMainWindow):
         seed_label.setVisible(False)
         self.flow_seed_input.setVisible(False)
 
-        # Row 8: Output directory (ẩn khỏi UI)
+        # Row 8: Output directory
         output_label = QLabel("Thư mục lưu ảnh")
         output_label.setStyleSheet("color: #0f172a; font-weight: 600;")
         output_row = QHBoxLayout()
@@ -4096,10 +4100,10 @@ class GoogleLabsFlowQt6(QMainWindow):
                 padding: 10px;
             }
         """)
-        btn_browse_output = QPushButton("Chọn")
-        btn_browse_output.setFixedWidth(90)
-        btn_browse_output.clicked.connect(self.browse_flow_output_dir)
-        btn_browse_output.setStyleSheet("""
+        self.btn_browse_flow_output = QPushButton("Chọn thư mục")
+        self.btn_browse_flow_output.setFixedWidth(110)
+        self.btn_browse_flow_output.clicked.connect(self.browse_flow_output_dir)
+        self.btn_browse_flow_output.setStyleSheet("""
             QPushButton {
                 background: #e0f2fe;
                 border-radius: 10px;
@@ -4111,12 +4115,9 @@ class GoogleLabsFlowQt6(QMainWindow):
             QPushButton:hover { background: #bae6fd; }
         """)
         output_row.addWidget(self.flow_output_input)
-        output_row.addWidget(btn_browse_output)
+        output_row.addWidget(self.btn_browse_flow_output)
         config_form.addWidget(output_label, 8, 0)
         config_form.addLayout(output_row, 8, 1)
-        output_label.setVisible(False)
-        self.flow_output_input.setVisible(False)
-        btn_browse_output.setVisible(False)
 
         config_layout.addLayout(config_form)
         container_layout.addWidget(config_card)
@@ -8053,9 +8054,14 @@ class GoogleLabsFlowQt6(QMainWindow):
             completed = 0
             success = 0
             
-            # ✅ Số công việc đồng thời = số cookie × 3 (giống Text to Video)
-            max_concurrent = num_cookies * 3  # Max concurrent = số cookie × 3
-            self.log(f"⚙️ Flow: Nối đuôi với {max_concurrent} công việc đồng thời ({num_cookies} cookie(s) × 3)")
+            # ✅ Banana Pro: Gốc = 3/cookie, 2K-4K = 1/cookie
+            per_cookie_concurrent = self._get_flow_concurrency_per_cookie()
+            max_concurrent = max(1, num_cookies * per_cookie_concurrent)
+            quality_label = self.flow_upsample_combo.currentText() if hasattr(self, "flow_upsample_combo") and self.flow_upsample_combo else "Gốc"
+            self.log(
+                f"⚙️ Flow: Nối đuôi với {max_concurrent} công việc đồng thời "
+                f"({num_cookies} cookie(s) × {per_cookie_concurrent} - {quality_label})"
+            )
             # ✅ BỎ DELAY - Không còn delay giữa các prompt (nối đuôi liên tục)
 
             # ✅ ĐA COOKIE ROUND-ROBIN: Xử lý từng job với cookie riêng (giống Whisk)
@@ -9194,7 +9200,11 @@ class GoogleLabsFlowQt6(QMainWindow):
                                 continue  # Thử lại với cookie khác
             
             # ✅ Xử lý jobs với ThreadPoolExecutor - NỐI ĐUÔI (giống tab video)
-            self.log(f"🚀 Flow bắt đầu xử lý {len(jobs)} job(s) với {max_concurrent} công việc đồng thời ({num_cookies} cookie(s) × 3)")
+            quality_label = self.flow_upsample_combo.currentText() if hasattr(self, "flow_upsample_combo") and self.flow_upsample_combo else "Gốc"
+            self.log(
+                f"🚀 Flow bắt đầu xử lý {len(jobs)} job(s) với {max_concurrent} công việc đồng thời "
+                f"({num_cookies} cookie(s) × {per_cookie_concurrent} - {quality_label})"
+            )
             
             # ✅ BỎ DELAY - Submit tất cả jobs ngay lập tức (nối đuôi liên tục)
             with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
@@ -10236,8 +10246,18 @@ class GoogleLabsFlowQt6(QMainWindow):
 
     # ==================== END TASK CREATION & TOOLBAR HANDLERS ====================
     
+    def _is_flow_high_quality_mode(self):
+        """Banana Pro 2K/4K chạy nặng hơn nên chỉ dùng 1 concurrent mỗi cookie."""
+        if not hasattr(self, "flow_upsample_combo") or not self.flow_upsample_combo:
+            return False
+        choice = self.flow_upsample_combo.currentData()
+        return choice in ("UPSAMPLE_IMAGE_RESOLUTION_2K", "UPSAMPLE_IMAGE_RESOLUTION_4K")
+
+    def _get_flow_concurrency_per_cookie(self):
+        return 1 if self._is_flow_high_quality_mode() else 3
+
     def update_flow_concurrent_range(self):
-        """Cập nhật range của flow_concurrent_spin dựa trên số cookies (1 cookie = 3 concurrent)"""
+        """Cập nhật range của flow_concurrent_spin theo số cookies và chất lượng Banana Pro."""
         if not hasattr(self, "flow_concurrent_spin"):
             return
         
@@ -10248,8 +10268,8 @@ class GoogleLabsFlowQt6(QMainWindow):
         elif self.cookie_value:
             num_cookies = 1
         
-        # Tính max concurrent: 1 cookie = 3 concurrent
-        max_concurrent = num_cookies * 3
+        per_cookie_concurrent = self._get_flow_concurrency_per_cookie()
+        max_concurrent = num_cookies * per_cookie_concurrent
         if max_concurrent < 1:
             max_concurrent = 1
         elif max_concurrent > 30:  # Giới hạn tối đa
@@ -10261,8 +10281,14 @@ class GoogleLabsFlowQt6(QMainWindow):
         if current_value > max_concurrent:
             self.flow_concurrent_spin.setValue(max_concurrent)
         
-        self.flow_concurrent_spin.setToolTip(f"Số prompt xử lý đồng thời (1-{max_concurrent}, 1 cookie = 3 concurrent)")
-        self.log(f"⚙️ Flow concurrent range: 1-{max_concurrent} (dựa trên {num_cookies} cookie(s))")
+        quality_label = self.flow_upsample_combo.currentText() if hasattr(self, "flow_upsample_combo") and self.flow_upsample_combo else "Gốc"
+        self.flow_concurrent_spin.setToolTip(
+            f"Số prompt xử lý đồng thời (1-{max_concurrent}, 1 cookie = {per_cookie_concurrent} concurrent, {quality_label})"
+        )
+        self.log(
+            f"⚙️ Flow concurrent range: 1-{max_concurrent} "
+            f"(dựa trên {num_cookies} cookie(s) × {per_cookie_concurrent} - {quality_label})"
+        )
     
     def on_flow_retry_failed_clicked(self):
         """Chạy lại các file lỗi trong batch - Giống Whisk: kiểm tra từ table và hiển thị dialog cookie"""
@@ -20180,19 +20206,26 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
         except Exception as e:
             print(f"Error updating image concurrent: {e}")
 
+    def _is_video_upscale_mode(self):
+        if not hasattr(self, "combo_upscale") or not self.combo_upscale:
+            return False
+        return self.combo_upscale.currentText() in ("1080P", "4K")
+
+    def _get_t2v_concurrency_per_cookie(self):
+        return 1 if self._is_video_upscale_mode() else 3
+
     def update_max_concurrent_from_cookies(self):
-        """Tự động điều chỉnh max concurrent dựa trên số cookies"""
+        """Tự động điều chỉnh max concurrent cho Text to Video dựa trên số cookies."""
         num_cookies = len(self.cookies_list) if self.cookies_list else 1
         
-        # Check upscale setting
         upscale = self.combo_upscale.currentText()
-        
-        # 720P = không upscale (5 tasks/cookie), 1080P/4K = upscale (3 tasks/cookie)
+        per_cookie_concurrent = self._get_t2v_concurrency_per_cookie()
+
         if upscale in ("1080P", "4K"):
-            max_concurrent = num_cookies * 3
+            max_concurrent = num_cookies * per_cookie_concurrent
             plan_cap = self.get_plan_limit("max_concurrent_1080")
-        else:  # 720P
-            max_concurrent = num_cookies * 5
+        else:
+            max_concurrent = num_cookies * per_cookie_concurrent
             plan_cap = self.get_plan_limit("max_concurrent_720")
         
         if plan_cap is not None:
@@ -20208,10 +20241,10 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
             plan_note = ""
             if plan_cap is not None:
                 plan_note = f" (Giới hạn gói: {plan_cap})"
-            if upscale != "Không":
-                self.log(f"⚙️ {num_cookies} cookie(s) + Upscale → Max {max_concurrent} concurrent{plan_note}")
-            else:
-                self.log(f"⚙️ {num_cookies} cookie(s) → Max {max_concurrent} concurrent{plan_note}")
+            self.log(
+                f"⚙️ Text to Video: {num_cookies} cookie(s) × {per_cookie_concurrent} "
+                f"({upscale}) → Max {max_concurrent} concurrent{plan_note}"
+            )
         
         # Adjust current value nếu vượt quá
         if self.spin_concurrent.value() > max_concurrent:
@@ -21856,12 +21889,17 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
             mode = getattr(self, "current_video_mode", "Text to Video")
             
             # ✅ Số công việc đồng thời:
-            #    - Text to Video  = số cookie × 3 (mỗi cookie tối đa 3 task đồng thời, như yêu cầu mới)
+            #    - Text to Video  = 720P: 3/cookie, 1080P/4K: 1/cookie
             #    - Các mode khác  = số cookie × 1 (nặng, tránh overload)
             num_cookies = len(self.cookies_list) if self.cookies_list else 1
             if mode == "Text to Video":
-                max_concurrent = num_cookies * 3
-                self.log(f"⚙️ Chế độ: Nối đuôi với {max_concurrent} công việc đồng thời ({num_cookies} cookie(s) × 3 - Text to Video)")
+                per_cookie_concurrent = self._get_t2v_concurrency_per_cookie()
+                max_concurrent = max(1, num_cookies * per_cookie_concurrent)
+                upscale_label = self.combo_upscale.currentText() if hasattr(self, "combo_upscale") and self.combo_upscale else "720P"
+                self.log(
+                    f"⚙️ Chế độ: Nối đuôi với {max_concurrent} công việc đồng thời "
+                    f"({num_cookies} cookie(s) × {per_cookie_concurrent} - Text to Video {upscale_label})"
+                )
             else:
                 max_concurrent = num_cookies * 1
                 self.log(f"⚙️ Chế độ: Nối đuôi với {max_concurrent} công việc đồng thời ({num_cookies} cookie(s) × 1 - {mode})")
@@ -21891,10 +21929,14 @@ PHẦN H: QUY TẮC ĐỒNG BỘ CỐT LÕI
             
             # ✅ CHỈ XỬ LÝ TEXT TO VIDEO TRƯỚC
             if mode == "Text to Video":
-                # Dùng ThreadPoolExecutor với max_workers = num_cookies × 3
+                # Dùng ThreadPoolExecutor với max_workers theo upscale hiện tại
                 from concurrent.futures import ThreadPoolExecutor, as_completed
                 
-                self.log(f"🚀 Bắt đầu xử lý {len(tasks)} Text to Video tasks với {max_concurrent} công việc đồng thời")
+                upscale_label = self.combo_upscale.currentText() if hasattr(self, "combo_upscale") and self.combo_upscale else "720P"
+                self.log(
+                    f"🚀 Bắt đầu xử lý {len(tasks)} Text to Video tasks với {max_concurrent} "
+                    f"công việc đồng thời ({upscale_label})"
+                )
                 self.log(f"🔑 Round-robin cookie distribution: {num_cookies} cookie(s) sẽ được phân phối đều")
                 
                 with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
