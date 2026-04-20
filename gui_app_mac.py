@@ -3589,6 +3589,16 @@ class GoogleLabsFlowQt6(QMainWindow, FlowTabMixin, VideoTabMixin):
             images = row_refs.get(idx) or []
             image_path = images[0] if images else ""
             if not image_path or not Path(image_path).exists():
+                # ✅ Dòng không có ảnh → tạo PromptTask để chạy T2V thay vì bỏ qua
+                task = PromptTask(
+                    prompt_text=prompt_text,
+                    prompt_index=idx,
+                    output_folder=None,
+                )
+                task.source_file = self.video_prompt_file_mapping.get(idx, f"task_{idx}")
+                task.local_index = self.video_prompt_local_mapping.get(idx, idx)
+                tasks.append(task)
+                self.log(f"  ℹ️ Dòng {idx} không có ảnh → sẽ chạy Text-to-Video")
                 continue
 
             task = ImageTask(image_path=str(image_path), prompt_text=prompt_text, task_index=idx)
@@ -3615,9 +3625,17 @@ class GoogleLabsFlowQt6(QMainWindow, FlowTabMixin, VideoTabMixin):
             end_images = row_ends.get(idx) or []
             start_path = start_images[0] if start_images else ""
             end_path = end_images[0] if end_images else ""
-            if not start_path or not end_path:
-                continue
-            if not Path(start_path).exists() or not Path(end_path).exists():
+            if not start_path or not end_path or not Path(start_path).exists() or not Path(end_path).exists():
+                # ✅ Dòng thiếu ảnh start/end → tạo PromptTask để chạy T2V thay vì bỏ qua
+                task = PromptTask(
+                    prompt_text=prompt_text,
+                    prompt_index=idx,
+                    output_folder=None,
+                )
+                task.source_file = self.video_prompt_file_mapping.get(idx, f"task_{idx}")
+                task.local_index = self.video_prompt_local_mapping.get(idx, idx)
+                tasks.append(task)
+                self.log(f"  ℹ️ Dòng {idx} thiếu ảnh Start/End → sẽ chạy Text-to-Video")
                 continue
 
             task = ImageTask(
@@ -6022,6 +6040,10 @@ class GoogleLabsFlowQt6(QMainWindow, FlowTabMixin, VideoTabMixin):
         for idx, task in enumerate(tasks, 1):
             self.signals.add_task.emit(task, idx)
         
+        # ✅ Restore image thumbnail widgets sau khi rebuild bảng
+        # (add_task chỉ thêm text/progress, không restore ảnh đã gắn vào từng dòng)
+        QTimer.singleShot(0, self._refresh_visible_video_row_image_cells)
+        
         self.log("📋 Bắt đầu xử lý các tasks trong bảng...")
         
         # Store tasks
@@ -6111,6 +6133,48 @@ class GoogleLabsFlowQt6(QMainWindow, FlowTabMixin, VideoTabMixin):
             return client
         except Exception as e:
             self.log(f"❌ Lỗi tạo client: {e}")
+            return None
+
+    def _build_client_from_cookie_str(self, cookie_str: str, cookie_index: int = 0):
+        """Build LabsFlowClient from a cookie string (used by Flow tab).
+        
+        Args:
+            cookie_str: The raw cookie string
+            cookie_index: Index of the cookie for profile path lookup
+        
+        Returns:
+            LabsFlowClient instance or None on failure
+        """
+        try:
+            # Check app state before creating client
+            if getattr(self, "app_closing", False):
+                return None
+            if hasattr(self, "stop_event") and self.stop_event.is_set():
+                return None
+            
+            self._init_cookie_status()
+            
+            # Parse cookie string
+            cookies = _parse_cookie_string(cookie_str)
+            if not cookies:
+                self.log(f"❌ Cookie {cookie_index+1} không hợp lệ")
+                return None
+            
+            # Get profile path if available for this cookie index
+            profile_path = None
+            if hasattr(self, 'cookie_profile_paths') and self.cookie_profile_paths:
+                if cookie_index < len(self.cookie_profile_paths):
+                    profile_path = self.cookie_profile_paths[cookie_index]
+            
+            # Create client with optional profile path
+            if profile_path:
+                client = LabsFlowClient(cookies, profile_path=profile_path)
+            else:
+                client = LabsFlowClient(cookies)
+            
+            return client
+        except Exception as e:
+            self.log(f"❌ Lỗi tạo client từ cookie string: {e}")
             return None
 
     def process_single_text_task_new(self, task, model, num_videos, aspect, output_folder, total_tasks):
@@ -10132,7 +10196,9 @@ class GoogleLabsFlowQt6(QMainWindow, FlowTabMixin, VideoTabMixin):
                     self.log(f"♻️ Sử dụng cache image ID (cookie {display_idx}): {media_id[:50]}...")
                 else:
                     try:
-                        media_id = client.upload_image(task.image_path)
+                        # ✅ Dùng upload_flow_image để lấy plain UUID (không phải CAM...)
+                        # Video API batchAsyncGenerateVideoStartImage cần plain UUID trong startImage.mediaId
+                        media_id = client.upload_flow_image(task.image_path)
                         if media_id:
                             # Lưu vào cache theo từng cookie
                             self.i2v_image_id_cache[cache_key] = media_id
@@ -10174,7 +10240,7 @@ class GoogleLabsFlowQt6(QMainWindow, FlowTabMixin, VideoTabMixin):
             crop_coordinates = getattr(task, 'crop_coordinates', None)
             try:
                 operations = client.generate_videos_from_image(
-                    project_id=str(uuid.uuid4()),
+                    project_id=getattr(client, 'flow_project_id', '0672f813-95d5-49ab-955d-0dc7535f3198'),
                     tool=tool,
                     user_tier=tier,
                     prompt=task.prompt_text,
@@ -15900,7 +15966,7 @@ QUAN TRỌNG:
             
             try:
                 operations = client.generate_videos_from_start_end(
-                    project_id=str(uuid.uuid4()),
+                    project_id=getattr(client, 'flow_project_id', '0672f813-95d5-49ab-955d-0dc7535f3198'),
                     tool=tool,
                     user_tier=tier,
                     prompt=task.prompt_text,

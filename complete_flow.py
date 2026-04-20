@@ -647,7 +647,8 @@ class LabsFlowClient:
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36",
         )
-        self.flow_project_id = _env("FLOW_PROJECT_ID", "b7974022-eba1-489c-8228-eb02442e2a6a")
+        # Use the newer Flow project as the default; env FLOW_PROJECT_ID can still override it.
+        self.flow_project_id = _env("FLOW_PROJECT_ID", "0672f813-95d5-49ab-955d-0dc7535f3198")
 
         # --- reCAPTCHA mode: Selenium Driver (mặc định) hoặc Extension ---
         # Enable by setting env AUTO_RECAPTCHA=1 (recommended for GUI)
@@ -1118,6 +1119,69 @@ class LabsFlowClient:
             if hasattr(LabsFlowClient, '_shared_selenium_drivers'):
                 LabsFlowClient._shared_selenium_drivers.pop(cookie_hash, None)
             return False
+
+    def _build_user_facing_error(self, error_code: int, technical_detail: str = "") -> str:
+        """Chuyển lỗi kỹ thuật thành thông báo dễ hiểu cho người dùng."""
+        detail = (technical_detail or "").strip()
+        detail_lower = detail.lower()
+
+        if error_code == 400:
+            return (
+                "Yeu cau khong hop le (400). Thuong la prompt, model, upscale hoac anh dau vao chua phu hop. "
+                "Cach khac phuc: rut ngan prompt, bo ky tu la, kiem tra lai so anh, model va upscale roi chay lai."
+            )
+
+        if error_code == 401:
+            if "token khong doi" in detail_lower or "invalid authentication credentials" in detail_lower or "expired" in detail_lower:
+                return (
+                    "Phien dang nhap Google da het han hoac access token khong con hop le (401). "
+                    "Cach khac phuc: vao Cai Dat Cookie dang nhap/lamm moi lai tai khoan nay, sau do chay lai."
+                )
+            return (
+                "Xac thuc Google Labs that bai (401). "
+                "Cach khac phuc: lam moi cookie/tai khoan dang dung, sau do thu lai."
+            )
+
+        if error_code == 403:
+            return (
+                "Cookie hoac token dang bi Google Labs chan (403). "
+                "Cach khac phuc: lam moi cookie, doi sang cookie khac, hoac doi vai phut roi thu lai."
+            )
+
+        if error_code == 429:
+            return (
+                "Tai khoan hoac IP dang bi gioi han tan suat (429). "
+                "Cach khac phuc: giam so luong luong, cho 5-15 phut, hoac doi cookie/proxy roi thu lai."
+            )
+
+        if error_code >= 500:
+            if "public_error_high_traffic" in detail_lower or "high_traffic" in detail_lower:
+                return (
+                    "Google Labs dang qua tai (5xx/HIGH_TRAFFIC). "
+                    "Cach khac phuc: cho 5-15 phut roi chay lai, giam so task dong thoi, "
+                    "neu van lap lai thi doi cookie hoac proxy khac."
+                )
+            return (
+                f"Google Labs dang loi hoac qua tai (HTTP {error_code}). "
+                "Cach khac phuc: cho mot luc roi thu lai, giam so luong task dong thoi, "
+                "neu van lap lai thi doi cookie/proxy khac."
+            )
+
+        if "high_traffic" in detail_lower:
+            return (
+                "Google Labs dang qua tai. Cach khac phuc: cho mot luc roi chay lai, "
+                "hoac giam so luong task dong thoi."
+            )
+
+        if detail:
+            return detail
+        return f"Loi he thong (HTTP {error_code}). Vui long thu lai."
+
+    def _set_user_facing_error(self, error_code: int, technical_detail: str = "") -> str:
+        friendly = self._build_user_facing_error(error_code, technical_detail)
+        self.last_error_detail = friendly
+        self.last_error = friendly
+        return friendly
     
     def _hard_reset_driver(self, cookie_hash: str) -> None:
         """
@@ -2123,6 +2187,7 @@ class LabsFlowClient:
             True nếu đã reset context (nên retry), False nếu không reset
         """
         cookie_hash = self._cookie_hash
+        self._set_user_facing_error(error_code, error_message)
         
         # 1. Tăng counter lỗi
         count_403, count_429, total_errors = self._increment_error_counter(error_code)
@@ -3760,12 +3825,17 @@ class LabsFlowClient:
                             return True
 
                 print("  ⚠️ [401 Handler] Bỏ refresh profile/CDP cho lỗi 401; dừng retry")
+                self._set_user_facing_error(
+                    401,
+                    "Token KHÔNG ĐỔI sau nhiều lần fetch; session Google Labs có thể đã hết hạn.",
+                )
                 return False
             
             # Chưa đến ngưỡng, vẫn retry với token hiện tại
             return True
         else:
             print(f"  ❌ [401 Handler] Không thể fetch access token")
+            self._set_user_facing_error(401, "Không thể fetch access token")
             return False
     
     def _on_api_success(self):
@@ -4485,10 +4555,14 @@ class LabsFlowClient:
                     
                     # ✅ Check 429/400/401 using unified error handler
                     if resp.status_code in [400, 401, 429]:
+                        should_retry_401 = True
                         if resp.status_code == 401:
                             print(f"  ⚠️ Lỗi 401 Debug Payload: {json.dumps(payload)}")
                             # ✅ FIX: Xử lý 401 thông minh - refresh token + cookies nếu cần
-                            self._handle_401_refresh_token()
+                            should_retry_401 = self._handle_401_refresh_token()
+                            if not should_retry_401:
+                                print("  ❌ [401 Handler] Khong the tu phuc hoi session/token; dung task va bao loi cho UI")
+                                return None
                         # Set flag bị chặn cho 429 (rate limit/IP blocked)
                         if resp.status_code == 429:
                             cookie_hash = self._cookie_hash
@@ -4519,8 +4593,13 @@ class LabsFlowClient:
                         print(f"  ⚠️ {resp.status_code} - Retry info: {resp.text[:100]}")
                         if attempt < max_retries - 1:
                             wait_time = LabsFlowClient.calculate_retry_delay(attempt, resp.status_code, base_delay=2.0)
+                            print(f"  ⏳ Retry sau {wait_time:.1f}s... (attempt {attempt + 1}/{max_retries})")
                             time.sleep(wait_time)
                             continue
+                        if resp.status_code == 401:
+                            self._set_user_facing_error(401, resp.text[:300])
+                            print("  ❌ [401 Handler] Da het so lan retry; dung task")
+                            return None
 
                     # ✅ Check 403 - Token score thấp, cần lấy token mới
                     if resp.status_code == 403:
@@ -4570,8 +4649,10 @@ class LabsFlowClient:
                         else:
                             # Đã retry 3 lần mà vẫn 403 → báo fail
                             self._403_refresh_retries[cookie_hash] = 0  # Reset for next time
-                            self.last_error_detail = f"403 Forbidden sau {max_403_retries} lần refresh cookie"
-                            self.last_error = self.last_error_detail
+                            self._set_user_facing_error(
+                                403,
+                                f"403 Forbidden sau {max_403_retries} lần refresh cookie",
+                            )
                             print(f"  ❌ [T2V] 403 sau {max_403_retries} lần refresh cookie - Bỏ qua task này")
                             return None
                     
@@ -4674,6 +4755,147 @@ class LabsFlowClient:
         except Exception as e:
             print(f"  ✗ Failed to check video status: {e}")
             return None
+
+    def upload_flow_image(self, image_path: str, max_retries: int = 3) -> Optional[str]:
+        """Upload image specifically for Flow (Image-to-Image reference).
+        
+        Uses the correct Flow endpoint: v1/flow/uploadImage
+        Returns plain media ID like "5899c158-..." instead of asset key "CAM..."
+        
+        Args:
+            image_path: Path to image file
+            max_retries: Maximum number of retry attempts (default: 3)
+        
+        Returns:
+            Media ID string (plain UUID format) or None on failure
+        """
+        # Ensure we have flow_project_id for this upload
+        flow_project_id = getattr(self, 'flow_project_id', None) or "0672f813-95d5-49ab-955d-0dc7535f3198"
+        
+        for attempt in range(max_retries):
+            try:
+                if attempt > 0:
+                    print(f"→ [Flow Upload] Retrying upload (attempt {attempt + 1}/{max_retries}): {image_path}")
+                else:
+                    print(f"→ [Flow Upload] Uploading for Flow: {image_path}")
+                
+                self.last_error_detail = None
+                
+                # Load and encode image
+                with open(image_path, 'rb') as f:
+                    image_data = f.read()
+                
+                # Convert to base64
+                image_b64 = base64.b64encode(image_data).decode('utf-8')
+                
+                # Determine mime type from file extension
+                import mimetypes
+                mime_type, _ = mimetypes.guess_type(image_path)
+                if not mime_type:
+                    mime_type = "image/png"  # Default fallback
+                
+                # Get filename from path
+                import os
+                filename = os.path.basename(image_path)
+                
+                # Build payload according to user's curl example
+                upload_payload = {
+                    "clientContext": {
+                        "projectId": flow_project_id,
+                        "tool": "PINHOLE"
+                    },
+                    "imageBytes": image_b64,
+                    "isUserUploaded": True,
+                    "isHidden": False,
+                    "mimeType": mime_type,
+                    "fileName": filename
+                }
+                
+                # Use the correct Flow upload endpoint
+                upload_url = "https://aisandbox-pa.googleapis.com/v1/flow/uploadImage"
+                
+                resp = self.session.post(
+                    upload_url,
+                    headers=self._aisandbox_headers(),
+                    data=json.dumps(upload_payload),
+                    timeout=120,
+                )
+                
+                # Handle upload errors with retry
+                if resp.status_code != 200:
+                    if resp.status_code == 401:
+                        print(f"  🔄 [Flow Upload] 401 - Re-fetch access token...")
+                        if self.fetch_access_token():
+                            print(f"  ✅ [Flow Upload] Access token refreshed: {self.access_token[:20]}...")
+                        else:
+                            print(f"  ❌ [Flow Upload] Cannot refresh access token")
+                        if attempt < max_retries - 1:
+                            time.sleep(1)
+                            continue
+                    
+                    try:
+                        err_json = resp.json()
+                        error_detail = json.dumps(err_json, ensure_ascii=False)
+                    except Exception:
+                        error_detail = f"status={resp.status_code} text={resp.text[:400]}"
+                    
+                    self.last_error_detail = f"Flow upload failed: {error_detail}"
+                    print(f"  ⚠️ [Flow Upload] Failed (attempt {attempt + 1}/{max_retries}): {error_detail[:200]}")
+                    
+                    if resp.status_code >= 500 and attempt < max_retries - 1:
+                        wait_time = LabsFlowClient.calculate_retry_delay(attempt, 500, base_delay=3.0)
+                        print(f"  → Server error, retry after {wait_time:.1f}s...")
+                        time.sleep(wait_time)
+                        continue
+                    elif attempt < max_retries - 1:
+                        wait_time = (attempt + 1) * 2
+                        print(f"  → Retry after {wait_time}s...")
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        print(f"  ✗ [Flow Upload] Failed after {max_retries} attempts")
+                        return None
+                
+                result = resp.json()
+                print(f"  ✓ [Flow Upload] Image uploaded successfully")
+                
+                # ✅ Extract media ID from response - Flow returns "media.name"
+                media_id = None
+                if isinstance(result, dict):
+                    # Try media.name first (Flow format)
+                    media_obj = result.get("media", {})
+                    if isinstance(media_obj, dict):
+                        media_id = media_obj.get("name")
+                    
+                    # Fallback: try direct mediaId
+                    if not media_id:
+                        media_id = result.get("mediaId")
+                
+                if media_id and isinstance(media_id, str):
+                    print(f"  ✓ [Flow Upload] Media ID: {media_id}")
+                    return media_id
+                else:
+                    print(f"  ✗ [Flow Upload] No media ID found in response")
+                    print(f"  Available keys: {list(result.keys()) if isinstance(result, dict) else 'Not a dict'}")
+                    if attempt < max_retries - 1:
+                        wait_time = (attempt + 1) * 2
+                        print(f"  → Retry after {wait_time}s...")
+                        time.sleep(wait_time)
+                        continue
+                    return None
+                    
+            except Exception as e:
+                print(f"  ⚠️ [Flow Upload] Error (attempt {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    wait_time = (attempt + 1) * 2
+                    print(f"  → Retry after {wait_time}s...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    print(f"  ✗ [Flow Upload] Failed after {max_retries} attempts: {e}")
+                    return None
+        
+        return None
 
     def upload_image(self, image_path: str, max_retries: int = 3) -> Optional[str]:
         """Upload image and return media ID.
@@ -4818,22 +5040,48 @@ class LabsFlowClient:
                 
                 # Extract media ID from response
                 media_id = None
+                asset_key = None
                 if isinstance(result, dict):
-                    # Try direct mediaId first
+                    # Try direct mediaId first (preferred for Flow image reference)
                     media_id = result.get("mediaId")
+                    # Capture asset key if present (used for Whisk/legacy)
+                    if not media_id:
+                        asset_key = result.get("assetKey")
+                    
                     if not media_id:
                         # Try mediaGenerationId structure
                         media_gen = result.get("mediaGenerationId", {})
                         if isinstance(media_gen, dict):
                             media_id = media_gen.get("mediaGenerationId")
+                            if not asset_key:
+                                asset_key = media_gen.get("assetKey")
+                    
                     if not media_id:
                         # Try nested imageData paths
                         image_data = result.get("imageData", {})
                         media_id = image_data.get("mediaId") or image_data.get("mediaGenerationId")
+                        if not asset_key:
+                            asset_key = image_data.get("assetKey")
                 
+                # Normalize: prefer plain UUID media_id over asset key for Flow reference
+                # Flow batchGenerateImages expects plain media IDs like "5899c158-..." not asset keys like "CAM..."
                 if media_id:
+                    # If media_id looks like an asset key (starts with CAM), try to get plain media ID instead
+                    if isinstance(media_id, str) and media_id.startswith("CAM"):
+                        # Try to find plain media ID in other response fields
+                        plain_id = result.get("mediaId")
+                        if plain_id and not plain_id.startswith("CAM"):
+                            media_id = plain_id
+                        else:
+                            # Keep asset key but log for debugging - Flow may need different handling
+                            print(f"  ⚠️ Media ID appears to be asset key: {media_id[:30]}...")
+                    
                     print(f"  ✓ Media ID: {media_id}")
                     return media_id
+                elif asset_key:
+                    # Fallback to asset key if no media ID found
+                    print(f"  ⚠️ No plain media ID found, using asset key: {asset_key[:30]}...")
+                    return asset_key
                 else:
                     print("  ✗ No media ID found in response")
                     print(f"  Available keys: {list(result.keys()) if isinstance(result, dict) else 'Not a dict'}")
@@ -4925,7 +5173,10 @@ class LabsFlowClient:
         batch_id = str(uuid.uuid4())
         session_id = f";{int(time.time() * 1000)}"
         payload = {
-            "mediaGenerationContext": {"batchId": batch_id},
+            "mediaGenerationContext": {
+                "batchId": batch_id,
+                "audioFailurePreference": "BLOCK_SILENCED_VIDEOS",  # ✅ Theo curl web
+            },
             "clientContext": {
                 "projectId": project_id,
                 "tool": tool,
@@ -5016,18 +5267,19 @@ class LabsFlowClient:
                             if not hasattr(LabsFlowClient, '_recaptcha_cookie_blocked_flags'):
                                 LabsFlowClient._recaptcha_cookie_blocked_flags = {}
                             LabsFlowClient._recaptcha_cookie_blocked_flags[cookie_hash] = True
-                        print(f"  ⚠️ [API] 429 Rate Limit, thử lại (attempt {attempt + 1})...")
-                        
-                        # ✅ Dùng unified error handler để xử lý 429
-                        if self._handle_error_and_maybe_reset(429, "429 Rate Limit"):
-                            print(f"  🔄 [I2V] Đã reset BrowserContext, retry với context mới...")
-                            continue  # Retry với context mới
                         
                         if attempt < max_retries - 1:
-                            time.sleep(5 * (attempt + 1))
+                            # ✅ Exponential backoff: 30s, 60s, 90s, 120s
+                            # Google rate limit I2V rất chặt, cần đợi đủ lâu
+                            wait_time = 30 * (attempt + 1)
+                            print(f"  ⚠️ [API] 429 Rate Limit (attempt {attempt + 1}/{max_retries}), đợi {wait_time}s trước khi retry...")
+                            time.sleep(wait_time)
+                            # Reset context sau khi đợi
+                            self._handle_error_and_maybe_reset(429, "429 Rate Limit")
                             continue
-                        self.last_error_detail = "429 Rate Limit"
-                        self.last_error = self.last_error_detail
+                        
+                        print(f"  ⚠️ [API] 429 Rate Limit, thử lại (attempt {attempt + 1})...")
+                        self._set_user_facing_error(429, "429 Rate Limit")
                         return None
 
                     if resp.status_code == 403:
@@ -5069,8 +5321,10 @@ class LabsFlowClient:
                         else:
                             # Đã retry 3 lần mà vẫn 403 → báo fail
                             self._403_refresh_retries[cookie_hash] = 0  # Reset for next time
-                            self.last_error_detail = f"403 Forbidden sau {max_403_retries} lần refresh cookie"
-                            self.last_error = self.last_error_detail
+                            self._set_user_facing_error(
+                                403,
+                                f"403 Forbidden sau {max_403_retries} lần refresh cookie",
+                            )
                             print(f"  ❌ [I2V] 403 sau {max_403_retries} lần refresh cookie - Bỏ qua task này")
                             return None
                         
@@ -5081,8 +5335,7 @@ class LabsFlowClient:
                             print(f"  🔄 [I2V] Đã reset BrowserContext + Zendriver, retry...")
                             continue  # Retry với context mới
                         
-                        self.last_error_detail = f"403 Forbidden: {resp.text[:200]}"
-                        self.last_error = self.last_error_detail
+                        self._set_user_facing_error(403, f"403 Forbidden: {resp.text[:200]}")
                         return None
 
                     if resp.status_code >= 400:
@@ -5229,7 +5482,10 @@ class LabsFlowClient:
         # ✅ Thêm sessionId theo format: ";timestamp"
         session_id = f";{int(time.time() * 1000)}"
         payload: Dict[str, Any] = {
-            "mediaGenerationContext": {"batchId": batch_id},
+            "mediaGenerationContext": {
+                "batchId": batch_id,
+                "audioFailurePreference": "BLOCK_SILENCED_VIDEOS",  # ✅ Theo curl web
+            },
             "clientContext": {
                 "projectId": project_id,
                 "tool": tool,
@@ -5312,16 +5568,16 @@ class LabsFlowClient:
                             if not hasattr(LabsFlowClient, "_recaptcha_cookie_blocked_flags"):
                                 LabsFlowClient._recaptcha_cookie_blocked_flags = {}
                             LabsFlowClient._recaptcha_cookie_blocked_flags[cookie_hash] = True
-                        print(f"  ⚠️ [API] 429 Rate Limit (start-end), thử lại...")
-                        
-                        # ✅ Dùng unified error handler để xử lý 429
-                        if self._handle_error_and_maybe_reset(429, "429 Rate Limit (start-end)"):
-                            print(f"  🔄 [Start-End] Đã reset BrowserContext, retry với context mới...")
-                            continue  # Retry với context mới
                         
                         if attempt < max_retries - 1:
-                            time.sleep(5 * (attempt + 1))
+                            # ✅ Exponential backoff: 30s, 60s, 90s, 120s
+                            wait_time = 30 * (attempt + 1)
+                            print(f"  ⚠️ [API] 429 Rate Limit (start-end, attempt {attempt + 1}/{max_retries}), đợi {wait_time}s...")
+                            time.sleep(wait_time)
+                            self._handle_error_and_maybe_reset(429, "429 Rate Limit (start-end)")
                             continue
+                        
+                        print(f"  ⚠️ [API] 429 Rate Limit (start-end), thử lại...")
                         self.last_error_detail = "429 Rate Limit (start-end)"
                         self.last_error = self.last_error_detail
                         return None
@@ -6280,7 +6536,7 @@ class LabsFlowClient:
                         time.sleep(wait_time)
                         continue
                     
-                    self.last_error_detail = "429 Rate Limit - Đã retry hết"
+                    self._set_user_facing_error(429, "429 Rate Limit - Đã retry hết")
                     return None
                 
                 # ✅ Check 403 - Token score thấp, cần lấy token mới (log FULL)
@@ -6412,12 +6668,12 @@ class LabsFlowClient:
                 # ✅ Xử lý đặc biệt cho lỗi 500 - Internal Server Error từ Google
                 if resp is not None and resp.status_code == 500:
                     # ✅ Luôn set error detail để GUI hiển thị cho user
-                    error_msg_500 = "500 Internal Server Error - Lỗi tạm thời từ phía Google Labs, vui lòng thử lại sau."
-                    self.last_error_detail = error_msg_500
+                    error_msg_500 = "500 Internal Server Error - Loi tam thoi tu phia Google Labs"
+                    self._set_user_facing_error(500, error_msg_500)
                     
                     if attempt < max_retries - 1:
                         wait_time = LabsFlowClient.calculate_retry_delay(attempt, 500, base_delay=10.0, max_delay=120.0)
-                        print(f"  ⚠️ [Flow API] {error_msg_500}")
+                        print(f"  ⚠️ [Flow API] {self.last_error_detail}")
                         print(f"  ⚠️ Retry sau {wait_time:.1f}s... (attempt {attempt + 1}/{max_retries})")
                         time.sleep(wait_time)
                         
