@@ -3860,8 +3860,17 @@ class FlowTabMixin:
                 if len(target_path_str) > 260 and not target_path_str.startswith("\\\\?\\"):
                     target_path = Path("\\\\?\\" + target_path_str)
             
-            headers = client._aisandbox_headers()
-            headers = {k: v for k, v in headers.items() if k.lower() != "content-type"}
+            # ✅ flow-content.google là signed URL - chỉ cần User-Agent, không cần Bearer/Origin
+            # Dùng aisandbox headers cho googleapis.com, dùng headers đơn giản cho flow-content.google
+            if "flow-content.google" in url or "flow-content.googleapis.com" in url:
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+                    "Referer": "https://labs.google/",
+                }
+            else:
+                headers = client._aisandbox_headers()
+                headers = {k: v for k, v in headers.items() if k.lower() != "content-type"}
+
             with client.session.get(url, headers=headers, timeout=120, stream=True) as resp:
                 resp.raise_for_status()
                 target_path.parent.mkdir(parents=True, exist_ok=True)
