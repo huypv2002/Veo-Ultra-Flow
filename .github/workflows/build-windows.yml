@@ -107,6 +107,7 @@ jobs:
             --windows-console-mode=disable `
             --output-filename=Veo3-Ultra.exe `
             --enable-plugin=pyside6 `
+            --include-qt-plugins=qml `
             --jobs=$cpu `
             --lto=no `
             --include-module=gui_app_mac `
@@ -169,7 +170,6 @@ jobs:
             --include-package=websockets `
             --include-package=emoji `
             --include-package=grapheme `
-            --include-package=setuptools `
             --include-package-data=PySide6 `
             --include-package-data=PIL `
             --include-package-data=requests `
@@ -180,7 +180,6 @@ jobs:
             --include-package-data=bcrypt `
             --include-package-data=cryptography `
             --include-package-data=jwt `
-            --include-package-data=PyJWT `
             --include-package-data=openpyxl `
             --include-package-data=playwright `
             --include-package-data=flask `
@@ -189,7 +188,6 @@ jobs:
             --include-package-data=emoji `
             --include-package-data=grapheme `
             --include-package-data=selenium `
-            --include-package-data=setuptools `
             --nofollow-import-to=tkinter `
             --nofollow-import-to=_tkinter `
             --nofollow-import-to=ttkbootstrap `
