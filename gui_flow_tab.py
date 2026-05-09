@@ -4411,17 +4411,7 @@ class FlowTabMixin:
                                     return None
                         
                         client_context = {}
-                        # ✅ Inject recaptchaToken for Flow image generation here if server requires it
-                        try:
-                            # ✅ Dùng trực tiếp job_client hiện tại để inject recaptchaToken (đã có session và cookies đúng)
-                            if hasattr(job_client, '_maybe_inject_recaptcha'):
-                                job_client._maybe_inject_recaptcha(client_context)
-                                # ✅ Convert recaptchaToken → recaptchaContext (Flow image API yêu cầu nested format)
-                                if hasattr(job_client, '_convert_to_recaptcha_context'):
-                                    job_client._convert_to_recaptcha_context(client_context)
-                        except Exception as e:
-                            # Log lỗi để debug
-                            self.log(f"⚠️ Flow job {job_idx}: Lỗi inject recaptchaToken: {e}")
+                        # Token Flow image được inject một lần trong generate_flow_images() rồi mirror vào từng request.
 
                         # ✅ Thêm sessionId, projectId, và tool vào clientContext của mỗi request (theo curl example)
                         client_context["sessionId"] = f";{int(time.time() * 1000)}"

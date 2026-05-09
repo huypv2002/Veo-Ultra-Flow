@@ -43010,7 +43010,9 @@ Make sure EVERY prompt contains character IDs that will be used for visual consi
 
         chrome_options = Options()
 
-        chrome_options.add_argument("--headless=new")
+        chrome_options.add_argument("--window-position=-3000,-3000")
+
+        chrome_options.add_argument("--window-size=400,300")
 
         chrome_options.add_argument("--disable-gpu")
 

@@ -24578,17 +24578,6 @@ Requirements:
             self.log(f"❌ Lỗi xuất log: {e}")
             QMessageBox.critical(self, "Lỗi", f"Lỗi xuất log: {e}")
     
-    def on_hide_browser_changed(self, state):
-        """Xử lý khi checkbox Ẩn Browser thay đổi"""
-        headless = (state == 2)  # Qt.Checked = 2
-        LabsFlowClient.set_headless_mode(headless)
-        
-        mode_str = "HEADLESS" if headless else "OFF-SCREEN"
-        self.log(f"🌐 reCAPTCHA mode: LOCAL BROWSER ({mode_str})")
-        
-        # ✅ Persist setting
-        self._save_recaptcha_settings()
-
     def _open_settings_dialog(self):
         """Open proxy settings dialog with per-cookie proxy mapping."""
         dialog = QDialog(self)
@@ -24765,19 +24754,10 @@ Requirements:
             LabsFlowClient._proxy_pool = proxy_pool
             LabsFlowClient._use_proxy_pool = bool(use_pool_checkbox.isChecked() and proxy_pool)
             LabsFlowClient._proxy_pool_index = 0
-            # ✅ Headless mode is always forced internally
-            LabsFlowClient._global_headless_mode = True
-
-            # Update checkbox if exists
-            if hasattr(self, 'chk_hide_browser') and self.chk_hide_browser:
-                self.chk_hide_browser.blockSignals(True)
-                self.chk_hide_browser.setChecked(LabsFlowClient._global_headless_mode)
-                self.chk_hide_browser.blockSignals(False)
-
             self._save_recaptcha_settings()
             self.log(
                 f"⚙️ Đã lưu proxy: type={proxy_config.get('proxy_type', 'none')}, "
-                f"pool={len(proxy_pool)} proxies, headless={LabsFlowClient._global_headless_mode}"
+                f"pool={len(proxy_pool)} proxies"
             )
             QMessageBox.information(dialog, "Đã lưu", "Đã lưu cài đặt proxy.")
             dialog.accept()
@@ -24787,11 +24767,10 @@ Requirements:
         dialog.exec()
     
     def _save_recaptcha_settings(self):
-        """Lưu recaptcha settings (headless mode + proxy pool + proxy config) vào file."""
+        """Lưu recaptcha settings (proxy pool + proxy config) vào file."""
         import json
         try:
             settings = {
-                "headless": LabsFlowClient._global_headless_mode,
                 "proxy_pool": LabsFlowClient._proxy_pool if LabsFlowClient._proxy_pool else [],
                 "use_proxy_pool": LabsFlowClient._use_proxy_pool,
                 "proxy_config": getattr(self, '_proxy_config_cache', None),
@@ -24808,10 +24787,6 @@ Requirements:
         try:
             with open("recaptcha_settings.json", "r", encoding="utf-8") as f:
                 settings = json.load(f)
-            
-            # Load headless mode
-            headless = settings.get("headless", False)
-            LabsFlowClient._global_headless_mode = headless
             
             # Load proxy pool
             proxy_pool = settings.get("proxy_pool", [])
@@ -24834,15 +24809,8 @@ Requirements:
             else:
                 self._proxy_config_cache = {"proxy_type": "none"}
             
-            # Update checkbox nếu đã tạo
-            if hasattr(self, 'chk_hide_browser') and self.chk_hide_browser:
-                self.chk_hide_browser.blockSignals(True)
-                self.chk_hide_browser.setChecked(headless)
-                self.chk_hide_browser.blockSignals(False)
-            
-            mode_str = "HEADLESS" if headless else "OFF-SCREEN"
             proxy_type = self._proxy_config_cache.get("proxy_type", "none") if hasattr(self, '_proxy_config_cache') else "none"
-            print(f"  ✅ [Settings] Loaded: mode={mode_str}, proxy_pool={len(proxy_pool)}, use_proxy={use_proxy}, proxy_type={proxy_type}")
+            print(f"  ✅ [Settings] Loaded: proxy_pool={len(proxy_pool)}, use_proxy={use_proxy}, proxy_type={proxy_type}")
             
         except FileNotFoundError:
             self._proxy_config_cache = {"proxy_type": "none"}

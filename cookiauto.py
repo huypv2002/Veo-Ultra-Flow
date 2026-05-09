@@ -1383,7 +1383,7 @@ async def _get_global_browser_async(headless: bool = False) -> Any:
     Single Process Architecture: Chỉ 1 Browser, nhiều Context.
     
     Args:
-        headless: Chạy headless mode
+        headless: Ignored; true headless is disabled, Chrome runs headful-hidden.
     
     Returns:
         Browser instance (async)
@@ -1417,7 +1417,8 @@ async def _get_global_browser_async(headless: bool = False) -> Any:
                     await asyncio.sleep(random.uniform(3.0, 5.0))
                     playwright = await async_playwright().start()
                     
-                    # Browser launch args
+                    # Browser launch args: always headful; hidden mode moves the window off-screen.
+                    hidden_args = ['--window-position=-32000,-32000', '--window-size=400,300'] if platform.system() == 'Windows' else ['--window-position=-3000,-3000', '--window-size=400,300']
                     launch_args = [
                         '--no-first-run',
                         '--no-default-browser-check',
@@ -1428,6 +1429,7 @@ async def _get_global_browser_async(headless: bool = False) -> Any:
                         '--password-store=basic',
                         '--use-mock-keychain',
                         '--hide-crash-restore-bubble',
+                        *hidden_args,
                     ]
                     
                     # Windows-specific: Set AppUserModelID để gom icon trên taskbar
@@ -1446,7 +1448,7 @@ async def _get_global_browser_async(headless: bool = False) -> Any:
                     # Launch browser
                     browser = await playwright.chromium.launch(
                         channel="chrome",
-                        headless=headless,
+                        headless=False,
                         args=launch_args,
                     )
                     
@@ -1577,7 +1579,7 @@ class CookieWorker(QThread):
                 # Tạo CDP session
                 session = ChromeCDPSession(
                     profile_path=profile_path,
-                    headless=True,  # Sẽ được override trong extract_cookies
+                    headless=False,  # True headless disabled; use headful/off-screen instead.
                     window_pos=(pos_x, pos_y),
                     window_size=(win_w, win_h),
                     log_fn=lambda msg: self.log.emit(msg),
@@ -1685,8 +1687,8 @@ class CookieWorker(QThread):
         
         BƯỚC 1: Check xem có cần login không (force_login hoặc không có cookies trong profile)
         BƯỚC 2: Mở browser:
-            - Nếu CẦN LOGIN → headless=False (VISIBLE để giải captcha)
-            - Nếu KHÔNG CẦN LOGIN → headless=True (HEADLESS để nhanh hơn)
+            - Nếu CẦN LOGIN → visible để giải captcha
+            - Nếu KHÔNG CẦN LOGIN → headful-hidden/off-screen, không dùng true headless
         BƯỚC 3: Nếu cần login → Gọi _do_google_login() để đăng nhập
         BƯỚC 4: Vào Labs để lấy session cookie
         BƯỚC 5: Lấy cookies và lưu vào results
@@ -1754,9 +1756,9 @@ class CookieWorker(QThread):
                 need_login = self.force_login or not self._check_profile_has_cookies(profile_path)
                 
                 if need_login:
-                    self.log.emit(f"   🔐 [{email}] CẦN ĐĂNG NHẬP → Browser sẽ hiển thị (headless=False)")
+                    self.log.emit(f"   🔐 [{email}] CẦN ĐĂNG NHẬP → Browser sẽ hiển thị")
                 else:
-                    self.log.emit(f"   🍪 [{email}] KHÔNG CẦN ĐĂNG NHẬP → Browser sẽ chạy ngầm (headless=True)")
+                    self.log.emit(f"   🍪 [{email}] KHÔNG CẦN ĐĂNG NHẬP → Browser chạy headful-hidden/off-screen")
 
                 # ✅ Ưu tiên Chrome thật + CDP giống web_app:
                 # 1 account = 1 folder profile
@@ -1789,7 +1791,7 @@ class CookieWorker(QThread):
 
                     session = ChromeCDPSession(
                         profile_path=profile_path,
-                        headless=not need_login,
+                        headless=False,
                         window_pos=(pos_x, pos_y),
                         window_size=(500, 600),
                         log_fn=_cdp_log,
@@ -1843,7 +1845,7 @@ class CookieWorker(QThread):
                         # ✅ Thêm delay ngẫu nhiên để giãn tải khi khởi tạo browser (tránh nghẽn mạng)
                         await asyncio.sleep(random.uniform(1.0, 2.0))
                         
-                        self.log.emit(f"   🚀 [{email}] Mở browser {'(VISIBLE - để giải captcha)' if need_login else '(HEADLESS - nhanh hơn)'}...")
+                        self.log.emit(f"   🚀 [{email}] Mở browser {'(VISIBLE - để giải captcha)' if need_login else '(HEADFUL-HIDDEN - off-screen)'}...")
                         
                         # ✅ Get proxy from pool if enabled
                         proxy_config = None
@@ -1862,6 +1864,14 @@ class CookieWorker(QThread):
                         # ✅ Launch browser với headless phụ thuộc vào need_login
                         # - need_login=True → headless=False (VISIBLE để giải captcha)
                         # - need_login=False → headless=True (HEADLESS để nhanh hơn)
+                        if need_login:
+                            window_args = ['--window-size=500,600', f'--window-position={pos_x},{pos_y}']
+                        else:
+                            import platform
+                            if platform.system() == 'Windows':
+                                window_args = ['--window-position=-32000,-32000', '--window-size=400,300']
+                            else:
+                                window_args = ['--window-position=-3000,-3000', '--window-size=400,300']
                         launch_args = [
                             '--no-first-run',
                             '--no-default-browser-check',
@@ -1872,8 +1882,7 @@ class CookieWorker(QThread):
                             '--password-store=basic',
                             '--use-mock-keychain',
                             '--hide-crash-restore-bubble',
-                            '--window-size=500,600',
-                            f'--window-position={pos_x},{pos_y}',
+                            *window_args,
                         ]
                         
                         context = await playwright.chromium.launch_persistent_context(

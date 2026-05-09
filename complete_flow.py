@@ -17,6 +17,7 @@ import asyncio
 import base64
 import json
 import os
+import platform
 import queue
 import sys
 import threading
@@ -403,8 +404,8 @@ class LabsFlowClient:
     _contexts_need_reset: Dict[str, bool] = {}  # {cookie_hash: True} - đánh dấu context cần reset
     _contexts_need_reset_lock = threading.Lock()  # Lock để bảo vệ flag
     
-    # ✅ Headless mode cho reCAPTCHA browser (mặc định False = hiện browser)
-    _global_headless_mode: bool = False
+    # ✅ Local reCAPTCHA browsers are always headful; default is hidden off-screen.
+    _global_browser_visible: bool = False
     
     
     # ✅ reCAPTCHA Worker Thread Architecture: 1 worker thread chuyên reCAPTCHA, mỗi cookie có BrowserContext riêng (không giới hạn số cookie)
@@ -514,15 +515,34 @@ class LabsFlowClient:
     
     @classmethod
     def set_headless_mode(cls, headless: bool):
-        """Đặt chế độ headless cho reCAPTCHA browser."""
-        cls._global_headless_mode = headless
-        mode_str = "HEADLESS" if headless else "OFF-SCREEN"
+        """Backward-compatible API: headless is disabled; True still maps to hidden headful."""
+        cls._global_browser_visible = False
+        mode = cls._recaptcha_browser_mode()
+        mode_str = {
+            "hidden": "HEADFUL-HIDDEN (off-screen)",
+            "visible": "HEADFUL (visible browser)",
+        }.get(mode, mode)
         print(f"  ✅ reCAPTCHA mode: LOCAL BROWSER ({mode_str})")
+
+    @classmethod
+    def _recaptcha_browser_mode(cls) -> str:
+        """Return visible or hidden for local reCAPTCHA browsers; headless is intentionally disabled."""
+        mode = str(_env("RECAPTCHA_BROWSER_MODE", "") or "").strip().lower()
+        if mode in {"visible", "headful", "show"}:
+            return "visible"
+        return "hidden"
+
+    @staticmethod
+    def _hidden_browser_window_args() -> List[str]:
+        """Keep Chrome headful for trust score, but move the window outside the desktop."""
+        if platform.system() == "Windows":
+            return ["--window-position=-32000,-32000", "--window-size=400,300"]
+        return ["--window-position=-3000,-3000", "--window-size=400,300"]
     
     # ═══════════════════════════════════════════════════════════════════════
     # ✅ AUTO COOKIE RENEWAL - Tự động lấy cookie mới khi bị 403
     # Lưu thông tin account (email, password, profile_path) cho mỗi cookie_hash
-    # Khi bị 403 liên tiếp → tự động headless login lại để lấy cookie mới
+    # Khi bị 403 liên tiếp → tự động mở Chrome headful-hidden để lấy cookie mới
     # ═══════════════════════════════════════════════════════════════════════
     _cookie_account_info: Dict[str, Dict[str, str]] = {}  # {cookie_hash: {email, password, profile_path}}
     _cookie_auto_renew_lock = threading.Lock()  # Lock bảo vệ auto-renew (tránh nhiều thread cùng renew)
@@ -644,11 +664,12 @@ class LabsFlowClient:
             self._apply_proxy_to_session(proxy_config)
         self.user_agent = _env(
             "USER_AGENT",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
         )
-        # Use the newer Flow project as the default; env FLOW_PROJECT_ID can still override it.
-        self.flow_project_id = _env("FLOW_PROJECT_ID", "0672f813-95d5-49ab-955d-0dc7535f3198")
+        # Flow project used by the logged-in Labs session; env FLOW_PROJECT_ID can override it.
+        cookie_project_id = self._extract_flow_project_id_from_cookies(cookies)
+        self.flow_project_id = _env("FLOW_PROJECT_ID", cookie_project_id or "f29ebccd-1f46-4bd4-91ad-b1f4a093878f")
 
         # --- reCAPTCHA mode: Selenium Driver (mặc định) hoặc Extension ---
         # Enable by setting env AUTO_RECAPTCHA=1 (recommended for GUI)
@@ -675,15 +696,15 @@ class LabsFlowClient:
         self.captcha_bridge_url: str = _env("CAPTCHA_BRIDGE_URL", "http://localhost:3000") or "http://localhost:3000"
         
         # ✅ Selenium driver settings (chỉ dùng khi use_selenium_recaptcha = True)
-        self.selenium_headless: bool = str(_env("SELENIUM_HEADLESS", "0") or "0") in ("1", "true", "True", "YES", "yes")
+        # Headful-only: Flow/reCAPTCHA reject true headless more often; use hidden off-screen Chrome instead.
+        self.selenium_headless: bool = False
         self.selenium_browser_path: Optional[str] = _env("SELENIUM_BROWSER_PATH")
         
         # ✅ Log mode đang dùng
         if self.auto_recaptcha:
             if self.use_selenium_recaptcha:
-                mode_str = "Selenium Driver (Trình duyệt)"
-                if self.selenium_headless:
-                    mode_str += " [Headless]"
+                browser_mode = self._recaptcha_browser_mode()
+                mode_str = "Selenium Driver (Chrome headful-hidden)" if browser_mode == "hidden" else "Selenium Driver (Chrome visible)"
             else:
                 mode_str = f"Extension (Bridge: {self.captcha_bridge_url})"
             print(f"✓ reCAPTCHA mode: {mode_str}")
@@ -826,9 +847,10 @@ class LabsFlowClient:
         
         ✅ THREAD-SAFE: Mỗi thread có browser instance riêng để tránh "Cannot switch to a different thread"
         ✅ ICON GROUPING: Tất cả browsers có cùng AppUserModelID để Windows gom icon trên taskbar thành 1
+        ✅ HEADFUL-ONLY: tham số headless chỉ giữ tương thích, Chrome luôn chạy headful-hidden/visible.
         
         Args:
-            headless: Chạy headless mode
+            headless: Ignored; true headless is intentionally disabled.
             browser_path: Đường dẫn đến Chrome executable (optional)
         
         Returns:
@@ -873,7 +895,8 @@ class LabsFlowClient:
                 print(f"  🚀 Khởi tạo Browser instance (Playwright) cho thread {thread_id}...")
                 playwright = sync_playwright().start()
                 
-                # Browser launch args
+                # Browser launch args: always headful; hidden mode moves the window off-screen.
+                browser_mode = cls._recaptcha_browser_mode()
                 launch_args = [
                     '--no-first-run',
                     '--no-default-browser-check',
@@ -886,6 +909,10 @@ class LabsFlowClient:
                     '--use-mock-keychain',
                     '--hide-crash-restore-bubble',
                 ]
+                if browser_mode == "visible":
+                    launch_args.extend(['--window-position=80,80', '--window-size=1280,900'])
+                else:
+                    launch_args.extend(cls._hidden_browser_window_args())
                 
                 # Windows-specific: Set AppUserModelID để gom icon trên taskbar
                 # ✅ CÙNG AppUserModelID cho tất cả threads để Windows gom icon thành 1
@@ -902,10 +929,10 @@ class LabsFlowClient:
                         except Exception as e:
                             print(f"  ⚠️ Không thể set AppUserModelID: {e}")
                 
-                # Launch browser
+                # Launch browser: never pass true headless, even if old callers request it.
                 browser = playwright.chromium.launch(
                     channel="chrome",
-                    headless=headless,
+                    headless=False,
                     executable_path=browser_path,
                     args=launch_args,
                 )
@@ -1037,10 +1064,11 @@ class LabsFlowClient:
                 chrome_options.add_argument(f"--user-data-dir={self.profile_path}")
                 print(f"  → Dùng profile: {self.profile_path}")
             
-            # Headless mode
-            if self.selenium_headless:
-                chrome_options.add_argument('--headless=new')
-                chrome_options.add_argument('--window-size=1920,1080')
+            # Headful-only: hide off-screen by default, never use --headless.
+            selenium_mode = LabsFlowClient._recaptcha_browser_mode()
+            window_args = ["--window-position=100,100", "--window-size=1280,900"] if selenium_mode == "visible" else LabsFlowClient._hidden_browser_window_args()
+            for arg in window_args:
+                chrome_options.add_argument(arg)
             
             # Anti-detection
             chrome_options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
@@ -1641,14 +1669,15 @@ class LabsFlowClient:
                 return None
             
             with sync_playwright() as p:
-                # Mở profile bằng persistent context (headless)
+                # Mở profile dạng headful-hidden, không dùng headless.
                 context = p.chromium.launch_persistent_context(
                     user_data_dir=str(profile_dir),
-                    headless=True,
+                    headless=False,
                     channel="chrome",
                     args=[
                         '--no-first-run',
                         '--no-default-browser-check',
+                        *LabsFlowClient._hidden_browser_window_args(),
                     ],
                 )
                 
@@ -1692,8 +1721,8 @@ class LabsFlowClient:
         """Tự động lấy cookie mới khi bị 403 - KHÔNG cần user thao tác.
         
         Flow ưu tiên (hỗ trợ proxy per-account):
-        1. Thử lấy cookie mới từ profile (headless, nhanh nhất)
-        2. Nếu fail → thử headless re-login với email/password từ DB
+        1. Thử lấy cookie mới từ profile bằng Chrome headful-hidden
+        2. Nếu fail → thử re-login headful-hidden với email/password từ DB
         3. Áp dụng proxy per-account (nếu có) vào session
         4. Update cookies mới vào instance, DB, và tất cả browser contexts
         5. Reset tất cả error counters và token timestamps
@@ -1744,10 +1773,10 @@ class LabsFlowClient:
                     pass
             
             # ═══════════════════════════════════════════════════════════════
-            # BƯỚC 1: Thử lấy cookie mới từ profile (headless, nhanh nhất)
+            # BƯỚC 1: Thử lấy cookie mới từ profile (Chrome headful-hidden)
             # ═══════════════════════════════════════════════════════════════
             if profile_path and self._get_cookie_source() == "profile":
-                print(f"  🔄 [Auto Renew] BƯỚC 1: Thử lấy cookie từ profile (headless)...")
+                print(f"  🔄 [Auto Renew] BƯỚC 1: Thử lấy cookie từ profile (headful-hidden)...")
                 new_cookies = self._refresh_cookies_from_profile()
                 
                 if new_cookies and self._verify_new_cookies(new_cookies):
@@ -1762,14 +1791,14 @@ class LabsFlowClient:
                     print(f"  ⚠️ [Auto Renew] BƯỚC 1 thất bại - Cookie từ profile không hợp lệ hoặc đã hết hạn")
             
             # ═══════════════════════════════════════════════════════════════
-            # BƯỚC 2: Headless re-login với email/password
+            # BƯỚC 2: Re-login headful-hidden với email/password
             # ═══════════════════════════════════════════════════════════════
             if account_info and account_info.get("email") and account_info.get("password"):
                 email = account_info["email"]
                 password = account_info["password"]
                 acc_profile = account_info.get("profile_path", profile_path or "")
                 
-                print(f"  🔄 [Auto Renew] BƯỚC 2: Headless re-login cho {email}...")
+                print(f"  🔄 [Auto Renew] BƯỚC 2: Re-login headful-hidden cho {email}...")
                 new_cookies = self._headless_relogin(email, password, acc_profile)
                 
                 if new_cookies and self._verify_new_cookies(new_cookies):
@@ -1914,20 +1943,10 @@ class LabsFlowClient:
         print(f"  ✅ [Apply] Đã áp dụng cookies mới hoàn tất")
     
     def _headless_relogin(self, email: str, password: str, profile_path: str) -> Optional[Dict[str, str]]:
-        """Headless re-login để lấy cookie mới - KHÔNG cần user thao tác.
-        
-        Sử dụng Playwright persistent context với profile đã có để:
-        1. Mở browser headless
-        2. Navigate đến Google Labs
-        3. Nếu cần login → tự động nhập email/password
-        4. Lấy cookies mới
-        
-        Returns:
-            Dict cookies mới hoặc None nếu thất bại
-        """
+        """Backward-compatible name: re-login bằng Chrome headful-hidden, không dùng true headless."""
         from pathlib import Path
         
-        print(f"  🔐 [Headless Login] Bắt đầu re-login cho {email}...")
+        print(f"  🔐 [Hidden Login] Bắt đầu re-login cho {email}...")
         
         try:
             from playwright.sync_api import sync_playwright
@@ -1936,10 +1955,10 @@ class LabsFlowClient:
             profile_dir.mkdir(parents=True, exist_ok=True)
             
             with sync_playwright() as p:
-                # Mở browser headless với profile
+                # Mở browser headful-hidden với profile, không dùng headless.
                 context = p.chromium.launch_persistent_context(
                     user_data_dir=str(profile_dir),
-                    headless=True,
+                    headless=False,
                     channel="chrome",
                     args=[
                         '--no-first-run',
@@ -1948,6 +1967,7 @@ class LabsFlowClient:
                         '--disable-extensions',
                         '--disable-infobars',
                         '--disable-sync',
+                        *LabsFlowClient._hidden_browser_window_args(),
                     ],
                     viewport={"width": 1280, "height": 720},
                 )
@@ -1956,7 +1976,7 @@ class LabsFlowClient:
                     page = context.pages[0] if context.pages else context.new_page()
                     
                     # Navigate đến Google Labs
-                    print(f"  🌍 [Headless Login] Đang vào Google Labs...")
+                    print(f"  🌍 [Hidden Login] Đang vào Google Labs...")
                     try:
                         page.goto("https://labs.google/fx/tools/flow", wait_until="domcontentloaded", timeout=30000)
                     except Exception:
@@ -1968,10 +1988,10 @@ class LabsFlowClient:
                     session_cookies = [c for c in cookies if c.get("name") == "__Secure-next-auth.session-token" and "labs.google" in c.get("domain", "")]
                     
                     if session_cookies:
-                        print(f"  ✅ [Headless Login] Đã có session token - không cần login lại")
+                        print(f"  ✅ [Hidden Login] Đã có session token - không cần login lại")
                     else:
                         # Cần login - navigate đến Google signin
-                        print(f"  🔐 [Headless Login] Chưa có session - bắt đầu login...")
+                        print(f"  🔐 [Hidden Login] Chưa có session - bắt đầu login...")
                         
                         # Thử click Sign In trên Labs page
                         try:
@@ -1998,10 +2018,10 @@ class LabsFlowClient:
                         
                         # Kiểm tra nếu đã login sẵn (redirect về myaccount)
                         if "myaccount.google.com" in page.url or "accounts.google.com/b/" in page.url:
-                            print(f"  ✅ [Headless Login] Đã login sẵn trong profile")
+                            print(f"  ✅ [Hidden Login] Đã login sẵn trong profile")
                         else:
                             # Nhập email
-                            print(f"  📧 [Headless Login] Nhập email: {email}...")
+                            print(f"  📧 [Hidden Login] Nhập email: {email}...")
                             try:
                                 page.wait_for_selector('input[type="email"]', state="visible", timeout=10000)
                                 time.sleep(0.5)
@@ -2009,11 +2029,11 @@ class LabsFlowClient:
                                 page.click("#identifierNext")
                                 time.sleep(4)
                             except Exception as e:
-                                print(f"  ⚠️ [Headless Login] Email step failed: {e}")
+                                print(f"  ⚠️ [Hidden Login] Email step failed: {e}")
                                 return None
                             
                             # Nhập password
-                            print(f"  🔑 [Headless Login] Nhập password...")
+                            print(f"  🔑 [Hidden Login] Nhập password...")
                             try:
                                 page.wait_for_selector('input[type="password"]', state="visible", timeout=15000)
                                 time.sleep(1)
@@ -2022,14 +2042,14 @@ class LabsFlowClient:
                                 page.click("#passwordNext")
                                 time.sleep(5)
                             except Exception as e:
-                                print(f"  ⚠️ [Headless Login] Password step failed: {e}")
+                                print(f"  ⚠️ [Hidden Login] Password step failed: {e}")
                                 return None
                             
-                            # Kiểm tra captcha/2FA - nếu có thì fail (headless không giải được)
+                            # Kiểm tra captcha/2FA - nếu có thì fail (tự động không giải được)
                             page_text = page.evaluate("() => document.body.innerText.toLowerCase()")
                             captcha_indicators = ["challenge", "captcha", "recaptcha", "verify", "unusual activity"]
                             if any(ind in page_text for ind in captcha_indicators):
-                                print(f"  ⚠️ [Headless Login] Phát hiện captcha/2FA - không thể tự động giải")
+                                print(f"  ⚠️ [Hidden Login] Phát hiện captcha/2FA - không thể tự động giải")
                                 print(f"  💡 Tip: Mở tool Cookie để login thủ công 1 lần, sau đó auto-renew sẽ hoạt động")
                                 return None
                             
@@ -2038,11 +2058,11 @@ class LabsFlowClient:
                                 # Đợi thêm
                                 time.sleep(5)
                                 if "myaccount.google.com" not in page.url and "accounts.google.com/b/" not in page.url:
-                                    print(f"  ⚠️ [Headless Login] Login có thể chưa thành công, URL: {page.url[:80]}")
+                                    print(f"  ⚠️ [Hidden Login] Login có thể chưa thành công, URL: {page.url[:80]}")
                                     # Vẫn tiếp tục thử lấy cookies
                         
                         # Sau khi login, navigate lại Labs để lấy session cookie
-                        print(f"  🌍 [Headless Login] Navigate lại Labs để lấy session cookie...")
+                        print(f"  🌍 [Hidden Login] Navigate lại Labs để lấy session cookie...")
                         try:
                             page.goto("https://labs.google/fx/tools/flow", wait_until="domcontentloaded", timeout=30000)
                         except Exception:
@@ -2083,14 +2103,14 @@ class LabsFlowClient:
                     page.close()
                     
                     if has_session and google_cookies:
-                        print(f"  ✅ [Headless Login] Đã lấy {len(google_cookies)} cookies (có session token)")
+                        print(f"  ✅ [Hidden Login] Đã lấy {len(google_cookies)} cookies (có session token)")
                         return google_cookies
                     elif google_cookies:
-                        print(f"  ⚠️ [Headless Login] Có {len(google_cookies)} cookies nhưng KHÔNG có session token")
+                        print(f"  ⚠️ [Hidden Login] Có {len(google_cookies)} cookies nhưng KHÔNG có session token")
                         # Vẫn trả về cookies, _verify_new_cookies sẽ kiểm tra
                         return google_cookies
                     else:
-                        print(f"  ❌ [Headless Login] Không lấy được cookies")
+                        print(f"  ❌ [Hidden Login] Không lấy được cookies")
                         return None
                         
                 finally:
@@ -2100,7 +2120,7 @@ class LabsFlowClient:
                         pass
                     
         except Exception as e:
-            print(f"  ❌ [Headless Login] Lỗi: {e}")
+            print(f"  ❌ [Hidden Login] Lỗi: {e}")
             import traceback
             print(traceback.format_exc())
             return None
@@ -2303,6 +2323,23 @@ class LabsFlowClient:
             print(f"  ❌ [Smart 403] Không thể reset BrowserContext")
             return False
     
+    @staticmethod
+    def _extract_flow_project_id_from_cookies(cookies: Dict[str, str]) -> Optional[str]:
+        """Extract current Flow project ID from Labs callback-url cookie when available."""
+        try:
+            from urllib.parse import unquote
+            callback_url = cookies.get("__Secure-next-auth.callback-url") or ""
+            decoded = unquote(callback_url)
+            marker = "/flow/project/"
+            if marker not in decoded:
+                return None
+            project_id = decoded.split(marker, 1)[1].split("/", 1)[0].split("?", 1)[0].strip()
+            if project_id:
+                return project_id
+        except Exception:
+            return None
+        return None
+
     def _labs_headers(self) -> Dict[str, str]:
         return {
             "accept": "*/*",
@@ -2323,7 +2360,7 @@ class LabsFlowClient:
     def _aisandbox_headers(self) -> Dict[str, str]:
         if not self.access_token:
             raise ValueError("Missing access token for aisandbox API.")
-        headers = {
+        return {
             "accept": "*/*",
             "accept-language": _env("ACCEPT_LANGUAGE", "vi-VN,vi;q=0.9,fr-FR;q=0.8,fr;q=0.7,en-US;q=0.6,en;q=0.5"),
             "authorization": f"Bearer {self.access_token}",
@@ -2331,27 +2368,14 @@ class LabsFlowClient:
             "origin": "https://labs.google",
             "priority": "u=1, i",
             "referer": "https://labs.google/",
-            "sec-ch-ua": _env("SEC_CH_UA", '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"'),
+            "sec-ch-ua": _env("SEC_CH_UA", '"Chromium";v="148", "Google Chrome";v="148", "Not/A)Brand";v="99"'),
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": _env("SEC_CH_UA_PLATFORM", '"macOS"'),
             "sec-fetch-dest": "empty",
             "sec-fetch-mode": "cors",
             "sec-fetch-site": "cross-site",
-            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-            "x-browser-channel": _env("X_BROWSER_CHANNEL", "stable"),
-            "x-browser-copyright": _env(
-                "X_BROWSER_COPYRIGHT",
-                "Copyright 2026 Google LLC. All Rights reserved.",
-            ),
-            "x-browser-year": _env("X_BROWSER_YEAR", "2026"),
-            "x-client-data": _env("X_CLIENT_DATA", "CIq2yQEIprbJAQipncoBCNDiygEIlaHLAQiGoM0BGLGKzwEY57HPAQ=="),
-            "x-browser-validation": "lYo6cDWNH/3Bt+JG4mYU+Q3kh6s=",
+            "user-agent": self.user_agent,
         }
-        # Optional validation header if you have one
-        x_validation = _env("X_BROWSER_VALIDATION")
-        if x_validation:
-            headers["x-browser-validation"] = x_validation
-        return headers
 
     @classmethod
     def _get_cookie_lock(cls, cookie_hash: str) -> threading.Lock:
@@ -2470,21 +2494,18 @@ class LabsFlowClient:
                     
                     playwright = sync_playwright().start()
                     
-                    # Luồng lấy reCAPTCHA token phải visible để dễ kiểm tra trực quan.
-                    # Không dùng _global_headless_mode ở đây nữa.
-                    headless = False
+                    # Mode mặc định mới: headful ẩn ngoài màn hình để giữ trust score nhưng không hiện tab.
+                    browser_mode = LabsFlowClient._recaptcha_browser_mode()
                     
                     launch_args = [
                         '--no-sandbox',
                         '--disable-dev-shm-usage',
                     ]
                     
-                    # ✅ Nếu không headless: hiện cửa sổ để dễ quan sát luồng lấy token
-                    if not headless:
-                        launch_args.extend([
-                            '--window-position=80,80',
-                            '--window-size=1280,900',
-                        ])
+                    if browser_mode == "visible":
+                        launch_args.extend(['--window-position=80,80', '--window-size=1280,900'])
+                    else:
+                        launch_args.extend(LabsFlowClient._hidden_browser_window_args())
                     
                     # ✅ Tìm Chrome đã cài trên máy (fallback nếu Playwright browsers chưa cài)
                     chrome_path = None
@@ -2503,8 +2524,11 @@ class LabsFlowClient:
                         if os.path.exists(mac_chrome):
                             chrome_path = mac_chrome
                     
-                    mode_str = "HEADLESS" if headless else "VISIBLE (80,80 - 1280x900)"
-                    print(f"  👀 [reCAPTCHA Worker] Force visible browser cho token flow ({mode_str})")
+                    mode_str = {
+                        "hidden": "HEADFUL-HIDDEN (off-screen)",
+                        "visible": "HEADFUL (80,80 - 1280x900)",
+                    }.get(browser_mode, browser_mode)
+                    print(f"  👀 [reCAPTCHA Worker] Browser mode cho token flow: {mode_str}")
                     
                     # ✅ Thử launch với Chrome có sẵn trước, fallback sang Chromium
                     browser = None
@@ -2512,7 +2536,7 @@ class LabsFlowClient:
                         try:
                             print(f"  → Mở Chrome có sẵn ({mode_str})...")
                             browser = playwright.chromium.launch(
-                                headless=headless,
+                                headless=False,
                                 executable_path=chrome_path,
                                 args=launch_args,
                             )
@@ -2526,7 +2550,7 @@ class LabsFlowClient:
                         try:
                             print(f"  → Mở Chromium Playwright ({mode_str})...")
                             browser = playwright.chromium.launch(
-                                headless=headless,
+                                headless=False,
                                 args=launch_args,
                             )
                             print(f"  ✅ Chromium đã khởi tạo ({mode_str})")
@@ -2858,7 +2882,29 @@ class LabsFlowClient:
                         cls._recaptcha_context = browser.new_context(
                             viewport={"width": 200, "height": 150},
                             ignore_https_errors=True,
+                            user_agent=user_agent,
                         )
+                        # Inject Labs cookies into the same context that executes reCAPTCHA.
+                        cookie_items = []
+                        for name, value in (cookies or {}).items():
+                            if not name or value is None:
+                                continue
+                            item = {
+                                "name": name,
+                                "value": str(value),
+                                "secure": True,
+                                "httpOnly": True,
+                                "sameSite": "Lax",
+                            }
+                            if name.startswith("__Host-"):
+                                item["url"] = "https://labs.google/"
+                            else:
+                                item["domain"] = "labs.google"
+                                item["path"] = "/"
+                            cookie_items.append(item)
+                        if cookie_items:
+                            cls._recaptcha_context.add_cookies(cookie_items)
+                            print(f"  ✅ Inject {len(cookie_items)} Labs cookies vào reCAPTCHA context")
                     page = cls._recaptcha_context.new_page()
                     cls._recaptcha_page = page
                     
@@ -3572,14 +3618,17 @@ class LabsFlowClient:
 
                 with sync_playwright() as playwright:
                     context = None
+                    zendriver_mode = LabsFlowClient._recaptcha_browser_mode()
                     launch_args = [
                         "--no-first-run",
                         "--no-default-browser-check",
                         "--disable-infobars",
                         "--hide-crash-restore-bubble",
-                        "--window-position=100,100",
-                        "--window-size=1280,900",
                     ]
+                    if zendriver_mode == "visible":
+                        launch_args.extend(["--window-position=100,100", "--window-size=1280,900"])
+                    else:
+                        launch_args.extend(LabsFlowClient._hidden_browser_window_args())
                     if launch_info.get("profile_directory"):
                         launch_args.append(f"--profile-directory={launch_info['profile_directory']}")
 
@@ -3590,7 +3639,8 @@ class LabsFlowClient:
                         args=launch_args,
                     )
                     try:
-                        print("  👀 [Zendriver] Đã mở Chrome temp-profile ở chế độ visible (100,100 - 1280x900)")
+                        mode_str = "visible (100,100 - 1280x900)" if zendriver_mode == "visible" else "headful-hidden (off-screen)"
+                        print(f"  👀 [Zendriver] Đã mở Chrome temp-profile ở chế độ {mode_str}")
                         injected = 0
                         failed_cookies: List[str] = []
                         for name, value in (self.cookies or {}).items():
@@ -3901,48 +3951,52 @@ class LabsFlowClient:
         
         token = None
         token_generated_at = None
-        
-        # ✅ SOURCE 1: Playwright trước
+        source_preference = str(_env("RECAPTCHA_SOURCE", "playwright") or "playwright").strip().lower()
+
+        def inject_token(source: str, token_value: Optional[str]) -> bool:
+            nonlocal token_generated_at
+            if not token_value or len(token_value.strip()) <= 0:
+                return False
+            token_generated_at = time.time()
+            self._record_token_source(source)
+            client_context["recaptchaToken"] = token_value
+            LabsFlowClient._token_timestamps[cookie_hash] = token_generated_at
+            label = "Zendriver" if source == "zendriver" else "Playwright"
+            print(f"  ✅ [{label}] Token injected (len={len(token_value)}, ts={token_generated_at:.0f})")
+            return True
+
+        if source_preference in ("zendriver", "selenium") and self._should_use_zendriver():
+            print(f"  🔵 [Token] Ưu tiên Zendriver/temp-profile trước...")
+            try:
+                token = self._get_recaptcha_token_zendriver(timeout_s=60, recaptcha_action=recaptcha_action)
+                if inject_token("zendriver", token):
+                    return True
+                print(f"  ⚠️ [Zendriver] Không lấy được token, fallback Playwright")
+            except Exception as e:
+                print(f"  ⚠️ [Zendriver] Error, fallback Playwright: {e}")
+
         print(f"  🟡 [Token] Ưu tiên Playwright lấy token trước...")
         token = self._get_recaptcha_token_with_playwright(
-            timeout_s=90, 
-            max_retries_on_403=3, 
+            timeout_s=90,
+            max_retries_on_403=3,
             acquire_lock=acquire_lock,
             recaptcha_action=recaptcha_action,
         )
-        
-        if token and len(token.strip()) > 0:
-            token_generated_at = time.time()
-            self._record_token_source("playwright")
-            client_context["recaptchaToken"] = token
-            # ✅ Track token timestamp
-            LabsFlowClient._token_timestamps[cookie_hash] = token_generated_at
-            print(f"  ✅ [Token Source] Playwright OK, bỏ qua Zendriver fallback")
-            print(f"  ✅ [Playwright] Token injected (len={len(token)}, ts={token_generated_at:.0f})")
+        if inject_token("playwright", token):
+            print(f"  ✅ [Token Source] Playwright OK")
             return True
 
-        # ✅ SOURCE 2: Zendriver temp-profile (fallback)
-        if self._should_use_zendriver():
+        if source_preference not in ("zendriver", "selenium") and self._should_use_zendriver():
             print(f"  🔵 [Token] Playwright fail -> fallback Zendriver/temp-profile...")
             try:
-                token = self._get_recaptcha_token_zendriver(
-                    timeout_s=60,
-                    recaptcha_action=recaptcha_action,
-                )
-                if token and len(token.strip()) > 0:
-                    token_generated_at = time.time()
-                    self._record_token_source("zendriver")
-                    client_context["recaptchaToken"] = token
-                    # ✅ Track token timestamp để kiểm tra freshness trước khi gọi API
-                    LabsFlowClient._token_timestamps[cookie_hash] = token_generated_at
+                token = self._get_recaptcha_token_zendriver(timeout_s=60, recaptcha_action=recaptcha_action)
+                if inject_token("zendriver", token):
                     print(f"  ✅ [Token Source] Zendriver temp-profile OK sau khi Playwright fail")
-                    print(f"  ✅ [Zendriver] Token injected (len={len(token)}, ts={token_generated_at:.0f})")
                     return True
-                else:
-                    print(f"  ⚠️ [Zendriver] Không lấy được token sau khi Playwright fail")
+                print(f"  ⚠️ [Zendriver] Không lấy được token sau khi Playwright fail")
             except Exception as e:
                 print(f"  ⚠️ [Zendriver] Error sau fallback từ Playwright: {e}")
-        
+
         # Cả 2 source đều fail
         if raise_on_fail:
             error_msg = f"Cannot get reCAPTCHA token from both Zendriver and Playwright. {self.last_error_detail or ''}"
@@ -3967,6 +4021,29 @@ class LabsFlowClient:
                 "token": token,
                 "applicationType": "RECAPTCHA_APPLICATION_TYPE_WEB",
             }
+
+    def _sync_flow_request_contexts(self, payload: Dict[str, Any]) -> None:
+        """Mirror official Flow web payload: same session/project/token in every request."""
+        top_context = payload.get("clientContext")
+        if not isinstance(top_context, dict):
+            return
+        recaptcha_context = top_context.get("recaptchaContext")
+        session_id = top_context.get("sessionId")
+        project_id = top_context.get("projectId")
+        tool = top_context.get("tool", "PINHOLE")
+        for req in payload.get("requests", []):
+            if not isinstance(req, dict):
+                continue
+            req_context = req.setdefault("clientContext", {})
+            if recaptcha_context:
+                req_context["recaptchaContext"] = recaptcha_context
+            if session_id:
+                req_context["sessionId"] = session_id
+            if project_id:
+                req_context["projectId"] = project_id
+            req_context["tool"] = tool
+            req_context.pop("userPaygateTier", None)
+        top_context.pop("userPaygateTier", None)
 
     def _verify_token_before_api_call(self, payload: Dict[str, Any]) -> bool:
         """Verify token có trong payload trước khi gọi API.
@@ -4770,7 +4847,7 @@ class LabsFlowClient:
             Media ID string (plain UUID format) or None on failure
         """
         # Ensure we have flow_project_id for this upload
-        flow_project_id = getattr(self, 'flow_project_id', None) or "0672f813-95d5-49ab-955d-0dc7535f3198"
+        flow_project_id = getattr(self, 'flow_project_id', None) or "f29ebccd-1f46-4bd4-91ad-b1f4a093878f"
         
         for attempt in range(max_retries):
             try:
@@ -6312,36 +6389,26 @@ class LabsFlowClient:
         url = f"https://aisandbox-pa.googleapis.com/v1/projects/{project}/flowMedia:batchGenerateImages"
         
         # Bỏ check live status - chạy trực tiếp
-        # ✅ Thêm clientContext + recaptchaToken cho Flow image
-        # ✅ FIX: Thêm projectId, tool, userPaygateTier vào top-level clientContext (giống generate_videos)
+        # Flow web chỉ lấy 1 token ngay trước request; không prefetch để tránh lệch fingerprint/risk.
         client_context: Dict[str, Any] = {
             "projectId": project,
             "tool": "PINHOLE",
-            "userPaygateTier": "PAYGATE_TIER_TWO",
         }
-        try:
-            self._maybe_inject_recaptcha(client_context, raise_on_fail=True, recaptcha_action="IMAGE_GENERATION")
-            # ✅ Delay nhỏ sau khi có token để Google Labs validate token (giảm vì nối đuôi)
-            time.sleep(0.1)
-        except RuntimeError as e:
-            self.last_error_detail = str(e)
-            print(f"  ✗ Không thể lấy reCAPTCHA token: {e}")
-            return None
-
-        # ✅ Convert recaptchaToken → recaptchaContext (Flow image API yêu cầu nested format)
-        self._convert_to_recaptcha_context(client_context)
 
         # ✅ Thêm sessionId vào top-level clientContext (theo format: ";timestamp")
         # ✅ Tạo sessionId chung cho cả top-level và tất cả requests (theo curl example)
         common_session_id = f";{int(time.time() * 1000)}"
         client_context["sessionId"] = common_session_id
         
-        # ✅ Đảm bảo tất cả requests có cùng sessionId với top-level (theo curl example)
-        # ✅ Đồng thời convert recaptchaToken → recaptchaContext cho mỗi request
+        # ✅ Mirror token/session/project vào từng request giống payload official của Flow web.
         for req in requests_payload:
-            if "clientContext" in req and isinstance(req["clientContext"], dict):
-                req["clientContext"]["sessionId"] = common_session_id
-                self._convert_to_recaptcha_context(req["clientContext"])
+            if isinstance(req, dict):
+                req_context = req.setdefault("clientContext", {})
+                req_context["sessionId"] = common_session_id
+                req_context["projectId"] = project
+                req_context["tool"] = "PINHOLE"
+        temp_payload_for_sync = {"clientContext": client_context, "requests": requests_payload}
+        self._sync_flow_request_contexts(temp_payload_for_sync)
 
         # ✅ Thêm useNewMedia và mediaGenerationContext theo API format thực tế
         import uuid
@@ -6352,15 +6419,8 @@ class LabsFlowClient:
             "requests": requests_payload,
         }
         
-        # ✅ VERIFY: Đảm bảo token đã được inject vào payload trước khi gọi API
-        if not self._verify_token_before_api_call(payload):
-            return None
-        
-        # ✅ Rate limiting - delay trước khi gọi API để tránh 403
-        self._rate_limit_api_call()
-        
-        # ✅ Retry logic với xử lý 403 reCAPTCHA error và 500 Internal Server Error
-        max_retries = 3  # ✅ Giảm từ 5 xuống 3 theo yêu cầu
+        # ✅ Flow image: chỉ chạy 1 luồng/1 attempt để tránh spam reCAPTCHA làm tăng risk score.
+        max_retries = 1
         resp = None
         for attempt in range(max_retries):
             try:
@@ -6374,8 +6434,9 @@ class LabsFlowClient:
                     # ✅ Khôi phục sessionId nếu bị mất
                     if old_session_id and "sessionId" not in client_context:
                         client_context["sessionId"] = old_session_id
-                    # ✅ Update lại payload với client_context mới
+                    # ✅ Update lại payload với client_context mới và mirror token vào từng request
                     payload["clientContext"] = client_context
+                    self._sync_flow_request_contexts(payload)
                     # ✅ Delay nhỏ sau khi có token để Google Labs validate token
                     time.sleep(0.1)
                 except RuntimeError as e:
@@ -6398,8 +6459,9 @@ class LabsFlowClient:
                 if not self._ensure_fresh_token(payload["clientContext"], recaptcha_action="IMAGE_GENERATION", acquire_lock=False):
                     self.last_error_detail = "Token expired và không thể lấy mới trước khi gọi Flow API"
                     return None
-                # ✅ Convert lại format nếu token mới được inject
+                # ✅ Convert lại format nếu token mới được inject, rồi mirror token top-level vào request.
                 self._convert_to_recaptcha_context(payload["clientContext"])
+                self._sync_flow_request_contexts(payload)
                 
                 # ✅ LOG HEADERS VÀ PAYLOAD CHI TIẾT - FULL (KHÔNG TRUNCATE)
                 request_headers = self._aisandbox_headers()
@@ -6563,9 +6625,10 @@ class LabsFlowClient:
                         
                         # Chưa đến ngưỡng reset, thử lấy token mới
                         if error_details['is_recaptcha_error'] or "reCAPTCHA" in error_msg or "recaptcha" in error_msg.lower():
-                            if self._handle_403_recaptcha_error(payload, attempt, max_retries):
+                            if self._handle_403_recaptcha_error(payload, attempt, max_retries, recaptcha_action="IMAGE_GENERATION"):
                                 # ✅ Convert lại recaptchaToken → recaptchaContext sau khi _handle_403 inject token mới
                                 self._convert_to_recaptcha_context(payload["clientContext"])
+                                self._sync_flow_request_contexts(payload)
                                 continue  # Retry với token mới
                             else:
                                 self.last_error_detail = "403 reCAPTCHA evaluation failed - không thể lấy token mới"
@@ -6658,9 +6721,10 @@ class LabsFlowClient:
                             error_msg = json.dumps(error_data, indent=2, ensure_ascii=False)
                             print(f"  ❌ 403 Error details: {error_msg}")
                             if "reCAPTCHA" in error_msg or "recaptcha" in error_msg.lower():
-                                if self._handle_403_recaptcha_error(payload, attempt, max_retries):
+                                if self._handle_403_recaptcha_error(payload, attempt, max_retries, recaptcha_action="IMAGE_GENERATION"):
                                     # ✅ Convert lại recaptchaToken → recaptchaContext sau khi _handle_403 inject token mới
                                     self._convert_to_recaptcha_context(payload["clientContext"])
+                                    self._sync_flow_request_contexts(payload)
                                     continue  # Retry với token mới
                         except Exception:
                             pass
@@ -7259,7 +7323,7 @@ class LabsFlowClient:
                             
                             # Chưa đến ngưỡng reset, thử lấy token mới
                             if "reCAPTCHA" in error_msg or "recaptcha" in error_msg.lower():
-                                if self._handle_403_recaptcha_error(payload, attempt, max_retries):
+                                if self._handle_403_recaptcha_error(payload, attempt, max_retries, recaptcha_action="IMAGE_GENERATION"):
                                     continue  # Retry với token mới
                                 else:
                                     self.last_error_detail = "403 reCAPTCHA evaluation failed - không thể lấy token mới"
@@ -7325,7 +7389,7 @@ class LabsFlowClient:
                                 error_data = resp.json()
                                 error_msg = json.dumps(error_data)
                                 if "reCAPTCHA" in error_msg or "recaptcha" in error_msg.lower():
-                                    if self._handle_403_recaptcha_error(payload, attempt, max_retries):
+                                    if self._handle_403_recaptcha_error(payload, attempt, max_retries, recaptcha_action="IMAGE_GENERATION"):
                                         continue  # Retry với token mới
                             except Exception:
                                 pass

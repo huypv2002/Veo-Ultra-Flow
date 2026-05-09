@@ -355,7 +355,13 @@ class ChromeCDPSession:
             cmd.append(f"--profile-directory={self.profile_info['profile_directory']}")
 
         if self.headless:
-            cmd.extend(["--headless=new", "--disable-gpu", "--no-sandbox"])
+            # True headless is disabled for Google flows; keep Chrome headful and move it off-screen.
+            import platform
+            if platform.system() == "Windows":
+                cmd.extend(["--window-position=-32000,-32000", "--window-size=400,300"])
+            else:
+                cmd.extend(["--window-position=-3000,-3000", "--window-size=400,300"])
+            cmd.extend(["--disable-gpu", "--no-sandbox"])
 
         # Proxy support: --proxy-server cho Chrome
         if self.proxy_server:
