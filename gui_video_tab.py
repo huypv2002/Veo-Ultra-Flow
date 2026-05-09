@@ -619,24 +619,26 @@ class VideoTabMixin:
         # Bao gồm cả Portrait (9:16) và Landscape (16:9) variants
         self.combo_model.addItems([
             # Landscape (16:9)
-            "Low Fast (16:9) - 0 credits",
-            "Lite (16:9) - 0 credits",
-            "Fast (16:9) - 10 credits",
-            "Quality (16:9) - 100 credits",
+            "Veo 3.1 - Lite (16:9) - 0 credits",
+            "Veo 3.1 - Fast (16:9) - 10 credits",
+            "Veo 3.1 - Quality (16:9) - 100 credits",
+            "Veo 3.1 - Lite [Lower Priority] (16:9) - 0 credits",
+            "Veo 3.1 - Fast [Lower Priority] (16:9) - 0 credits",
             # Portrait (9:16)
-            "Low Fast (9:16) - 0 credits",
-            "Lite (9:16) - 0 credits",
-            "Fast (9:16) - 10 credits",
-            "Quality (9:16) - 100 credits",
+            "Veo 3.1 - Lite (9:16) - 0 credits",
+            "Veo 3.1 - Fast (9:16) - 10 credits",
+            "Veo 3.1 - Quality (9:16) - 100 credits",
+            "Veo 3.1 - Lite [Lower Priority] (9:16) - 0 credits",
+            "Veo 3.1 - Fast [Lower Priority] (9:16) - 0 credits",
         ])
-        self.combo_model.setCurrentIndex(1)  # Default = Fast (16:9) (10 credits)
+        self.combo_model.setCurrentIndex(1)  # Default = Veo 3.1 - Fast (16:9) (10 credits)
         settings_layout.addWidget(self.combo_model, row, 1)
         self.combo_model.currentIndexChanged.connect(self.update_model_credit_hint)
         
         # Model credit hint - Ẩn vì đã có trong combo box
         self.model_credit_label = QLabel("")
         self.model_credit_label.setStyleSheet("font-size: 11px; color: #616161;")
-        self.model_credit_label.setVisible(False)  # Ẩn vì đã có thông tin trong combo
+        self.model_credit_label.setVisible(True)  # Luôn hiển thị credits rõ ràng dưới dropdown
         settings_layout.addWidget(self.model_credit_label, row + 1, 0, 1, 2)
         self.update_model_credit_hint()
         

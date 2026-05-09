@@ -5901,17 +5901,28 @@ class GoogleLabsFlowQt6(QMainWindow, FlowTabMixin, VideoTabMixin):
         
         # Map display text to actual model key - Veo 3.1 Full Models
         model_map = {
-            # T2V Models - Landscape (16:9) - KHỚP VỚI COMBO BOX
-            "Low Fast (16:9) - 0 credits": "veo_3_1_t2v_fast_ultra_relaxed",  # 0 credits
-            "Lite (16:9) - 0 credits": "veo_3_1_t2v_lite_low_priority",       # 0 credits
-            "Fast (16:9) - 10 credits": "veo_3_1_t2v_fast_ultra",              # 10 credits
-            "Quality (16:9) - 100 credits": "veo_3_1_t2v",                     # 100 credits
+            # Official Flow T2V Models - Landscape (16:9)
+            "Veo 3.1 - Lite (16:9) - 0 credits": "veo_3_1_t2v_lite",                    # Official: Veo 3.1 - Lite
+            "Veo 3.1 - Fast (16:9) - 10 credits": "veo_3_1_t2v_fast_ultra",              # Official: Veo 3.1 - Fast
+            "Veo 3.1 - Quality (16:9) - 100 credits": "veo_3_1_t2v",                     # Official: Veo 3.1 - Quality
+            "Veo 3.1 - Lite [Lower Priority] (16:9) - 0 credits": "veo_3_1_t2v_lite_low_priority",  # Official: Veo 3.1 - Lite [Lower Priority]
+            "Veo 3.1 - Fast [Lower Priority] (16:9) - 0 credits": "veo_3_1_t2v_fast_ultra_relaxed", # Official: Veo 3.1 - Fast [Lower Priority]
             
-            # Portrait T2V Models (9:16) - KHỚP VỚI COMBO BOX
-            "Low Fast (9:16) - 0 credits": "veo_3_1_t2v_fast_portrait_ultra_relaxed",  # 0 credits
-            "Lite (9:16) - 0 credits": "veo_3_1_t2v_lite_low_priority",                 # 0 credits
-            "Fast (9:16) - 10 credits": "veo_3_1_t2v_fast_portrait_ultra",              # 10 credits
-            "Quality (9:16) - 100 credits": "veo_3_1_t2v_portrait",                     # 100 credits
+            # Official Flow T2V Models - Portrait (9:16)
+            "Veo 3.1 - Lite (9:16) - 0 credits": "veo_3_1_t2v_lite",                              # Official: Veo 3.1 - Lite
+            "Veo 3.1 - Fast (9:16) - 10 credits": "veo_3_1_t2v_fast_portrait_ultra",              # Official: Veo 3.1 - Fast
+            "Veo 3.1 - Quality (9:16) - 100 credits": "veo_3_1_t2v_portrait",                     # Official: Veo 3.1 - Quality
+            "Veo 3.1 - Lite [Lower Priority] (9:16) - 0 credits": "veo_3_1_t2v_lite_low_priority",          # Official: Veo 3.1 - Lite [Lower Priority]
+            "Veo 3.1 - Fast [Lower Priority] (9:16) - 0 credits": "veo_3_1_t2v_fast_portrait_ultra_relaxed", # Official: Veo 3.1 - Fast [Lower Priority]
+            # Old app labels
+            "Lite (16:9) - 0 credits": "veo_3_1_t2v_lite_low_priority",
+            "Low Fast (16:9) - 0 credits": "veo_3_1_t2v_fast_ultra_relaxed",
+            "Fast (16:9) - 10 credits": "veo_3_1_t2v_fast_ultra",
+            "Quality (16:9) - 100 credits": "veo_3_1_t2v",
+            "Lite (9:16) - 0 credits": "veo_3_1_t2v_lite_low_priority",
+            "Low Fast (9:16) - 0 credits": "veo_3_1_t2v_fast_portrait_ultra_relaxed",
+            "Fast (9:16) - 10 credits": "veo_3_1_t2v_fast_portrait_ultra",
+            "Quality (9:16) - 100 credits": "veo_3_1_t2v_portrait",
             
             # Legacy names (backward compatibility - không có "- X credits")
             "Low Fast (16:9)": "veo_3_1_t2v_fast_ultra_relaxed",
@@ -5951,11 +5962,10 @@ class GoogleLabsFlowQt6(QMainWindow, FlowTabMixin, VideoTabMixin):
                     model = "veo_3_1_i2v_s_fast_portrait_ultra_relaxed"  # I2V Low Fast Portrait
                 else:
                     model = "veo_3_1_i2v_s_fast_ultra_relaxed"  # I2V Low Fast Landscape (KHÔNG có _fl)
-            elif model == "veo_3_1_t2v_lite_low_priority":  # Lite (0 credits) - NEW
-                if is_portrait:
-                    model = "veo_3_1_i2v_lite_low_priority"  # I2V Lite Portrait
-                else:
-                    model = "veo_3_1_i2v_lite_low_priority"  # I2V Lite Landscape
+            elif model == "veo_3_1_t2v_lite":  # Official Lite
+                model = "veo_3_1_i2v_lite"
+            elif model == "veo_3_1_t2v_lite_low_priority":  # Official Lite [Lower Priority]
+                model = "veo_3_1_i2v_lite_low_priority"
             elif model == "veo_3_1_t2v_fast_ultra":  # Fast (10 credits)
                 if is_portrait:
                     model = "veo_3_1_i2v_s_fast_portrait_ultra"  # I2V Fast Portrait (KHÔNG có _fl)
@@ -5976,12 +5986,14 @@ class GoogleLabsFlowQt6(QMainWindow, FlowTabMixin, VideoTabMixin):
         elif current_mode == "Integrate to Video":
             # ✅ Update to Veo 3.1 Reference Images models based on aspect ratio AND quality mode
             is_relaxed = "relaxed" in model.lower() if model else False
-            is_lite = "lite" in model.lower() if model else False
+            is_lite_low_priority = "lite_low_priority" in model.lower() if model else False
+            is_lite = ("lite" in model.lower() if model else False) and not is_lite_low_priority
             # Xác định portrait/landscape từ model text thay vì aspect combo
             is_portrait = "9:16" in model_text
-            if is_lite:
-                # ✅ Lite model - dùng chung cho cả portrait và landscape
+            if is_lite_low_priority:
                 model = "veo_3_1_r2v_lite_low_priority"
+            elif is_lite:
+                model = "veo_3_1_r2v_lite"
             elif is_portrait:
                 if is_relaxed:
                     model = "veo_3_1_r2v_fast_portrait_ultra_relaxed"
@@ -6029,8 +6041,12 @@ class GoogleLabsFlowQt6(QMainWindow, FlowTabMixin, VideoTabMixin):
             )
             return
         
+        expected_credit = self._expected_credit_for_model_label(model_text)
+        if not self._validate_model_credit_safety(model_text, model, expected_credit):
+            return
         self.log(f"📊 Chế độ: {self.current_video_mode}")
-        self.log(f"📊 Model: {model}, Videos: {num_videos}, Aspect: {aspect}")
+        self.log(f"📊 Model UI: {model_text}")
+        self.log(f"📊 Model API: {model}, Expected credits: {expected_credit}, Videos: {num_videos}, Aspect: {aspect}")
         self.log(f"📊 Tổng tasks: {len(tasks)}")
         
         # Removed DEBUG log
@@ -9673,7 +9689,8 @@ class GoogleLabsFlowQt6(QMainWindow, FlowTabMixin, VideoTabMixin):
             # Old models (backward compatibility)
             "veo_3_0_r2v_fast_ultra": "veo_3_1_t2v_fast_ultra",
             "veo_3_0_r2v_fast_ultra_relaxed": "veo_3_1_t2v_fast_ultra_relaxed",
-            # ✅ Veo 3.1 R2V Lite model
+            # ✅ Veo 3.1 R2V Lite models
+            "veo_3_1_r2v_lite": "veo_3_1_t2v_lite",
             "veo_3_1_r2v_lite_low_priority": "veo_3_1_t2v_lite_low_priority",
             # Veo 3.1 R2V Landscape models (16:9) - KHÔNG có "landscape" trong tên T2V
             "veo_3_1_r2v_fast_landscape_ultra": "veo_3_1_t2v_fast_ultra",
@@ -9688,7 +9705,8 @@ class GoogleLabsFlowQt6(QMainWindow, FlowTabMixin, VideoTabMixin):
             "veo_3_1_i2v_s_fast_portrait_ultra": "veo_3_1_t2v_fast_portrait_ultra",
             "veo_3_1_i2v_s_fast_portrait_ultra_relaxed": "veo_3_1_t2v_fast_portrait_ultra_relaxed",
             "veo_3_1_i2v_s_portrait": "veo_3_1_t2v_portrait",
-            # ✅ Veo 3.1 I2V Lite models - NEW
+            # ✅ Veo 3.1 I2V Lite models
+            "veo_3_1_i2v_lite": "veo_3_1_t2v_lite",
             "veo_3_1_i2v_lite_low_priority": "veo_3_1_t2v_lite_low_priority",
         }
         
@@ -15805,10 +15823,13 @@ QUAN TRỌNG:
             # Step 1: Set model key (QUAN TRỌNG)
             # Start+End dùng interpolation model riêng, map theo model đang chọn trên UI.
             is_relaxed = "relaxed" in model.lower() if model else False
-            is_lite = "lite" in model.lower() if model else False
+            is_lite_low_priority = "lite_low_priority" in model.lower() if model else False
+            is_lite = ("lite" in model.lower() if model else False) and not is_lite_low_priority
             
-            if is_lite:
+            if is_lite_low_priority:
                 se_model = "veo_3_1_interpolation_lite_low_priority"
+            elif is_lite:
+                se_model = "veo_3_1_interpolation_lite"
             elif aspect_value == "VIDEO_ASPECT_RATIO_PORTRAIT":
                 se_model = "veo_3_1_i2v_s_fast_portrait_ultra"  # Fast Portrait (KHÔNG có _fl)
                 if is_relaxed:
@@ -15817,7 +15838,10 @@ QUAN TRỌNG:
                 se_model = "veo_3_1_i2v_s_fast_ultra"  # Fast Landscape
                 if is_relaxed:
                     se_model = "veo_3_1_i2v_s_fast_ultra_relaxed"  # Low Fast Landscape
-            self.log(f"🔧 Start+End model: {model} → API key: {se_model}")
+            expected_credit = "0" if (is_lite or is_relaxed) else ("100" if "t2v" in str(model) and str(model).endswith(("t2v", "t2v_portrait")) else "10")
+            if not self._validate_model_credit_safety(f"Start+End ({aspect})", se_model, expected_credit):
+                return False
+            self.log(f"🔧 Start+End model: {model} → API key: {se_model} (expected credits: {expected_credit})")
             if not client.set_video_model_key(se_model):
                 self.log(f"❌ Set model thất bại")
                 return False
@@ -16831,10 +16855,16 @@ QUAN TRỌNG:
             # Build requests body với num_videos requests
             requests_body = []
             # ✅ Update to Veo 3.1 model keys based on aspect ratio AND quality mode
-            # Kiểm tra model có phải relaxed mode không
+            # Kiểm tra model có phải lite/relaxed mode không
+            is_lite_low_priority = "lite_low_priority" in model.lower() if model else False
+            is_lite = ("lite" in model.lower() if model else False) and not is_lite_low_priority
             is_relaxed = "relaxed" in model.lower() if model else False
             
-            if aspect_value == "VIDEO_ASPECT_RATIO_PORTRAIT":
+            if is_lite_low_priority:
+                reference_model_key = "veo_3_1_r2v_lite_low_priority"
+            elif is_lite:
+                reference_model_key = "veo_3_1_r2v_lite"
+            elif aspect_value == "VIDEO_ASPECT_RATIO_PORTRAIT":
                 if is_relaxed:
                     reference_model_key = "veo_3_1_r2v_fast_portrait_ultra_relaxed"
                 else:
@@ -17243,9 +17273,15 @@ QUAN TRỌNG:
             seeds = [int(time.time() * 1000000 + i) % 100000 for i in range(num_videos)]
             
             # ✅ Update to Veo 3.1 model keys based on aspect ratio AND quality mode
+            is_lite_low_priority = "lite_low_priority" in model.lower() if model else False
+            is_lite = ("lite" in model.lower() if model else False) and not is_lite_low_priority
             is_relaxed = "relaxed" in model.lower() if model else False
             
-            if aspect_value == "VIDEO_ASPECT_RATIO_PORTRAIT":
+            if is_lite_low_priority:
+                reference_model_key = "veo_3_1_r2v_lite_low_priority"
+            elif is_lite:
+                reference_model_key = "veo_3_1_r2v_lite"
+            elif aspect_value == "VIDEO_ASPECT_RATIO_PORTRAIT":
                 if is_relaxed:
                     reference_model_key = "veo_3_1_r2v_fast_portrait_ultra_relaxed"
                 else:
@@ -17505,9 +17541,15 @@ QUAN TRỌNG:
             seeds = [int(time.time() * 1000000 + i) % 100000 for i in range(num_videos)]
             
             # ✅ Update to Veo 3.1 model keys based on aspect ratio AND quality mode
+            is_lite_low_priority = "lite_low_priority" in model.lower() if model else False
+            is_lite = ("lite" in model.lower() if model else False) and not is_lite_low_priority
             is_relaxed = "relaxed" in model.lower() if model else False
             
-            if aspect_value == "VIDEO_ASPECT_RATIO_PORTRAIT":
+            if is_lite_low_priority:
+                reference_model_key = "veo_3_1_r2v_lite_low_priority"
+            elif is_lite:
+                reference_model_key = "veo_3_1_r2v_lite"
+            elif aspect_value == "VIDEO_ASPECT_RATIO_PORTRAIT":
                 if is_relaxed:
                     reference_model_key = "veo_3_1_r2v_fast_portrait_ultra_relaxed"
                 else:
@@ -25022,6 +25064,47 @@ Requirements:
         except Exception:
             # Không để UI crash nếu có lỗi nhỏ
             pass
+
+    @staticmethod
+    def _expected_credit_for_model_label(model_label: str) -> str:
+        """Return expected credit tier from UI label."""
+        label = str(model_label or "")
+        if "100 credits" in label:
+            return "100"
+        if "10 credits" in label:
+            return "10"
+        if "0 credits" in label:
+            return "0"
+        if "Quality" in label or "Standard" in label:
+            return "100"
+        if "Fast" in label and "Low" not in label and "Relaxed" not in label:
+            return "10"
+        if "Lite" in label or "Low Fast" in label or "Relaxed" in label:
+            return "0"
+        return "unknown"
+
+    def _validate_model_credit_safety(self, model_label: str, model_key: str, expected_credit: str) -> bool:
+        """Block unsafe mapping where 0-credit UI resolves to known paid/quality model."""
+        model = str(model_key or "")
+        zero_credit_safe_tokens = ("low_priority", "relaxed", "lite")
+        hundred_credit_models = {
+            "veo_3_1_t2v",
+            "veo_3_1_t2v_portrait",
+            "veo_3_1_i2v_s",
+            "veo_3_1_i2v_s_portrait",
+        }
+        if expected_credit == "0" and (model in hundred_credit_models or not any(tok in model for tok in zero_credit_safe_tokens)):
+            msg = (
+                f"Chặn an toàn credits: UI chọn '{model_label}' (0 credits) "
+                f"nhưng API model là '{model_key}'."
+            )
+            self.log(f"🚫 {msg}")
+            try:
+                QMessageBox.critical(self, "Chặn model sai credits", msg)
+            except Exception:
+                pass
+            return False
+        return True
 
     def update_model_credit_hint(self):
         """Hiển thị thông tin credits theo model đang chọn (UI-only)."""

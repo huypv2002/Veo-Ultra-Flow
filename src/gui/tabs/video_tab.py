@@ -443,12 +443,16 @@ def build_left_panel(main_app):
     settings_layout.addWidget(QLabel("Model:"), row, 0)
     main_app.combo_model = QComboBox()
     main_app.combo_model.addItems([
-        "Low Fast (16:9) - 0 credits",
-        "Fast (16:9) - 10 credits",
-        "Quality (16:9) - 100 credits",
-        "Low Fast (9:16) - 0 credits",
-        "Fast (9:16) - 10 credits",
-        "Quality (9:16) - 100 credits",
+        "Veo 3.1 - Lite (16:9) - 0 credits",
+        "Veo 3.1 - Fast (16:9) - 10 credits",
+        "Veo 3.1 - Quality (16:9) - 100 credits",
+        "Veo 3.1 - Lite [Lower Priority] (16:9) - 0 credits",
+        "Veo 3.1 - Fast [Lower Priority] (16:9) - 0 credits",
+        "Veo 3.1 - Lite (9:16) - 0 credits",
+        "Veo 3.1 - Fast (9:16) - 10 credits",
+        "Veo 3.1 - Quality (9:16) - 100 credits",
+        "Veo 3.1 - Lite [Lower Priority] (9:16) - 0 credits",
+        "Veo 3.1 - Fast [Lower Priority] (9:16) - 0 credits",
     ])
     main_app.combo_model.setCurrentIndex(1)
     settings_layout.addWidget(main_app.combo_model, row, 1)
@@ -456,7 +460,7 @@ def build_left_panel(main_app):
     
     main_app.model_credit_label = QLabel("")
     main_app.model_credit_label.setStyleSheet("font-size: 11px; color: #616161;")
-    main_app.model_credit_label.setVisible(False)
+    main_app.model_credit_label.setVisible(True)
     settings_layout.addWidget(main_app.model_credit_label, row + 1, 0, 1, 2)
     main_app.update_model_credit_hint()
     
