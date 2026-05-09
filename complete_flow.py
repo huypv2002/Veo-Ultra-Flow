@@ -3951,7 +3951,7 @@ class LabsFlowClient:
         
         token = None
         token_generated_at = None
-        source_preference = str(_env("RECAPTCHA_SOURCE", "zendriver") or "zendriver").strip().lower()
+        source_preference = str(_env("RECAPTCHA_SOURCE", "playwright") or "playwright").strip().lower()
 
         def inject_token(source: str, token_value: Optional[str]) -> bool:
             nonlocal token_generated_at
