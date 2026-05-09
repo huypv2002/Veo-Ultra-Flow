@@ -3951,7 +3951,7 @@ class LabsFlowClient:
         
         token = None
         token_generated_at = None
-        source_preference = str(_env("RECAPTCHA_SOURCE", "playwright") or "playwright").strip().lower()
+        source_preference = str(_env("RECAPTCHA_SOURCE", "zendriver") or "zendriver").strip().lower()
 
         def inject_token(source: str, token_value: Optional[str]) -> bool:
             nonlocal token_generated_at
@@ -4232,9 +4232,14 @@ class LabsFlowClient:
         try:
             mapped_aspect = LabsFlowClient._map_video_aspect(aspect_ratio)
             
-            # Detect mode: relaxed, fast, quality
+            # Detect mode: relaxed, fast, quality, lite
             is_relaxed = "relaxed" in base_key
+            is_lite = "lite" in base_key
             is_fl = "_fl" in base_key  # start-end mode
+            
+            # Flow2API: Lite model_key stays same for portrait/landscape; aspect carries orientation.
+            if is_lite:
+                return base_key
             
             # Portrait (9:16) → map sang model portrait
             if mapped_aspect == "VIDEO_ASPECT_RATIO_PORTRAIT":

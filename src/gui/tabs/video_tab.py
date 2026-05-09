@@ -443,18 +443,18 @@ def build_left_panel(main_app):
     settings_layout.addWidget(QLabel("Model:"), row, 0)
     main_app.combo_model = QComboBox()
     main_app.combo_model.addItems([
-        "Veo 3.1 - Lite (16:9) - 0 credits",
+        "Veo 3.1 - Lite (16:9) - 5 credits",
         "Veo 3.1 - Fast (16:9) - 10 credits",
         "Veo 3.1 - Quality (16:9) - 100 credits",
         "Veo 3.1 - Lite [Lower Priority] (16:9) - 0 credits",
         "Veo 3.1 - Fast [Lower Priority] (16:9) - 0 credits",
-        "Veo 3.1 - Lite (9:16) - 0 credits",
+        "Veo 3.1 - Lite (9:16) - 5 credits",
         "Veo 3.1 - Fast (9:16) - 10 credits",
         "Veo 3.1 - Quality (9:16) - 100 credits",
         "Veo 3.1 - Lite [Lower Priority] (9:16) - 0 credits",
         "Veo 3.1 - Fast [Lower Priority] (9:16) - 0 credits",
     ])
-    main_app.combo_model.setCurrentIndex(1)
+    main_app.combo_model.setCurrentIndex(3)  # Default = Veo 3.1 - Lite [Lower Priority] (16:9) - 0 credits
     settings_layout.addWidget(main_app.combo_model, row, 1)
     main_app.combo_model.currentIndexChanged.connect(main_app.update_model_credit_hint)
     

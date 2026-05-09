@@ -615,23 +615,23 @@ class VideoTabMixin:
         # Model
         settings_layout.addWidget(QLabel("Model"), row, 0)
         self.combo_model = QComboBox()
-        # Sắp xếp theo credits: Low Fast (0) < Fast (10) < Quality (100)
+        # Ultra credits: Lite 5, Fast 10, Quality 100, Lower Priority 0
         # Bao gồm cả Portrait (9:16) và Landscape (16:9) variants
         self.combo_model.addItems([
             # Landscape (16:9)
-            "Veo 3.1 - Lite (16:9) - 0 credits",
+            "Veo 3.1 - Lite (16:9) - 5 credits",
             "Veo 3.1 - Fast (16:9) - 10 credits",
             "Veo 3.1 - Quality (16:9) - 100 credits",
             "Veo 3.1 - Lite [Lower Priority] (16:9) - 0 credits",
             "Veo 3.1 - Fast [Lower Priority] (16:9) - 0 credits",
             # Portrait (9:16)
-            "Veo 3.1 - Lite (9:16) - 0 credits",
+            "Veo 3.1 - Lite (9:16) - 5 credits",
             "Veo 3.1 - Fast (9:16) - 10 credits",
             "Veo 3.1 - Quality (9:16) - 100 credits",
             "Veo 3.1 - Lite [Lower Priority] (9:16) - 0 credits",
             "Veo 3.1 - Fast [Lower Priority] (9:16) - 0 credits",
         ])
-        self.combo_model.setCurrentIndex(1)  # Default = Veo 3.1 - Fast (16:9) (10 credits)
+        self.combo_model.setCurrentIndex(3)  # Default = Veo 3.1 - Lite [Lower Priority] (16:9) - 0 credits
         settings_layout.addWidget(self.combo_model, row, 1)
         self.combo_model.currentIndexChanged.connect(self.update_model_credit_hint)
         

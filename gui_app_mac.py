@@ -5902,35 +5902,35 @@ class GoogleLabsFlowQt6(QMainWindow, FlowTabMixin, VideoTabMixin):
         # Map display text to actual model key - Veo 3.1 Full Models
         model_map = {
             # Official Flow T2V Models - Landscape (16:9)
-            "Veo 3.1 - Lite (16:9) - 0 credits": "veo_3_1_t2v_lite",                    # Official: Veo 3.1 - Lite
+            "Veo 3.1 - Lite (16:9) - 5 credits": "veo_3_1_t2v_lite",                    # Official: Veo 3.1 - Lite
             "Veo 3.1 - Fast (16:9) - 10 credits": "veo_3_1_t2v_fast_ultra",              # Official: Veo 3.1 - Fast
             "Veo 3.1 - Quality (16:9) - 100 credits": "veo_3_1_t2v",                     # Official: Veo 3.1 - Quality
             "Veo 3.1 - Lite [Lower Priority] (16:9) - 0 credits": "veo_3_1_t2v_lite_low_priority",  # Official: Veo 3.1 - Lite [Lower Priority]
             "Veo 3.1 - Fast [Lower Priority] (16:9) - 0 credits": "veo_3_1_t2v_fast_ultra_relaxed", # Official: Veo 3.1 - Fast [Lower Priority]
             
             # Official Flow T2V Models - Portrait (9:16)
-            "Veo 3.1 - Lite (9:16) - 0 credits": "veo_3_1_t2v_lite",                              # Official: Veo 3.1 - Lite
+            "Veo 3.1 - Lite (9:16) - 5 credits": "veo_3_1_t2v_lite",                              # Official: Veo 3.1 - Lite
             "Veo 3.1 - Fast (9:16) - 10 credits": "veo_3_1_t2v_fast_portrait_ultra",              # Official: Veo 3.1 - Fast
             "Veo 3.1 - Quality (9:16) - 100 credits": "veo_3_1_t2v_portrait",                     # Official: Veo 3.1 - Quality
             "Veo 3.1 - Lite [Lower Priority] (9:16) - 0 credits": "veo_3_1_t2v_lite_low_priority",          # Official: Veo 3.1 - Lite [Lower Priority]
             "Veo 3.1 - Fast [Lower Priority] (9:16) - 0 credits": "veo_3_1_t2v_fast_portrait_ultra_relaxed", # Official: Veo 3.1 - Fast [Lower Priority]
             # Old app labels
-            "Lite (16:9) - 0 credits": "veo_3_1_t2v_lite_low_priority",
+            "Lite (16:9) - 5 credits": "veo_3_1_t2v_lite",
             "Low Fast (16:9) - 0 credits": "veo_3_1_t2v_fast_ultra_relaxed",
             "Fast (16:9) - 10 credits": "veo_3_1_t2v_fast_ultra",
             "Quality (16:9) - 100 credits": "veo_3_1_t2v",
-            "Lite (9:16) - 0 credits": "veo_3_1_t2v_lite_low_priority",
+            "Lite (9:16) - 5 credits": "veo_3_1_t2v_lite",
             "Low Fast (9:16) - 0 credits": "veo_3_1_t2v_fast_portrait_ultra_relaxed",
             "Fast (9:16) - 10 credits": "veo_3_1_t2v_fast_portrait_ultra",
             "Quality (9:16) - 100 credits": "veo_3_1_t2v_portrait",
             
             # Legacy names (backward compatibility - không có "- X credits")
             "Low Fast (16:9)": "veo_3_1_t2v_fast_ultra_relaxed",
-            "Lite (16:9)": "veo_3_1_t2v_lite_low_priority",
+            "Lite (16:9)": "veo_3_1_t2v_lite",
             "Fast (16:9)": "veo_3_1_t2v_fast_ultra",
             "Quality (16:9)": "veo_3_1_t2v",
             "Low Fast (9:16)": "veo_3_1_t2v_fast_portrait_ultra_relaxed",
-            "Lite (9:16)": "veo_3_1_t2v_lite_low_priority",
+            "Lite (9:16)": "veo_3_1_t2v_lite",
             "Fast (9:16)": "veo_3_1_t2v_fast_portrait_ultra",
             "Quality (9:16)": "veo_3_1_t2v_portrait",
             "Veo 3.1 Ultra": "veo_3_1_t2v_fast_ultra",
@@ -5939,8 +5939,8 @@ class GoogleLabsFlowQt6(QMainWindow, FlowTabMixin, VideoTabMixin):
             "Veo 3.1 Standard Portrait": "veo_3_1_t2v_portrait",
             "Veo 3.1 Relaxed": "veo_3_1_t2v_fast_ultra_relaxed",
             "Veo 3.1 Relaxed Portrait": "veo_3_1_t2v_fast_portrait_ultra_relaxed",
-            "Veo 3.1 Lite": "veo_3_1_t2v_lite_low_priority",
-            "Veo 3.1 Lite Portrait": "veo_3_1_t2v_lite_low_priority",
+            "Veo 3.1 Lite": "veo_3_1_t2v_lite",
+            "Veo 3.1 Lite Portrait": "veo_3_1_t2v_lite",
             "Veo 2.1 Fast": "veo_2_1_fast_d_15_t2v",
         }
         # ⚠️ NOTE: Default luôn là bản 10 credits (Fast) để tránh nhầm sang bản 100 credits (Quality)
@@ -5962,10 +5962,8 @@ class GoogleLabsFlowQt6(QMainWindow, FlowTabMixin, VideoTabMixin):
                     model = "veo_3_1_i2v_s_fast_portrait_ultra_relaxed"  # I2V Low Fast Portrait
                 else:
                     model = "veo_3_1_i2v_s_fast_ultra_relaxed"  # I2V Low Fast Landscape (KHÔNG có _fl)
-            elif model == "veo_3_1_t2v_lite":  # Official Lite
+            elif model == "veo_3_1_t2v_lite":  # Flow2API Lite (5 credits)
                 model = "veo_3_1_i2v_lite"
-            elif model == "veo_3_1_t2v_lite_low_priority":  # Official Lite [Lower Priority]
-                model = "veo_3_1_i2v_lite_low_priority"
             elif model == "veo_3_1_t2v_fast_ultra":  # Fast (10 credits)
                 if is_portrait:
                     model = "veo_3_1_i2v_s_fast_portrait_ultra"  # I2V Fast Portrait (KHÔNG có _fl)
@@ -7875,10 +7873,14 @@ class GoogleLabsFlowQt6(QMainWindow, FlowTabMixin, VideoTabMixin):
                 # ✅ Đảm bảo model 0 credits cho I2V - _get_effective_model sẽ xử lý portrait/landscape
                 model = "veo_3_1_i2v_s_fast_ultra_relaxed"
                 self.log(f"✅ I2V: Model 0 credits được set: {model}")
-            elif model in ["Lite", "Lite (16:9)", "Lite (9:16)", "veo_3_1_t2v_lite_low_priority", "Veo 3.1 Lite", "Veo 3.1 Lite Portrait"]:
-                # ✅ NEW: Lite model for I2V
+            elif model in ["veo_3_1_t2v_lite", "Veo 3.1 - Lite (16:9) - 5 credits", "Veo 3.1 - Lite (9:16) - 5 credits", "Veo 3.1 Lite", "Veo 3.1 Lite Portrait"]:
+                # ✅ Official regular Lite model for I2V (0 credits)
+                model = "veo_3_1_i2v_lite"
+                self.log(f"✅ I2V: Model Lite 5 credits được set: {model}")
+            elif model in ["Lite", "Lite (16:9)", "Lite (9:16)", "veo_3_1_t2v_lite_low_priority", "Veo 3.1 - Lite [Lower Priority] (16:9) - 0 credits", "Veo 3.1 - Lite [Lower Priority] (9:16) - 0 credits"]:
+                # ✅ Official lower-priority Lite model for I2V (0 credits)
                 model = "veo_3_1_i2v_lite_low_priority"
-                self.log(f"✅ I2V: Model Lite được set: {model}")
+                self.log(f"✅ I2V: Model Lite Lower Priority 0 credits được set: {model}")
             
             num_cookies = len(self.cookies_list) if self.cookies_list else 1
             self._init_cookie_status()
@@ -8775,12 +8777,12 @@ class GoogleLabsFlowQt6(QMainWindow, FlowTabMixin, VideoTabMixin):
         # Check upscale setting
         upscale = self.combo_upscale.currentText()
         
-        # 720P = không upscale (5 tasks/cookie), 1080P/4K = upscale (3 tasks/cookie)
+        # Giữ an toàn: tối đa 3 tasks/cookie cho video (không dùng 5 nữa)
         if upscale in ("1080P", "4K"):
             max_concurrent = num_cookies * 3
             plan_cap = self.get_plan_limit("max_concurrent_1080")
         else:  # 720P
-            max_concurrent = num_cookies * 5
+            max_concurrent = num_cookies * 3
             plan_cap = self.get_plan_limit("max_concurrent_720")
         
         if plan_cap is not None:
@@ -8793,18 +8795,8 @@ class GoogleLabsFlowQt6(QMainWindow, FlowTabMixin, VideoTabMixin):
 
     def _get_t2v_concurrency_per_cookie(self) -> int:
         """Get concurrency per cookie for Text to Video mode.
-        Returns 3 for 1080P/4K (upscale), 5 for 720P (no upscale)."""
-        try:
-            # Try to get from combo_upscale if available
-            if hasattr(self, 'combo_upscale') and self.combo_upscale:
-                upscale = self.combo_upscale.currentText()
-                if upscale in ("1080P", "4K"):
-                    return 3
-                return 5
-            # Default to 720P (5)
-            return 5
-        except Exception:
-            return 5  # Default fallback
+        Returns max 3 per cookie for all upscale modes (5 disabled)."""
+        return 3
         
         # Log
         if hasattr(self, 'log'):
@@ -15539,28 +15531,36 @@ QUAN TRỌNG:
             is_portrait = "9:16" in model_text
             # Map display text to actual model key - Veo 3.1 Full Models
             model_map = {
-                # Landscape (16:9) - KHỚP VỚI COMBO BOX
+                "Veo 3.1 - Lite (16:9) - 5 credits": "veo_3_1_t2v_lite",
+                "Veo 3.1 - Fast (16:9) - 10 credits": "veo_3_1_t2v_fast_ultra",
+                "Veo 3.1 - Quality (16:9) - 100 credits": "veo_3_1_t2v",
+                "Veo 3.1 - Lite [Lower Priority] (16:9) - 0 credits": "veo_3_1_t2v_lite_low_priority",
+                "Veo 3.1 - Fast [Lower Priority] (16:9) - 0 credits": "veo_3_1_t2v_fast_ultra_relaxed",
+                "Veo 3.1 - Lite (9:16) - 5 credits": "veo_3_1_t2v_lite",
+                "Veo 3.1 - Fast (9:16) - 10 credits": "veo_3_1_t2v_fast_portrait_ultra",
+                "Veo 3.1 - Quality (9:16) - 100 credits": "veo_3_1_t2v_portrait",
+                "Veo 3.1 - Lite [Lower Priority] (9:16) - 0 credits": "veo_3_1_t2v_lite_low_priority",
+                "Veo 3.1 - Fast [Lower Priority] (9:16) - 0 credits": "veo_3_1_t2v_fast_portrait_ultra_relaxed",
+                # Legacy names (backward compatibility)
                 "Fast (16:9) - 10 credits": "veo_3_1_t2v_fast_ultra",
                 "Quality (16:9) - 100 credits": "veo_3_1_t2v",
                 "Low Fast (16:9) - 0 credits": "veo_3_1_t2v_fast_ultra_relaxed",
-                "Lite (16:9) - 0 credits": "veo_3_1_t2v_lite_low_priority",
-                # Portrait (9:16)
+                "Lite (16:9) - 5 credits": "veo_3_1_t2v_lite",
                 "Fast (9:16) - 10 credits": "veo_3_1_t2v_fast_portrait_ultra",
                 "Quality (9:16) - 100 credits": "veo_3_1_t2v_portrait",
                 "Low Fast (9:16) - 0 credits": "veo_3_1_t2v_fast_portrait_ultra_relaxed",
-                "Lite (9:16) - 0 credits": "veo_3_1_t2v_lite_low_priority",
-                # Legacy names (backward compatibility)
+                "Lite (9:16) - 5 credits": "veo_3_1_t2v_lite",
                 "Fast (16:9)": "veo_3_1_t2v_fast_ultra",
                 "Quality (16:9)": "veo_3_1_t2v",
                 "Low Fast (16:9)": "veo_3_1_t2v_fast_ultra_relaxed",
-                "Lite (16:9)": "veo_3_1_t2v_lite_low_priority",
+                "Lite (16:9)": "veo_3_1_t2v_lite",
                 "Fast (9:16)": "veo_3_1_t2v_fast_portrait_ultra",
                 "Quality (9:16)": "veo_3_1_t2v_portrait",
                 "Low Fast (9:16)": "veo_3_1_t2v_fast_portrait_ultra_relaxed",
-                "Lite (9:16)": "veo_3_1_t2v_lite_low_priority",
+                "Lite (9:16)": "veo_3_1_t2v_lite",
                 "Veo 3.1 Ultra": "veo_3_1_t2v_fast_ultra",
                 "Veo 3.1 Standard": "veo_3_1_t2v",
-                "Veo 3.1 Lite": "veo_3_1_t2v_lite_low_priority",
+                "Veo 3.1 Lite": "veo_3_1_t2v_lite",
                 "Veo 2.1 Fast": "veo_2_1_fast_d_15_t2v",
                 "Veo 3.1 Relaxed": "veo_3_1_t2v_fast_ultra_relaxed",
             }
@@ -25069,17 +25069,21 @@ Requirements:
     def _expected_credit_for_model_label(model_label: str) -> str:
         """Return expected credit tier from UI label."""
         label = str(model_label or "")
+        if "Included" in label or "0 credits" in label:
+            return "0"
         if "100 credits" in label:
             return "100"
         if "10 credits" in label:
             return "10"
-        if "0 credits" in label:
-            return "0"
+        if "5 credits" in label:
+            return "5"
         if "Quality" in label or "Standard" in label:
             return "100"
-        if "Fast" in label and "Low" not in label and "Relaxed" not in label:
+        if "Fast" in label and "Lower Priority" not in label and "Low" not in label and "Relaxed" not in label:
             return "10"
-        if "Lite" in label or "Low Fast" in label or "Relaxed" in label:
+        if "Lite" in label and "Lower Priority" not in label:
+            return "5"
+        if "Lite [Lower Priority]" in label or "Low Fast" in label or "Relaxed" in label or "Lower Priority" in label:
             return "0"
         return "unknown"
 
@@ -25118,8 +25122,8 @@ Requirements:
         
         # Trích xuất thông tin từ format mới: "Fast (16:9) - 10 credits"
         # Nếu đã có thông tin credits trong tên thì hiển thị luôn
-        if "credits" in current_model:
-            # Format mới đã có sẵn thông tin credits
+        if "credits" in current_model or "Included" in current_model:
+            # Format mới đã có sẵn thông tin credits / Included
             self.model_credit_label.setText(current_model)
             return
         
@@ -25127,10 +25131,12 @@ Requirements:
         credit_map = {
             "Fast": "- 10 credits",
             "Quality": "- 100 credits",
+            "Lite": "- 5 credits",
             "Low Fast": "- 0 credits",
             # Legacy names (backward compatibility)
             "Veo 3.1 Ultra": "- 10 credits",
             "Veo 3.1 Standard": "- 100 credits",
+            "Veo 3.1 Lite": "- 5 credits",
             "Veo 3.1 Relaxed": "- 0 credits",
         }
         suffix = credit_map.get(current_model, "")
@@ -25775,31 +25781,41 @@ Requirements:
                 model_text = self.combo_model.currentText()
                 # Xác định portrait/landscape từ model text thay vì aspect combo
                 is_portrait = "9:16" in model_text
-                # Map display text to actual model key - Veo 3.1 Full Models
+                # Map display text to actual model key - aligned with flow2api / Flow WebUI
                 model_map = {
-                    # Landscape - KHỚP VỚI COMBO BOX
+                    "Veo 3.1 - Lite (16:9) - 5 credits": "veo_3_1_t2v_lite",
+                    "Veo 3.1 - Fast (16:9) - 10 credits": "veo_3_1_t2v_fast_ultra",
+                    "Veo 3.1 - Quality (16:9) - 100 credits": "veo_3_1_t2v",
+                    "Veo 3.1 - Lite [Lower Priority] (16:9) - 0 credits": "veo_3_1_t2v_lite_low_priority",
+                    "Veo 3.1 - Fast [Lower Priority] (16:9) - 0 credits": "veo_3_1_t2v_fast_ultra_relaxed",
+                    "Veo 3.1 - Lite (9:16) - 5 credits": "veo_3_1_t2v_lite",
+                    "Veo 3.1 - Fast (9:16) - 10 credits": "veo_3_1_t2v_fast_portrait_ultra",
+                    "Veo 3.1 - Quality (9:16) - 100 credits": "veo_3_1_t2v_portrait",
+                    "Veo 3.1 - Lite [Lower Priority] (9:16) - 0 credits": "veo_3_1_t2v_lite_low_priority",
+                    "Veo 3.1 - Fast [Lower Priority] (9:16) - 0 credits": "veo_3_1_t2v_fast_portrait_ultra_relaxed",
+                    # Legacy names (backward compatibility)
                     "Fast (16:9) - 10 credits": "veo_3_1_t2v_fast_ultra",
                     "Quality (16:9) - 100 credits": "veo_3_1_t2v",
                     "Low Fast (16:9) - 0 credits": "veo_3_1_t2v_fast_ultra_relaxed",
-                    # Portrait
+                    "Lite (16:9) - 5 credits": "veo_3_1_t2v_lite",
                     "Fast (9:16) - 10 credits": "veo_3_1_t2v_fast_portrait_ultra",
                     "Quality (9:16) - 100 credits": "veo_3_1_t2v_portrait",
                     "Low Fast (9:16) - 0 credits": "veo_3_1_t2v_fast_portrait_ultra_relaxed",
-                    # Legacy names (backward compatibility)
+                    "Lite (9:16) - 5 credits": "veo_3_1_t2v_lite",
                     "Fast": "veo_3_1_t2v_fast_ultra",
                     "Quality": "veo_3_1_t2v",
                     "Low Fast": "veo_3_1_t2v_fast_ultra_relaxed",
-                    "Lite": "veo_3_1_t2v_lite_low_priority",
+                    "Lite": "veo_3_1_t2v_lite",
                     "Fast Portrait": "veo_3_1_t2v_fast_portrait_ultra",
                     "Quality Portrait": "veo_3_1_t2v_portrait",
                     "Low Fast Portrait": "veo_3_1_t2v_fast_portrait_ultra_relaxed",
-                    "Lite Portrait": "veo_3_1_t2v_lite_low_priority",
+                    "Lite Portrait": "veo_3_1_t2v_lite",
                     "Veo 3.1 Ultra": "veo_3_1_t2v_fast_ultra",
                     "Veo 3.1 Ultra Portrait": "veo_3_1_t2v_fast_portrait_ultra",
                     "Veo 3.1 Standard": "veo_3_1_t2v",
                     "Veo 3.1 Standard Portrait": "veo_3_1_t2v_portrait",
-                    "Veo 3.1 Lite": "veo_3_1_t2v_lite_low_priority",
-                    "Veo 3.1 Lite Portrait": "veo_3_1_t2v_lite_low_priority",
+                    "Veo 3.1 Lite": "veo_3_1_t2v_lite",
+                    "Veo 3.1 Lite Portrait": "veo_3_1_t2v_lite",
                     "Veo 2.1 Fast": "veo_2_1_fast_d_15_t2v",
                     "Veo 3.1 Relaxed": "veo_3_1_t2v_fast_ultra_relaxed",
                     "Veo 3.1 Relaxed Portrait": "veo_3_1_t2v_fast_portrait_ultra_relaxed",
@@ -27721,29 +27737,41 @@ Requirements:
             model_text = self.combo_model.currentText()
             # Xác định portrait/landscape từ model text thay vì aspect combo
             is_portrait = "9:16" in model_text
-            # Map display text to actual model key - Veo 3.1 Full Models
+            # Map display text to actual model key - aligned with flow2api / Flow WebUI
             model_map = {
-                # Landscape - KHỚP VỚI COMBO BOX
+                "Veo 3.1 - Lite (16:9) - 5 credits": "veo_3_1_t2v_lite",
+                "Veo 3.1 - Fast (16:9) - 10 credits": "veo_3_1_t2v_fast_ultra",
+                "Veo 3.1 - Quality (16:9) - 100 credits": "veo_3_1_t2v",
+                "Veo 3.1 - Lite [Lower Priority] (16:9) - 0 credits": "veo_3_1_t2v_lite_low_priority",
+                "Veo 3.1 - Fast [Lower Priority] (16:9) - 0 credits": "veo_3_1_t2v_fast_ultra_relaxed",
+                "Veo 3.1 - Lite (9:16) - 5 credits": "veo_3_1_t2v_lite",
+                "Veo 3.1 - Fast (9:16) - 10 credits": "veo_3_1_t2v_fast_portrait_ultra",
+                "Veo 3.1 - Quality (9:16) - 100 credits": "veo_3_1_t2v_portrait",
+                "Veo 3.1 - Lite [Lower Priority] (9:16) - 0 credits": "veo_3_1_t2v_lite_low_priority",
+                "Veo 3.1 - Fast [Lower Priority] (9:16) - 0 credits": "veo_3_1_t2v_fast_portrait_ultra_relaxed",
+                # Legacy names (backward compatibility)
                 "Fast (16:9) - 10 credits": "veo_3_1_t2v_fast_ultra",
                 "Quality (16:9) - 100 credits": "veo_3_1_t2v",
                 "Low Fast (16:9) - 0 credits": "veo_3_1_t2v_fast_ultra_relaxed",
-                "Lite (16:9) - 0 credits": "veo_3_1_t2v_lite_low_priority",
-                # Portrait
+                "Lite (16:9) - 5 credits": "veo_3_1_t2v_lite",
                 "Fast (9:16) - 10 credits": "veo_3_1_t2v_fast_portrait_ultra",
                 "Quality (9:16) - 100 credits": "veo_3_1_t2v_portrait",
                 "Low Fast (9:16) - 0 credits": "veo_3_1_t2v_fast_portrait_ultra_relaxed",
-                "Lite (9:16) - 0 credits": "veo_3_1_t2v_lite_low_priority",
-                # Legacy names (backward compatibility)
+                "Lite (9:16) - 5 credits": "veo_3_1_t2v_lite",
                 "Fast": "veo_3_1_t2v_fast_ultra",
                 "Quality": "veo_3_1_t2v",
                 "Low Fast": "veo_3_1_t2v_fast_ultra_relaxed",
-                "Lite": "veo_3_1_t2v_lite_low_priority",
+                "Lite": "veo_3_1_t2v_lite",
+                "Fast Portrait": "veo_3_1_t2v_fast_portrait_ultra",
+                "Quality Portrait": "veo_3_1_t2v_portrait",
+                "Low Fast Portrait": "veo_3_1_t2v_fast_portrait_ultra_relaxed",
+                "Lite Portrait": "veo_3_1_t2v_lite",
                 "Veo 3.1 Ultra": "veo_3_1_t2v_fast_ultra",
                 "Veo 3.1 Ultra Portrait": "veo_3_1_t2v_fast_portrait_ultra",
                 "Veo 3.1 Standard": "veo_3_1_t2v",
                 "Veo 3.1 Standard Portrait": "veo_3_1_t2v_portrait",
-                "Veo 3.1 Lite": "veo_3_1_t2v_lite_low_priority",
-                "Veo 3.1 Lite Portrait": "veo_3_1_t2v_lite_low_priority",
+                "Veo 3.1 Lite": "veo_3_1_t2v_lite",
+                "Veo 3.1 Lite Portrait": "veo_3_1_t2v_lite",
                 "Veo 2.1 Fast": "veo_2_1_fast_d_15_t2v",
                 "Veo 3.1 Relaxed": "veo_3_1_t2v_fast_ultra_relaxed",
                 "Veo 3.1 Relaxed Portrait": "veo_3_1_t2v_fast_portrait_ultra_relaxed",
