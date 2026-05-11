@@ -3597,6 +3597,114 @@ class LabsFlowClient:
             "temp_profile_dir": str(temp_profile_dir),
         }
     
+    def _get_recaptcha_token_cloakbrowser(
+        self,
+        timeout_s: int = 60,
+        recaptcha_action: str = "VIDEO_GENERATION",
+    ) -> Optional[str]:
+        """Lấy reCAPTCHA token bằng CloakBrowser (stealth Chromium) + inject cookies.
+        
+        CloakBrowser dùng patched Chromium binary với fingerprint spoofing,
+        cho trust score cao hơn Playwright thường.
+        Ưu tiên #1 trong chuỗi: CloakBrowser → Zendriver → Playwright.
+        """
+        try:
+            from cloakbrowser import launch as cloak_launch
+        except ImportError:
+            print("  ⚠️ [CloakBrowser] Chưa cài cloakbrowser, bỏ qua (pip install cloakbrowser)")
+            return None
+
+        cookie_hash = self._cookie_hash
+        cookie_lock = LabsFlowClient._get_cookie_lock(cookie_hash)
+        target_url = "https://labs.google/fx/tools/flow"
+        site_key = "6LdyGKwpAAAAABMFBMFBMFBMFBMFBMFBMFBMFBMF"  # placeholder; actual key from page
+
+        with cookie_lock:
+            try:
+                browser_mode = LabsFlowClient._recaptcha_browser_mode()
+                headless = (browser_mode != "visible")
+                window_args = LabsFlowClient._hidden_browser_window_args() if (not headless and browser_mode != "visible") else []
+
+                print(f"  🟢 [CloakBrowser] Khởi động stealth Chromium (headless={headless})...")
+                browser = cloak_launch(
+                    headless=headless,
+                    args=window_args if window_args else None,
+                )
+                try:
+                    context = browser.new_context()
+                    # Inject Labs cookies
+                    injected = 0
+                    for name, value in (self.cookies or {}).items():
+                        try:
+                            if name.startswith("__Host-"):
+                                context.add_cookies([{"name": name, "value": value, "url": "https://labs.google/"}])
+                            else:
+                                context.add_cookies([{"name": name, "value": value, "domain": "labs.google", "path": "/"}])
+                            injected += 1
+                        except Exception:
+                            pass
+                    print(f"  🍪 [CloakBrowser] Injected {injected}/{len(self.cookies or {})} cookies")
+
+                    page = context.new_page()
+                    print(f"  🌐 [CloakBrowser] Navigate đến {target_url}...")
+                    try:
+                        page.goto(target_url, wait_until="domcontentloaded", timeout=15000)
+                    except Exception:
+                        pass
+
+                    # Check redirect to login
+                    current_url = page.url or ""
+                    if "accounts.google" in current_url or "signin" in current_url.lower():
+                        print("  ⚠️ [CloakBrowser] Redirected to login - cookie không hợp lệ")
+                        return None
+
+                    print("  ⏳ [CloakBrowser] Đợi grecaptcha load...")
+                    page.wait_for_function(
+                        """() => {
+                            return (typeof grecaptcha !== 'undefined' && grecaptcha.enterprise &&
+                                    typeof grecaptcha.enterprise.execute === 'function') ||
+                                   (typeof grecaptcha !== 'undefined' &&
+                                    typeof grecaptcha.execute === 'function');
+                        }""",
+                        timeout=timeout_s * 1000,
+                    )
+
+                    print(f"  🔑 [CloakBrowser] Executing reCAPTCHA (action={recaptcha_action})...")
+                    token = page.evaluate(
+                        """async ({action}) => {
+                            try {
+                                const siteKey = document.querySelector('[data-sitekey]')?.dataset?.sitekey
+                                    || '6LdyGKwpAAAAABMFBMFBMFBMFBMFBMFBMFBMFBMF';
+                                if (typeof grecaptcha !== 'undefined' && grecaptcha.enterprise) {
+                                    return await grecaptcha.enterprise.execute(siteKey, {action});
+                                } else if (typeof grecaptcha !== 'undefined') {
+                                    return await grecaptcha.execute(siteKey, {action});
+                                }
+                                return 'ERROR:grecaptcha not found';
+                            } catch(e) {
+                                return 'ERROR:' + e.message;
+                            }
+                        }""",
+                        {"action": recaptcha_action},
+                    )
+
+                    if isinstance(token, str) and token.startswith("ERROR:"):
+                        print(f"  ⚠️ [CloakBrowser] reCAPTCHA error: {token[6:]}")
+                        return None
+                    if isinstance(token, str) and len(token.strip()) > 20:
+                        print(f"  ✅ [CloakBrowser] Token OK (len={len(token)})")
+                        return token
+                    print(f"  ⚠️ [CloakBrowser] Unexpected token result: {token}")
+                    return None
+                finally:
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
+            except Exception as e:
+                print(f"  ⚠️ [CloakBrowser] Error: {e}")
+                return None
+
     def _get_recaptcha_token_zendriver(
         self,
         timeout_s: int = 60,
@@ -3951,7 +4059,7 @@ class LabsFlowClient:
         
         token = None
         token_generated_at = None
-        source_preference = str(_env("RECAPTCHA_SOURCE", "playwright") or "playwright").strip().lower()
+        source_preference = str(_env("RECAPTCHA_SOURCE", "cloak") or "cloak").strip().lower()
 
         def inject_token(source: str, token_value: Optional[str]) -> bool:
             nonlocal token_generated_at
@@ -3961,11 +4069,25 @@ class LabsFlowClient:
             self._record_token_source(source)
             client_context["recaptchaToken"] = token_value
             LabsFlowClient._token_timestamps[cookie_hash] = token_generated_at
-            label = "Zendriver" if source == "zendriver" else "Playwright"
+            label_map = {"cloakbrowser": "CloakBrowser", "zendriver": "Zendriver"}
+            label = label_map.get(source, "Playwright")
             print(f"  ✅ [{label}] Token injected (len={len(token_value)}, ts={token_generated_at:.0f})")
             return True
 
-        if source_preference in ("zendriver", "selenium") and self._should_use_zendriver():
+        # ── Priority 1: CloakBrowser (stealth Chromium, best trust score) ──────
+        if source_preference in ("cloak", "cloakbrowser"):
+            print(f"  🟢 [Token] Ưu tiên CloakBrowser trước...")
+            try:
+                token = self._get_recaptcha_token_cloakbrowser(timeout_s=60, recaptcha_action=recaptcha_action)
+                if inject_token("cloakbrowser", token):
+                    print(f"  ✅ [Token Source] CloakBrowser OK")
+                    return True
+                print(f"  ⚠️ [CloakBrowser] Không lấy được token, fallback Zendriver")
+            except Exception as e:
+                print(f"  ⚠️ [CloakBrowser] Error, fallback Zendriver: {e}")
+
+        # ── Priority 2: Zendriver (temp-profile) ────────────────────────────────
+        if source_preference in ("cloak", "cloakbrowser", "zendriver", "selenium") and self._should_use_zendriver():
             print(f"  🔵 [Token] Ưu tiên Zendriver/temp-profile trước...")
             try:
                 token = self._get_recaptcha_token_zendriver(timeout_s=60, recaptcha_action=recaptcha_action)
@@ -3975,7 +4097,7 @@ class LabsFlowClient:
             except Exception as e:
                 print(f"  ⚠️ [Zendriver] Error, fallback Playwright: {e}")
 
-        print(f"  🟡 [Token] Ưu tiên Playwright lấy token trước...")
+        # ── Priority 3: Playwright (fallback) ───────────────────────────────────
         token = self._get_recaptcha_token_with_playwright(
             timeout_s=90,
             max_retries_on_403=3,
@@ -3986,7 +4108,7 @@ class LabsFlowClient:
             print(f"  ✅ [Token Source] Playwright OK")
             return True
 
-        if source_preference not in ("zendriver", "selenium") and self._should_use_zendriver():
+        if source_preference not in ("cloak", "cloakbrowser", "zendriver", "selenium") and self._should_use_zendriver():
             print(f"  🔵 [Token] Playwright fail -> fallback Zendriver/temp-profile...")
             try:
                 token = self._get_recaptcha_token_zendriver(timeout_s=60, recaptcha_action=recaptcha_action)
