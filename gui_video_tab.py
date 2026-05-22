@@ -2117,8 +2117,12 @@ class VideoTabMixin:
                     f"({num_cookies} cookie(s) × {per_cookie_concurrent} - Text to Video {upscale_label})"
                 )
             else:
-                max_concurrent = num_cookies * 1
-                self.log(f"⚙️ Chế độ: Nối đuôi với {max_concurrent} công việc đồng thời ({num_cookies} cookie(s) × 1 - {mode})")
+                per_cookie_concurrent = max(1, int(self.get_threads_per_cookie_limit(default=1)))
+                max_concurrent = num_cookies * per_cookie_concurrent
+                self.log(
+                    f"⚙️ Chế độ: Nối đuôi với {max_concurrent} công việc đồng thời "
+                    f"({num_cookies} cookie(s) × {per_cookie_concurrent} - {mode})"
+                )
             self.log(f"🔑 Sử dụng {num_cookies} cookie(s)")
             # ✅ BỎ DELAY - Không còn delay giữa các prompt
             # self.log(f"⏱️ Delay giữa các prompt: {delay_value}s")  # Comment lại

@@ -6351,7 +6351,7 @@ class FlowTabMixin:
         return choice in ("UPSAMPLE_IMAGE_RESOLUTION_2K", "UPSAMPLE_IMAGE_RESOLUTION_4K")
 
     def _get_flow_concurrency_per_cookie(self):
-        return 1 if self._is_flow_high_quality_mode() else 3
+        return max(1, int(self.get_threads_per_cookie_limit(default=1, force_refresh=True)))
 
     def update_flow_concurrent_range(self):
         """Cập nhật range của flow_concurrent_spin theo số cookies và chất lượng Banana Pro."""

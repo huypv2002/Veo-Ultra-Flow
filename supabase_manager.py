@@ -252,6 +252,180 @@ class SupabaseManager:
             return self.update_user(user_id, updates)
         except Exception as e:
             return False, {"error": str(e)}
+
+    def get_user_threads_per_cookie(self, user_id: int, is_key_login: bool = None) -> Tuple[bool, Optional[int]]:
+        """Lấy số luồng mỗi cookie cho user.
+
+        Cột sử dụng:
+        - concurrent_per_cookie
+
+        Nếu chưa có cột hoặc chưa có dữ liệu thì trả về None để app fallback = 1.
+        """
+        candidate_key = "concurrent_per_cookie"
+
+        def _extract_limit(record: Dict[str, Any]) -> Optional[int]:
+            if not isinstance(record, dict):
+                return None
+            value = record.get(candidate_key)
+            if value is None or str(value).strip() == "":
+                return None
+            try:
+                parsed = int(str(value).strip())
+                if parsed > 0:
+                    return parsed
+            except Exception:
+                return None
+            return None
+
+        try:
+            if is_key_login is True:
+                key_params = {"id": f"eq.{user_id}", "select": "*"}
+                key_success, key_data = self._make_request("GET", "activation_keys", params=key_params)
+                if key_success and key_data:
+                    key = key_data[0] if isinstance(key_data, list) else key_data
+                    limit = _extract_limit(key)
+                    if limit is not None:
+                        print(f"✅ Lấy threads_per_cookie từ activation_keys id={user_id}: {limit}")
+                        return True, limit
+                return True, None
+
+            if is_key_login is False:
+                success, user_data = self.get_user_by_id(user_id)
+                if success and user_data:
+                    user = user_data[0] if isinstance(user_data, list) and user_data else user_data
+                    limit = _extract_limit(user)
+                    if limit is not None:
+                        print(f"✅ Lấy threads_per_cookie từ users id={user_id}: {limit}")
+                        return True, limit
+                return True, None
+
+            key_params = {"id": f"eq.{user_id}", "select": "*"}
+            key_success, key_data = self._make_request("GET", "activation_keys", params=key_params)
+            if key_success and key_data:
+                key = key_data[0] if isinstance(key_data, list) else key_data
+                limit = _extract_limit(key)
+                if limit is not None:
+                    print(f"✅ Lấy threads_per_cookie từ activation_keys id={user_id}: {limit}")
+                    return True, limit
+
+            success, user_data = self.get_user_by_id(user_id)
+            if success and user_data:
+                user = user_data[0] if isinstance(user_data, list) and user_data else user_data
+                limit = _extract_limit(user)
+                if limit is not None:
+                    print(f"✅ Lấy threads_per_cookie từ users id={user_id}: {limit}")
+                    return True, limit
+
+            return True, None
+        except Exception as e:
+            print(f"Error in get_user_threads_per_cookie: {e}")
+            return False, None
+
+    def get_concurrent_per_cookie_value(
+        self,
+        record_id: int,
+        target_table: str = "users"
+    ) -> Tuple[bool, Dict[str, Any]]:
+        """Lấy giá trị concurrent_per_cookie từ users hoặc activation_keys.
+
+        Fallback an toàn:
+        - Nếu chưa có cột / chưa có dữ liệu -> value=None, effective_value=1
+        - Không raise exception để admin UI không crash
+        """
+        try:
+            table = "activation_keys" if str(target_table).strip() == "activation_keys" else "users"
+            params = {
+                "id": f"eq.{record_id}",
+                "select": "id,username,key_name,activation_key,concurrent_per_cookie"
+            }
+            success, data = self._make_request("GET", table, params=params)
+            if not success:
+                details = data.get("details") if isinstance(data, dict) else None
+                details_text = json.dumps(details, ensure_ascii=False) if details else str(data)
+                if "concurrent_per_cookie" in details_text:
+                    return True, {
+                        "target_table": table,
+                        "record_id": record_id,
+                        "value": None,
+                        "effective_value": 1,
+                        "column_exists": False,
+                        "record_exists": True,
+                        "label": None,
+                    }
+                return False, {
+                    "error": data.get("error") if isinstance(data, dict) else str(data),
+                    "details": details,
+                }
+
+            if not data:
+                return True, {
+                    "target_table": table,
+                    "record_id": record_id,
+                    "value": None,
+                    "effective_value": 1,
+                    "column_exists": True,
+                    "record_exists": False,
+                    "label": None,
+                }
+
+            record = data[0] if isinstance(data, list) else data
+            raw_value = record.get("concurrent_per_cookie")
+            parsed_value = None
+            if raw_value is not None and str(raw_value).strip() != "":
+                try:
+                    candidate = int(str(raw_value).strip())
+                    if candidate > 0:
+                        parsed_value = candidate
+                except Exception:
+                    parsed_value = None
+
+            label = record.get("username") or record.get("key_name") or record.get("activation_key")
+            return True, {
+                "target_table": table,
+                "record_id": record_id,
+                "value": parsed_value,
+                "effective_value": parsed_value or 1,
+                "column_exists": True,
+                "record_exists": True,
+                "label": label,
+            }
+        except Exception as e:
+            return False, {"error": str(e)}
+
+    def update_concurrent_per_cookie_value(
+        self,
+        record_id: int,
+        concurrent_per_cookie: int,
+        target_table: str = "users"
+    ) -> Tuple[bool, Dict[str, Any]]:
+        """Cập nhật concurrent_per_cookie cho users hoặc activation_keys."""
+        try:
+            table = "activation_keys" if str(target_table).strip() == "activation_keys" else "users"
+            value = int(concurrent_per_cookie)
+            if value <= 0:
+                return False, {"error": "concurrent_per_cookie must be greater than 0"}
+
+            params = {"id": f"eq.{record_id}"}
+            updates = {"concurrent_per_cookie": value}
+            success, data = self._make_request("PATCH", table, updates, params)
+            if not success:
+                return False, data if isinstance(data, dict) else {"error": str(data)}
+
+            read_success, read_result = self.get_concurrent_per_cookie_value(record_id, table)
+            if read_success:
+                read_result["updated"] = True
+                return True, read_result
+            return True, {
+                "target_table": table,
+                "record_id": record_id,
+                "value": value,
+                "effective_value": value,
+                "column_exists": True,
+                "record_exists": True,
+                "updated": True,
+            }
+        except Exception as e:
+            return False, {"error": str(e)}
     
     def get_gemini_api_keys(self, user_id: Any) -> Tuple[bool, List[str]]:
         """Lấy danh sách Gemini API Keys theo user_id"""

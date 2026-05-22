@@ -669,6 +669,35 @@ class GoogleLabsFlowQt6(QMainWindow, FlowTabMixin, VideoTabMixin):
             return default
         return limits[key]
 
+    def get_threads_per_cookie_limit(self, default=1, force_refresh=False):
+        """Lấy số luồng trên mỗi cookie theo user; fallback = 1 nếu chưa có cột/dữ liệu."""
+        try:
+            cached = None if force_refresh else getattr(self, "_threads_per_cookie_limit", None)
+            if isinstance(cached, int) and cached > 0:
+                return cached
+
+            user_id = None
+            if hasattr(self, 'current_user_id') and self.current_user_id:
+                user_id = self.current_user_id
+            elif hasattr(self, 'user_info') and self.user_info:
+                user_id = self.user_info.get('user_id') or (self.user_info.get('user', {}) or {}).get('id')
+
+            if not user_id:
+                return default
+
+            from supabase_manager import supabase_manager
+            is_key_login = getattr(self, 'is_key_login', None)
+            success, limit = supabase_manager.get_user_threads_per_cookie(user_id, is_key_login=is_key_login)
+            if success and isinstance(limit, int) and limit > 0:
+                self._threads_per_cookie_limit = limit
+                if hasattr(self, "log"):
+                    source_label = "activation_keys" if is_key_login is True else ("users" if is_key_login is False else "auto")
+                    self.log(f"⚙️ Threads/Cookie live config: user_id={user_id}, source={source_label}, value={limit}")
+                return limit
+        except Exception:
+            pass
+        return default
+
     def _apply_plan_cookie_limit(self):
         """Trim cookies_list to device_info limit from database (if any)."""
         try:
@@ -789,6 +818,7 @@ class GoogleLabsFlowQt6(QMainWindow, FlowTabMixin, VideoTabMixin):
         # Apply plan-specific limits
         self._apply_plan_cookie_limit()
         try:
+            self._threads_per_cookie_limit = self.get_threads_per_cookie_limit(default=1)
             self.update_max_concurrent_from_cookies()
             self._apply_extend_group_limit()
         except Exception:
@@ -8758,13 +8788,14 @@ class GoogleLabsFlowQt6(QMainWindow, FlowTabMixin, VideoTabMixin):
                 return
 
             num_cookies = len(self.cookies_list) if self.cookies_list else 1
-            max_concurrent = num_cookies * 1  # Max 1 per cookie cho Whisk
+            per_cookie = self.get_threads_per_cookie_limit(default=1)
+            max_concurrent = num_cookies * per_cookie
 
             # Update spinbox range
             self.spin_image_concurrent.setMaximum(max_concurrent)
 
             # Log
-            self.log(f"⚙️ Image Whisk: {num_cookies} cookie(s) → Max {max_concurrent} concurrent")
+            self.log(f"⚙️ Image Whisk: {num_cookies} cookie(s) × {per_cookie} → Max {max_concurrent} concurrent")
 
             # Adjust current value nếu vượt quá
             if self.spin_image_concurrent.value() > max_concurrent:
@@ -8776,16 +8807,17 @@ class GoogleLabsFlowQt6(QMainWindow, FlowTabMixin, VideoTabMixin):
     def update_max_concurrent_from_cookies(self):
         """Tự động điều chỉnh max concurrent dựa trên số cookies"""
         num_cookies = len(self.cookies_list) if self.cookies_list else 1
+        per_cookie = self.get_threads_per_cookie_limit(default=1, force_refresh=True)
         
         # Check upscale setting
         upscale = self.combo_upscale.currentText()
         
-        # Giữ an toàn: tối đa 3 tasks/cookie cho video (không dùng 5 nữa)
+        # Số luồng/cookie lấy từ cấu hình user; fallback = 1.
         if upscale in ("1080P", "4K"):
-            max_concurrent = num_cookies * 3
+            max_concurrent = num_cookies * per_cookie
             plan_cap = self.get_plan_limit("max_concurrent_1080")
         else:  # 720P
-            max_concurrent = num_cookies * 3
+            max_concurrent = num_cookies * per_cookie
             plan_cap = self.get_plan_limit("max_concurrent_720")
         
         if plan_cap is not None:
@@ -8797,11 +8829,8 @@ class GoogleLabsFlowQt6(QMainWindow, FlowTabMixin, VideoTabMixin):
         self.spin_concurrent.setMaximum(max_concurrent)
 
     def _get_t2v_concurrency_per_cookie(self) -> int:
-        """Get concurrency per cookie for Text to Video mode.
-        GUI path should stay conservative because reCAPTCHA token solving is serialized per cookie.
-        One cookie running 3 parallel T2V tasks looks like a stall at 20% while tasks queue behind the same token lock.
-        """
-        return 1
+        """Get concurrency per cookie for Text to Video mode; fallback = 1."""
+        return max(1, int(self.get_threads_per_cookie_limit(default=1, force_refresh=True)))
         
         # Log
         if hasattr(self, 'log'):
@@ -11077,11 +11106,12 @@ class GoogleLabsFlowQt6(QMainWindow, FlowTabMixin, VideoTabMixin):
         # ✅ Disable nút "Retry All Lỗi" khi bắt đầu xử lý
         self.btn_image_retry_all.setEnabled(False)
 
-        # ✅ Số công việc đồng thời = số cookie × 1 (QUY TẮC MỚI)
+        # ✅ Số công việc đồng thời = số cookie × cấu hình user (fallback = 1)
         num_cookies = len(available_cookies)
-        actual_concurrent = num_cookies * 1  # Max concurrent = số cookie × 1
+        per_cookie = self.get_threads_per_cookie_limit(default=1)
+        actual_concurrent = num_cookies * per_cookie
         
-        self.log(f"⚙️ Whisk: Nối đuôi với {actual_concurrent} công việc đồng thời ({num_cookies} cookie(s) × 1)")
+        self.log(f"⚙️ Whisk: Nối đuôi với {actual_concurrent} công việc đồng thời ({num_cookies} cookie(s) × {per_cookie})")
         self.log(f"🔑 Sử dụng {num_cookies} cookie(s)")
         
         # ✅ KHÔNG LOAD TẤT CẢ CARDS NGAY - Chỉ load khi xử lý để tránh crash
@@ -12450,8 +12480,9 @@ class GoogleLabsFlowQt6(QMainWindow, FlowTabMixin, VideoTabMixin):
             # ✅ BỎ DELAY - Không còn delay giữa các request (nối đuôi liên tục)
             # delay_seconds = self.spin_image_delay.value()  # Comment lại vì không dùng nữa
             
+            per_cookie = self.get_threads_per_cookie_limit(default=1)
             self.log(f"🚀 Starting image generation: {len(prompt_data_list)} prompts")
-            self.log(f"⚙️ Whisk: Nối đuôi với {concurrent} công việc đồng thời ({len(available_cookies)} cookie(s) × 1)")
+            self.log(f"⚙️ Whisk: Nối đuôi với {concurrent} công việc đồng thời ({len(available_cookies)} cookie(s) × {per_cookie})")
             # ✅ BỎ DELAY - Không còn delay giữa các prompt
             
             import time as _t
@@ -13089,7 +13120,7 @@ class GoogleLabsFlowQt6(QMainWindow, FlowTabMixin, VideoTabMixin):
                 return
             
             num_cookies = len(available_cookies)
-            max_jobs_per_cookie = 3  # 1 cookie = 3 jobs max cho image
+            max_jobs_per_cookie = self.get_threads_per_cookie_limit(default=1)
             total_max_jobs = num_cookies * max_jobs_per_cookie
             user_concurrent = self.spin_image_concurrent.value()
             max_concurrent = min(user_concurrent, total_max_jobs)
@@ -29404,6 +29435,7 @@ Requirements:
             # Store data first
             self.user_info = session_data
             self.subscription_info = session_data.get("subscription", {})
+            self._threads_per_cookie_limit = None
             
             # ✅ KIỂM TRA NẾU LÀ KEY LOGIN
             user_data = session_data.get("user", {})
