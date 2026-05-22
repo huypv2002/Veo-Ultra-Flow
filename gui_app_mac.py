@@ -8754,6 +8754,9 @@ class GoogleLabsFlowQt6(QMainWindow, FlowTabMixin, VideoTabMixin):
     def update_max_image_concurrent_from_cookies(self):
         """Update max concurrent cho Image Whisk dựa trên số cookies"""
         try:
+            if not hasattr(self, "spin_image_concurrent") or self.spin_image_concurrent is None:
+                return
+
             num_cookies = len(self.cookies_list) if self.cookies_list else 1
             max_concurrent = num_cookies * 1  # Max 1 per cookie cho Whisk
 
@@ -8795,8 +8798,10 @@ class GoogleLabsFlowQt6(QMainWindow, FlowTabMixin, VideoTabMixin):
 
     def _get_t2v_concurrency_per_cookie(self) -> int:
         """Get concurrency per cookie for Text to Video mode.
-        Returns max 3 per cookie for all upscale modes (5 disabled)."""
-        return 3
+        GUI path should stay conservative because reCAPTCHA token solving is serialized per cookie.
+        One cookie running 3 parallel T2V tasks looks like a stall at 20% while tasks queue behind the same token lock.
+        """
+        return 1
         
         # Log
         if hasattr(self, 'log'):
@@ -30636,20 +30641,33 @@ def main():
     palette.setColor(QPalette.HighlightedText, QColor(255, 255, 255))
     app.setPalette(palette)
 
-    # --- Auto reCAPTCHA token: Selenium Driver (mặc định) hoặc Extension ---
-    # Mặc định dùng Selenium Driver (Trình duyệt) - không cần extension
-    # Để dùng Extension: set RECAPTCHA_MODE="extension"
+    # --- Auto reCAPTCHA token: CloakBrowser (mặc định) / Bridge / Selenium ---
+    # ✅ RECAPTCHA_SOURCE ưu tiên: "cloak" → CloakBrowser stealth Chromium (best trust score)
+    # Các option: "bridge"/"headful" → Bridge Server, "cloak" → CloakBrowser, "zendriver"/"selenium", "playwright"
     os.environ.setdefault("AUTO_RECAPTCHA", "1")
     os.environ.setdefault("RECAPTCHA_MODE", "selenium")  # ✅ Mặc định: Selenium Driver
+    os.environ.setdefault("RECAPTCHA_SOURCE", "cloak")   # ✅ CloakBrowser ưu tiên (stealth Chromium)
+    os.environ.setdefault("HEADFUL_BRIDGE_URL", "http://127.0.0.1:8899")
     os.environ.setdefault("CAPTCHA_BRIDGE_URL", "http://localhost:3000")
     
     # ✅ Chỉ start bridge server nếu dùng Extension mode
     recaptcha_mode = os.environ.get("RECAPTCHA_MODE", "selenium").lower()
+    recaptcha_source = os.environ.get("RECAPTCHA_SOURCE", "cloak").lower()
     if recaptcha_mode in ("extension", "bridge", "ext"):
         ensure_captcha_bridge_server(os.environ["CAPTCHA_BRIDGE_URL"], auto_start=True)
         print("✓ reCAPTCHA mode: Extension (Bridge Server)")
     else:
-        print("✓ reCAPTCHA mode: Selenium Driver (Trình duyệt) - Mặc định")
+        source_labels = {
+            "cloak": "CloakBrowser (stealth Chromium)",
+            "cloakbrowser": "CloakBrowser (stealth Chromium)",
+            "bridge": "Headful Bridge Server → CloakBrowser",
+            "headful": "Headful Bridge Server → CloakBrowser",
+            "zendriver": "Zendriver (temp-profile)",
+            "selenium": "Zendriver (temp-profile)",
+            "playwright": "Playwright (fallback)",
+        }
+        src_label = source_labels.get(recaptcha_source, recaptcha_source)
+        print(f"✓ reCAPTCHA source: {src_label} (RECAPTCHA_SOURCE={recaptcha_source})")
     
     # ✅ CHECK EXISTING SESSION TRƯỚC (nếu user đã login)
     # Điều này quan trọng để check subscription validity của session cũ
@@ -30739,13 +30757,6 @@ def main():
     window.show()
     window.raise_()
     window.activateWindow()
-    
-    # ✅ Additional macOS-specific activation
-    try:
-        # Force app to front on macOS
-        app.setActiveWindow(window)
-    except:
-        pass
     
     print("✅ Main window shown and activated")
     

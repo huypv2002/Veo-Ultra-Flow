@@ -3597,15 +3597,20 @@ class LabsFlowClient:
             "temp_profile_dir": str(temp_profile_dir),
         }
     
+    # ✅ Correct site key cho labs.google reCAPTCHA Enterprise
+    RECAPTCHA_SITE_KEY = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV"
+
     def _get_recaptcha_token_cloakbrowser(
         self,
         timeout_s: int = 60,
         recaptcha_action: str = "VIDEO_GENERATION",
+        acquire_lock: bool = True,
     ) -> Optional[str]:
         """Lấy reCAPTCHA token bằng CloakBrowser (stealth Chromium) + inject cookies.
         
         CloakBrowser dùng patched Chromium binary với fingerprint spoofing,
         cho trust score cao hơn Playwright thường.
+        ✅ Đã test thành công: Token pass → HTTP 200 → Video gen OK.
         Ưu tiên #1 trong chuỗi: CloakBrowser → Zendriver → Playwright.
         """
         try:
@@ -3617,15 +3622,21 @@ class LabsFlowClient:
         cookie_hash = self._cookie_hash
         cookie_lock = LabsFlowClient._get_cookie_lock(cookie_hash)
         target_url = "https://labs.google/fx/tools/flow"
-        site_key = "6LdyGKwpAAAAABMFBMFBMFBMFBMFBMFBMFBMFBMF"  # placeholder; actual key from page
 
-        with cookie_lock:
+        from contextlib import nullcontext
+        lock_context = cookie_lock if acquire_lock else nullcontext()
+
+        with lock_context:
             try:
                 browser_mode = LabsFlowClient._recaptcha_browser_mode()
-                headless = (browser_mode != "visible")
-                window_args = LabsFlowClient._hidden_browser_window_args() if (not headless and browser_mode != "visible") else []
+                headless = False  # ✅ Luôn headful — headless bị trust score thấp
+                window_args = []
+                if browser_mode == "visible":
+                    window_args = ["--window-position=100,100", "--window-size=1280,900"]
+                else:
+                    window_args = LabsFlowClient._hidden_browser_window_args()
 
-                print(f"  🟢 [CloakBrowser] Khởi động stealth Chromium (headless={headless})...")
+                print(f"  🟢 [CloakBrowser] Khởi động stealth Chromium (mode={browser_mode})...")
                 browser = cloak_launch(
                     headless=headless,
                     args=window_args if window_args else None,
@@ -3646,11 +3657,23 @@ class LabsFlowClient:
                     print(f"  🍪 [CloakBrowser] Injected {injected}/{len(self.cookies or {})} cookies")
 
                     page = context.new_page()
-                    print(f"  🌐 [CloakBrowser] Navigate đến {target_url}...")
+
+                    # ✅ Warm-up: navigate google.com trước để build trust score
+                    print(f"  🔥 [CloakBrowser] Warm-up: google.com → labs.google")
                     try:
-                        page.goto(target_url, wait_until="domcontentloaded", timeout=15000)
+                        page.goto("https://www.google.com", wait_until="domcontentloaded", timeout=15000)
+                        time.sleep(0.5)
                     except Exception:
                         pass
+
+                    print(f"  🌐 [CloakBrowser] Navigate đến {target_url}...")
+                    try:
+                        page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+                    except Exception:
+                        pass
+
+                    # ✅ Đợi thêm để page fully settle (JS scripts, reCAPTCHA init)
+                    time.sleep(2)
 
                     # Check redirect to login
                     current_url = page.url or ""
@@ -3671,10 +3694,8 @@ class LabsFlowClient:
 
                     print(f"  🔑 [CloakBrowser] Executing reCAPTCHA (action={recaptcha_action})...")
                     token = page.evaluate(
-                        """async ({action}) => {
+                        """async ([siteKey, action]) => {
                             try {
-                                const siteKey = document.querySelector('[data-sitekey]')?.dataset?.sitekey
-                                    || '6LdyGKwpAAAAABMFBMFBMFBMFBMFBMFBMFBMFBMF';
                                 if (typeof grecaptcha !== 'undefined' && grecaptcha.enterprise) {
                                     return await grecaptcha.enterprise.execute(siteKey, {action});
                                 } else if (typeof grecaptcha !== 'undefined') {
@@ -3685,7 +3706,7 @@ class LabsFlowClient:
                                 return 'ERROR:' + e.message;
                             }
                         }""",
-                        {"action": recaptcha_action},
+                        [self.RECAPTCHA_SITE_KEY, recaptcha_action],
                     )
 
                     if isinstance(token, str) and token.startswith("ERROR:"):
@@ -3705,15 +3726,63 @@ class LabsFlowClient:
                 print(f"  ⚠️ [CloakBrowser] Error: {e}")
                 return None
 
-    def _get_recaptcha_token_zendriver(
+    def _get_recaptcha_token_headful_bridge(
         self,
         timeout_s: int = 60,
         recaptcha_action: str = "VIDEO_GENERATION",
     ) -> Optional[str]:
+        """Lấy reCAPTCHA token bằng Headful Bridge Server (HTTP service).
+        
+        Gọi recaptcha_headful_server.py đang chạy ở background.
+        Server giữ browser pool sẵn → solve nhanh hơn open/close mỗi lần.
+        """
+        import requests as _requests
+
+        bridge_url = str(_env("HEADFUL_BRIDGE_URL", "http://127.0.0.1:8899") or "http://127.0.0.1:8899").strip()
+        print(f"  🌉 [Bridge] Gọi {bridge_url}/solve...")
+
+        try:
+            resp = _requests.post(
+                f"{bridge_url}/solve",
+                json={
+                    "cookies": self.cookies or {},
+                    "action": recaptcha_action,
+                    "timeout": timeout_s,
+                },
+                timeout=timeout_s + 30,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                token = data.get("token")
+                solve_ms = data.get("solve_time_ms", "?")
+                source = data.get("source", "?")
+                if token and len(token) > 20:
+                    print(f"  ✅ [Bridge] Token OK (len={len(token)}, {solve_ms}ms, slot={source})")
+                    return token
+                print(f"  ⚠️ [Bridge] Token rỗng hoặc quá ngắn")
+                return None
+            else:
+                print(f"  ⚠️ [Bridge] Server error {resp.status_code}: {resp.text[:200]}")
+                return None
+        except _requests.ConnectionError:
+            print(f"  ⚠️ [Bridge] Không kết nối được {bridge_url} — server chưa chạy?")
+            return None
+        except Exception as e:
+            print(f"  ⚠️ [Bridge] Error: {e}")
+            return None
+
+    def _get_recaptcha_token_zendriver(
+        self,
+        timeout_s: int = 60,
+        recaptcha_action: str = "VIDEO_GENERATION",
+        acquire_lock: bool = True,
+    ) -> Optional[str]:
         """Lấy reCAPTCHA token bằng browser temp-profile trắng + inject cookie, không dùng Chrome CDP."""
         cookie_hash = self._cookie_hash
         cookie_lock = LabsFlowClient._get_cookie_lock(cookie_hash)
-        with cookie_lock:
+        from contextlib import nullcontext
+        lock_context = cookie_lock if acquire_lock else nullcontext()
+        with lock_context:
             launch_info = self._resolve_zendriver_profile_launch()
             if not launch_info:
                 return None
@@ -4040,9 +4109,11 @@ class LabsFlowClient:
     ) -> bool:
         """If enabled, fetch reCAPTCHA token and inject into clientContext.
         
-        ✅ TOKEN SOURCE PRIORITY:
-        1. Zendriver (headed, undetected) → trust score cao
-        2. Playwright (fallback) → sync API worker thread
+        ✅ TOKEN SOURCE PRIORITY (theo RECAPTCHA_SOURCE env var):
+        - "bridge"/"headful": Bridge Server → CloakBrowser → Zendriver → Playwright
+        - "cloak" (default):  CloakBrowser → Zendriver → Playwright
+        - "zendriver"/"selenium": Zendriver → Playwright
+        - "playwright" hoặc khác: Playwright → Zendriver
         
         Args:
             raise_on_fail: If True, raise exception when token not available
@@ -4059,6 +4130,7 @@ class LabsFlowClient:
         
         token = None
         token_generated_at = None
+        token_started_at = time.time()
         source_preference = str(_env("RECAPTCHA_SOURCE", "cloak") or "cloak").strip().lower()
 
         def inject_token(source: str, token_value: Optional[str]) -> bool:
@@ -4069,16 +4141,33 @@ class LabsFlowClient:
             self._record_token_source(source)
             client_context["recaptchaToken"] = token_value
             LabsFlowClient._token_timestamps[cookie_hash] = token_generated_at
-            label_map = {"cloakbrowser": "CloakBrowser", "zendriver": "Zendriver"}
+            label_map = {"cloakbrowser": "CloakBrowser", "zendriver": "Zendriver", "bridge": "HeadfulBridge"}
             label = label_map.get(source, "Playwright")
-            print(f"  ✅ [{label}] Token injected (len={len(token_value)}, ts={token_generated_at:.0f})")
+            elapsed = time.time() - token_started_at
+            print(f"  ✅ [{label}] Token injected (len={len(token_value)}, ts={token_generated_at:.0f}, elapsed={elapsed:.1f}s)")
             return True
 
+        # ── Priority 0: Headful Bridge Server (nếu RECAPTCHA_SOURCE=bridge/headful) ──
+        if source_preference in ("bridge", "headful"):
+            print(f"  🌉 [Token] Ưu tiên Headful Bridge Server trước...")
+            try:
+                token = self._get_recaptcha_token_headful_bridge(timeout_s=60, recaptcha_action=recaptcha_action)
+                if inject_token("bridge", token):
+                    print(f"  ✅ [Token Source] Headful Bridge OK")
+                    return True
+                print(f"  ⚠️ [Bridge] Không lấy được token, fallback CloakBrowser")
+            except Exception as e:
+                print(f"  ⚠️ [Bridge] Error, fallback CloakBrowser: {e}")
+
         # ── Priority 1: CloakBrowser (stealth Chromium, best trust score) ──────
-        if source_preference in ("cloak", "cloakbrowser"):
+        if source_preference in ("bridge", "headful", "cloak", "cloakbrowser"):
             print(f"  🟢 [Token] Ưu tiên CloakBrowser trước...")
             try:
-                token = self._get_recaptcha_token_cloakbrowser(timeout_s=60, recaptcha_action=recaptcha_action)
+                token = self._get_recaptcha_token_cloakbrowser(
+                    timeout_s=60,
+                    recaptcha_action=recaptcha_action,
+                    acquire_lock=acquire_lock,
+                )
                 if inject_token("cloakbrowser", token):
                     print(f"  ✅ [Token Source] CloakBrowser OK")
                     return True
@@ -4087,10 +4176,14 @@ class LabsFlowClient:
                 print(f"  ⚠️ [CloakBrowser] Error, fallback Zendriver: {e}")
 
         # ── Priority 2: Zendriver (temp-profile) ────────────────────────────────
-        if source_preference in ("cloak", "cloakbrowser", "zendriver", "selenium") and self._should_use_zendriver():
+        if source_preference in ("bridge", "headful", "cloak", "cloakbrowser", "zendriver", "selenium") and self._should_use_zendriver():
             print(f"  🔵 [Token] Ưu tiên Zendriver/temp-profile trước...")
             try:
-                token = self._get_recaptcha_token_zendriver(timeout_s=60, recaptcha_action=recaptcha_action)
+                token = self._get_recaptcha_token_zendriver(
+                    timeout_s=60,
+                    recaptcha_action=recaptcha_action,
+                    acquire_lock=acquire_lock,
+                )
                 if inject_token("zendriver", token):
                     return True
                 print(f"  ⚠️ [Zendriver] Không lấy được token, fallback Playwright")
@@ -4108,10 +4201,14 @@ class LabsFlowClient:
             print(f"  ✅ [Token Source] Playwright OK")
             return True
 
-        if source_preference not in ("cloak", "cloakbrowser", "zendriver", "selenium") and self._should_use_zendriver():
+        if source_preference not in ("bridge", "headful", "cloak", "cloakbrowser", "zendriver", "selenium") and self._should_use_zendriver():
             print(f"  🔵 [Token] Playwright fail -> fallback Zendriver/temp-profile...")
             try:
-                token = self._get_recaptcha_token_zendriver(timeout_s=60, recaptcha_action=recaptcha_action)
+                token = self._get_recaptcha_token_zendriver(
+                    timeout_s=60,
+                    recaptcha_action=recaptcha_action,
+                    acquire_lock=acquire_lock,
+                )
                 if inject_token("zendriver", token):
                     print(f"  ✅ [Token Source] Zendriver temp-profile OK sau khi Playwright fail")
                     return True
@@ -4119,11 +4216,12 @@ class LabsFlowClient:
             except Exception as e:
                 print(f"  ⚠️ [Zendriver] Error sau fallback từ Playwright: {e}")
 
-        # Cả 2 source đều fail
+        # Tất cả source đều fail
         if raise_on_fail:
-            error_msg = f"Cannot get reCAPTCHA token from both Zendriver and Playwright. {self.last_error_detail or ''}"
+            error_msg = f"Cannot get reCAPTCHA token from all sources (pref={source_preference}). {self.last_error_detail or ''}"
             self.last_error_detail = error_msg
-            print(f"  ✗ Không thể lấy token từ cả 2 source, raise exception...")
+            elapsed = time.time() - token_started_at
+            print(f"  ✗ Không thể lấy token từ tất cả source sau {elapsed:.1f}s, raise exception...")
             raise RuntimeError(error_msg)
         
         return False
@@ -4674,7 +4772,7 @@ class LabsFlowClient:
         batch_id = str(uuid.uuid4())
         session_id = self._generate_session_id()
         payload = {
-            "mediaGenerationContext": {"batchId": batch_id},
+            "mediaGenerationContext": {"batchId": batch_id, "audioFailurePreference": "BLOCK_SILENCED_VIDEOS"},
             "clientContext": {
                 "sessionId": session_id,
                 "projectId": project_id,
@@ -4882,22 +4980,49 @@ class LabsFlowClient:
                     self._reset_403_counter_for_cookie()
                     self._on_api_success()  # ✅ Reset zendriver/playwright 403 counters
                     
-                    # Extract operations for status checking
+                    # Extract operations for status checking.
+                    # Labs hiện có ít nhất 2 response formats:
+                    # 1) {"operations": [...]} cũ
+                    # 2) {"media": [...], "workflows": [...]} mới
+                    # Polling phải dùng đúng operation/media name thật, không được tự tạo UUID giả.
                     operations = []
-                    if isinstance(result, dict) and "operations" in result:
-                        for i, op in enumerate(result["operations"]):
-                            operations.append({
-                                "operation": {"name": op.get("operation", {}).get("name", "")},
-                                "sceneId": scene_ids[i],
-                                "status": "MEDIA_GENERATION_STATUS_PENDING",
-                            })
-                    else:
-                        for scene_id in scene_ids:
-                            operations.append({
-                                "operation": {"name": str(uuid.uuid4()).replace('-', '')},
-                                "sceneId": scene_id,
-                                "status": "MEDIA_GENERATION_STATUS_PENDING",
-                            })
+                    if isinstance(result, dict):
+                        if "operations" in result and isinstance(result["operations"], list):
+                            for i, op in enumerate(result["operations"]):
+                                op_name = (
+                                    op.get("operation", {}).get("name", "")
+                                    if isinstance(op, dict) else ""
+                                )
+                                operations.append({
+                                    "operation": {"name": op_name},
+                                    "sceneId": scene_ids[i] if i < len(scene_ids) else str(uuid.uuid4()),
+                                    "status": "MEDIA_GENERATION_STATUS_PENDING",
+                                })
+                        elif "media" in result and isinstance(result["media"], list):
+                            media_list = result.get("media", []) or []
+                            workflows = result.get("workflows", []) or []
+                            if workflows:
+                                try:
+                                    wf = workflows[0] or {}
+                                    print(f"  📦 [Generate Video] Workflow: {wf.get('name', '')}")
+                                    print(f"  📦 [Generate Video] Project: {wf.get('projectId', '')}")
+                                except Exception:
+                                    pass
+                            for i, media in enumerate(media_list):
+                                media_name = media.get("name", "") if isinstance(media, dict) else ""
+                                operations.append({
+                                    "operation": {"name": media_name},
+                                    "sceneId": scene_ids[i] if i < len(scene_ids) else str(uuid.uuid4()),
+                                    "status": "MEDIA_GENERATION_STATUS_PENDING",
+                                })
+
+                    if not operations:
+                        self.last_error_detail = (
+                            f"Generate thành công nhưng không parse được operations/media để polling. "
+                            f"Response keys: {list(result.keys()) if isinstance(result, dict) else type(result)}"
+                        )
+                        print(f"  ✗ {self.last_error_detail}")
+                        return None
                     
                     return operations
                 
