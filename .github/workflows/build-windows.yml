@@ -170,7 +170,6 @@ jobs:
             --include-package=websockets `
             --include-package=emoji `
             --include-package=grapheme `
-            --include-package-data=PySide6 `
             --include-package-data=PIL `
             --include-package-data=requests `
             --include-package-data=certifi `
