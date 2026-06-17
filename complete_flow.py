@@ -141,6 +141,189 @@ def _normalize_bearer(token_like: Optional[str]) -> Optional[str]:
     return None
 
 
+class _PatchrightWarmWorker:
+    """Giữ 1 Chrome Patchright 'ấm' (đã đăng nhập) cho mỗi cookie_hash, chạy trong
+    THREAD RIÊNG để tránh lỗi greenlet 'Cannot switch to a different thread'.
+
+    Vì sao cần:
+    - Trước đây mỗi lần lấy token = mở Chrome mới (profile trắng, lạnh) → reCAPTCHA
+      Enterprise ít tin, gen nhiều thì trust score tụt dần, lại chậm (~8.5s/token).
+    - Giữ 1 phiên sống, đã đăng nhập, "già đi" theo thời gian → Google quan sát hành
+      vi ổn định → trust score cao & ổn định hơn; mỗi token sau chỉ ~1s.
+
+    Cơ chế: thread sở hữu browser nhận yêu cầu qua queue, thực thi grecaptcha ở MAIN
+    world (vì Patchright chạy page.evaluate trong isolated world), trả token về.
+    """
+
+    def __init__(self, cookies: Dict[str, str], site_key: str, window_args: List[str],
+                 target_url: str = "https://labs.google/fx/tools/flow"):
+        self.cookies = dict(cookies or {})
+        self.site_key = site_key
+        self.window_args = list(window_args or [])
+        self.target_url = target_url
+        self._req_q: "queue.Queue" = queue.Queue()
+        self._started = threading.Event()
+        self._stop = False
+        self.alive = False
+        self.logged_in = False
+        self.last_used = time.time()
+        self.start_error: Optional[str] = None
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    # ---- chạy trong thread riêng ----
+    def _run(self):
+        import tempfile, shutil
+        try:
+            from patchright.sync_api import sync_playwright
+        except Exception as e:
+            self.start_error = f"patchright import fail: {e}"
+            self._started.set()
+            return
+
+        tmp = tempfile.mkdtemp(prefix="patchright_warm_")
+        ctx = None
+        try:
+            with sync_playwright() as p:
+                ctx = p.chromium.launch_persistent_context(
+                    user_data_dir=tmp,
+                    channel="chrome",
+                    headless=False,
+                    no_viewport=True,
+                    args=[
+                        "--no-first-run", "--no-default-browser-check",
+                        "--disable-infobars", "--hide-crash-restore-bubble",
+                        *self.window_args,
+                    ],
+                )
+                for name, value in self.cookies.items():
+                    if name.upper() in ("EMAIL", "PASSWORD", "PROFILE_PATH"):
+                        continue
+                    try:
+                        ctx.add_cookies([{"name": name, "value": value, "url": "https://labs.google/"}])
+                    except Exception:
+                        pass
+
+                page = ctx.pages[0] if ctx.pages else ctx.new_page()
+                try:
+                    page.goto("https://www.google.com", wait_until="domcontentloaded", timeout=15000)
+                    time.sleep(0.3)
+                except Exception:
+                    pass
+                try:
+                    page.goto(self.target_url, wait_until="domcontentloaded", timeout=30000)
+                except Exception:
+                    pass
+                time.sleep(2)
+
+                url = page.url or ""
+                if "accounts.google" in url or "signin" in url.lower():
+                    self.logged_in = False
+                    print("  ⚠️ [Patchright-Warm] Redirected to login - cookie không hợp lệ")
+                else:
+                    self.logged_in = True
+                    print(f"  ♻️ [Patchright-Warm] Phiên ấm sẵn sàng (logged-in) cho token")
+
+                self.alive = True
+                self._started.set()
+
+                # vòng phục vụ
+                while not self._stop:
+                    try:
+                        item = self._req_q.get(timeout=1.0)
+                    except queue.Empty:
+                        continue
+                    if item is None:
+                        break
+                    action, settle, timeout_s, holder, done = item
+                    try:
+                        holder["token"] = self._exec_token(page, action, timeout_s, settle)
+                    except Exception as e:
+                        holder["error"] = str(e)
+                        # đánh dấu phiên hỏng để tạo lại lần sau
+                        self.alive = False
+                    finally:
+                        done.set()
+        except Exception as e:
+            self.start_error = str(e)
+            self._started.set()
+        finally:
+            self.alive = False
+            try:
+                if ctx is not None:
+                    ctx.close()
+            except Exception:
+                pass
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def _exec_token(self, page, action: str, timeout_s: int, settle: float) -> Optional[str]:
+        # out_id duy nhất mỗi request → tránh đọc nhầm token cũ
+        out_id = "__pr_gre_" + uuid.uuid4().hex[:10]
+        js = (
+            "(function(){"
+            "var OUT=" + json.dumps(out_id) + ";var SITE=" + json.dumps(self.site_key) + ";var ACT=" + json.dumps(action) + ";"
+            "var el=document.createElement('div');el.id=OUT;el.setAttribute('data-status','pending');document.documentElement.appendChild(el);"
+            "var started=Date.now();"
+            "function tryExec(){"
+            "if(typeof window.grecaptcha!=='undefined'&&window.grecaptcha.enterprise&&typeof window.grecaptcha.enterprise.execute==='function'){"
+            "window.grecaptcha.enterprise.execute(SITE,{action:ACT}).then(function(t){el.setAttribute('data-token',t||'');el.setAttribute('data-status','done');}).catch(function(e){el.setAttribute('data-status','error');el.setAttribute('data-error',String(e));});"
+            "}else if(typeof window.grecaptcha!=='undefined'&&typeof window.grecaptcha.execute==='function'){"
+            "window.grecaptcha.execute(SITE,{action:ACT}).then(function(t){el.setAttribute('data-token',t||'');el.setAttribute('data-status','done');}).catch(function(e){el.setAttribute('data-status','error');el.setAttribute('data-error',String(e));});"
+            "}else{if(Date.now()-started>" + str(int(timeout_s * 1000)) + "){el.setAttribute('data-status','no-grecaptcha');return;}setTimeout(tryExec,300);}}"
+            "tryExec();})();"
+        )
+        page.add_script_tag(content=js)
+        read_js = (
+            "() => { const el=document.getElementById(" + json.dumps(out_id) + ");"
+            "if(!el) return null;"
+            "return {status: el.getAttribute('data-status'), token: el.getAttribute('data-token'), error: el.getAttribute('data-error')}; }"
+        )
+        deadline = time.time() + timeout_s
+        info = None
+        while time.time() < deadline:
+            try:
+                info = page.evaluate(read_js)
+            except Exception:
+                info = None
+            if info and info.get("status") in ("done", "error", "no-grecaptcha"):
+                break
+            time.sleep(0.3)
+        # dọn element
+        try:
+            page.evaluate("(id)=>{const e=document.getElementById(id); if(e) e.remove();}", out_id)
+        except Exception:
+            pass
+        if not info or info.get("status") != "done":
+            return None
+        tok = info.get("token")
+        if isinstance(tok, str) and len(tok.strip()) > 20:
+            if settle > 0:
+                time.sleep(settle)
+            return tok
+        return None
+
+    # ---- gọi từ thread khác ----
+    def get_token(self, action: str, settle: float, timeout_s: int) -> Optional[str]:
+        if not self._started.wait(75):
+            return None
+        if not self.alive or not self.logged_in:
+            return None
+        holder: Dict[str, Any] = {}
+        done = threading.Event()
+        self._req_q.put((action, settle, timeout_s, holder, done))
+        if not done.wait(timeout_s + 30):
+            return None
+        self.last_used = time.time()
+        return holder.get("token")
+
+    def stop(self):
+        self._stop = True
+        try:
+            self._req_q.put_nowait(None)
+        except Exception:
+            pass
+
+
 class LabsFlowClient:
     """Complete Google Labs Flow client with automatic token extraction.
     
@@ -166,7 +349,50 @@ class LabsFlowClient:
     _proxy_live_status: Dict[int, bool] = {}  # {proxy_index: is_live} - cache trạng thái live của proxy
     _proxy_live_check_time: Dict[int, float] = {}  # {proxy_index: timestamp} - thời gian check gần nhất
     _proxy_live_cache_ttl: float = 300.0  # Cache live status trong 5 phút
-    
+
+    # ✅ Warm Patchright sessions: giữ 1 Chrome 'ấm' theo cookie_hash để token nhanh
+    #    & trust score ổn định (tránh mở browser lạnh mỗi lần). Tự đóng khi idle.
+    _patchright_workers: Dict[str, "_PatchrightWarmWorker"] = {}
+    _patchright_pool_lock = threading.Lock()
+    _patchright_idle_ttl: float = 180.0  # đóng phiên ấm nếu không dùng trong 3 phút
+
+    @classmethod
+    def _close_patchright_worker(cls, cookie_hash: str) -> None:
+        with cls._patchright_pool_lock:
+            w = cls._patchright_workers.pop(cookie_hash, None)
+        if w is not None:
+            try:
+                w.stop()
+            except Exception:
+                pass
+
+    @classmethod
+    def cleanup_patchright_workers(cls) -> None:
+        """Đóng toàn bộ warm Patchright sessions (gọi khi thoát app / cleanup)."""
+        with cls._patchright_pool_lock:
+            workers = list(cls._patchright_workers.items())
+            cls._patchright_workers.clear()
+        for _, w in workers:
+            try:
+                w.stop()
+            except Exception:
+                pass
+
+    @classmethod
+    def _reap_idle_patchright_workers(cls) -> None:
+        """Đóng các phiên ấm đã idle quá TTL hoặc đã chết (gọi mỗi lần lấy token)."""
+        now = time.time()
+        stale = []
+        with cls._patchright_pool_lock:
+            for ch, w in list(cls._patchright_workers.items()):
+                if (not getattr(w, "alive", False)) or (now - getattr(w, "last_used", now) > cls._patchright_idle_ttl):
+                    stale.append(cls._patchright_workers.pop(ch))
+        for w in stale:
+            try:
+                w.stop()
+            except Exception:
+                pass
+
     @classmethod
     def _check_proxy_live(cls, proxy: Dict[str, str], timeout: float = 10.0) -> bool:
         """Kiểm tra proxy có live không bằng cách request đến httpbin.org/ip
@@ -784,8 +1010,14 @@ class LabsFlowClient:
         if hasattr(cls, '_shared_cookies_injected'):
             cls._shared_cookies_injected.clear()
         
+        
         # ✅ Cleanup Chrome CDP process
         cls._cleanup_chrome_cdp()
+        # ✅ Cleanup warm Patchright sessions
+        try:
+            cls.cleanup_patchright_workers()
+        except Exception:
+            pass
     
     @classmethod
     def _cleanup_chrome_cdp(cls):
@@ -3600,131 +3832,263 @@ class LabsFlowClient:
     # ✅ Correct site key cho labs.google reCAPTCHA Enterprise
     RECAPTCHA_SITE_KEY = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV"
 
-    def _get_recaptcha_token_cloakbrowser(
+    def _get_recaptcha_token_patchright(
         self,
         timeout_s: int = 60,
         recaptcha_action: str = "VIDEO_GENERATION",
         acquire_lock: bool = True,
     ) -> Optional[str]:
-        """Lấy reCAPTCHA token bằng CloakBrowser (stealth Chromium) + inject cookies.
-        
-        CloakBrowser dùng patched Chromium binary với fingerprint spoofing,
-        cho trust score cao hơn Playwright thường.
-        ✅ Đã test thành công: Token pass → HTTP 200 → Video gen OK.
-        Ưu tiên #1 trong chuỗi: CloakBrowser → Zendriver → Playwright.
+        """Lấy reCAPTCHA token bằng Patchright + Chrome THẬT (channel='chrome').
+
+        ✅ Vì sao tốt hơn CloakBrowser:
+        - CloakBrowser dùng patched *Chromium* (binary lạ) → reCAPTCHA Enterprise
+          dễ chấm UNUSUAL_ACTIVITY / score thấp.
+        - Patchright dùng **Google Chrome thật** đã cài trên máy + vá các leak CDP
+          (Runtime.enable, command-flags, console leak…) mà reCAPTCHA Enterprise
+          dùng để phát hiện automation → trust score cao hơn hẳn.
+        - Dùng persistent context (khuyến nghị của Patchright cho stealth tối đa).
+        - Cookie inject bằng URL form cho MỌI cookie → cookie __Secure-/__Host-
+          (đặc biệt session-token) được nhận đúng → page thật sự logged-in → score cao.
         """
         try:
-            from cloakbrowser import launch as cloak_launch
+            from patchright.sync_api import sync_playwright
         except ImportError:
-            print("  ⚠️ [CloakBrowser] Chưa cài cloakbrowser, bỏ qua (pip install cloakbrowser)")
+            print("  ⚠️ [Patchright] Chưa cài patchright, bỏ qua (pip install patchright)")
             return None
 
         cookie_hash = self._cookie_hash
         cookie_lock = LabsFlowClient._get_cookie_lock(cookie_hash)
+        site_key = self.RECAPTCHA_SITE_KEY
         target_url = "https://labs.google/fx/tools/flow"
+
+        # Settle delay: để reCAPTCHA Enterprise đăng ký assessment lên server Google
+        # TRƯỚC khi token được dùng (dùng token quá sớm → 403). flow2api dùng ~3s.
+        try:
+            settle_seconds = float(os.environ.get("CLOAK_TOKEN_SETTLE_SECONDS", "3.0"))
+        except Exception:
+            settle_seconds = 3.0
+
+        # ✅ Pacing/jitter: thêm độ trễ ngẫu nhiên nhỏ trước mỗi lần lấy token để
+        #    tránh nhịp "máy" đều tăm tắp (giảm tín hiệu automation theo tốc độ).
+        try:
+            import random as _random
+            jmin = float(os.environ.get("RECAPTCHA_JITTER_MIN", "0.4"))
+            jmax = float(os.environ.get("RECAPTCHA_JITTER_MAX", "1.6"))
+            if jmax > 0:
+                time.sleep(_random.uniform(max(0.0, jmin), max(jmin, jmax)))
+        except Exception:
+            pass
+
+        browser_mode = LabsFlowClient._recaptcha_browser_mode()
+        if browser_mode == "visible":
+            window_args = ["--window-position=100,100", "--window-size=1280,900"]
+        else:
+            window_args = LabsFlowClient._hidden_browser_window_args()
+
+        # ════════════════════════════════════════════════════════════════════
+        # ✅ ƯU TIÊN: WARM SESSION REUSE (giữ 1 Chrome ấm/cookie, nhanh + trust ổn định)
+        #    Có thể tắt bằng env PATCHRIGHT_WARM_REUSE=0. Nếu lỗi → fallback per-call.
+        # ════════════════════════════════════════════════════════════════════
+        warm_enabled = str(os.environ.get("PATCHRIGHT_WARM_REUSE", "1")).strip().lower() in ("1", "true", "yes")
+        if warm_enabled:
+            try:
+                LabsFlowClient._reap_idle_patchright_workers()
+                worker = None
+                with LabsFlowClient._patchright_pool_lock:
+                    worker = LabsFlowClient._patchright_workers.get(cookie_hash)
+                    if worker is not None and not getattr(worker, "alive", False):
+                        # phiên cũ đã chết → bỏ, tạo lại
+                        LabsFlowClient._patchright_workers.pop(cookie_hash, None)
+                        try:
+                            worker.stop()
+                        except Exception:
+                            pass
+                        worker = None
+                    if worker is None:
+                        print(f"  ♻️ [Patchright-Warm] Tạo phiên ấm mới cho cookie {cookie_hash[:8]}...")
+                        worker = _PatchrightWarmWorker(self.cookies, site_key, window_args, target_url)
+                        LabsFlowClient._patchright_workers[cookie_hash] = worker
+
+                token = worker.get_token(recaptcha_action, settle_seconds, timeout_s)
+                if isinstance(token, str) and len(token.strip()) > 20:
+                    print(f"  ✅ [Patchright-Warm] Token OK (len={len(token)}) — phiên tái dùng")
+                    return token
+                # Token fail → đóng phiên hỏng, rơi xuống fallback per-call
+                print(f"  ⚠️ [Patchright-Warm] Không lấy được token từ phiên ấm → fallback per-call")
+                LabsFlowClient._close_patchright_worker(cookie_hash)
+            except Exception as e:
+                print(f"  ⚠️ [Patchright-Warm] Lỗi phiên ấm: {e} → fallback per-call")
+                try:
+                    LabsFlowClient._close_patchright_worker(cookie_hash)
+                except Exception:
+                    pass
 
         from contextlib import nullcontext
         lock_context = cookie_lock if acquire_lock else nullcontext()
 
         with lock_context:
+            temp_profile_dir = None
+            context = None
             try:
-                browser_mode = LabsFlowClient._recaptcha_browser_mode()
-                headless = False  # ✅ Luôn headful — headless bị trust score thấp
-                window_args = []
-                if browser_mode == "visible":
-                    window_args = ["--window-position=100,100", "--window-size=1280,900"]
-                else:
-                    window_args = LabsFlowClient._hidden_browser_window_args()
+                import tempfile
+                temp_profile_dir = tempfile.mkdtemp(prefix="patchright_flow_")
 
-                print(f"  🟢 [CloakBrowser] Khởi động stealth Chromium (mode={browser_mode})...")
-                browser = cloak_launch(
-                    headless=headless,
-                    args=window_args if window_args else None,
-                )
-                try:
-                    context = browser.new_context()
-                    # Inject Labs cookies
+                launch_args = [
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--disable-infobars",
+                    "--hide-crash-restore-bubble",
+                    *window_args,
+                ]
+
+                print(f"  🟣 [Patchright] Khởi động Chrome THẬT (channel=chrome, mode={browser_mode})...")
+                with sync_playwright() as p:
+                    # ✅ Patchright khuyến nghị: launch_persistent_context + channel='chrome'
+                    #    + no_viewport=True; KHÔNG dùng add_init_script (patchright tự ẩn webdriver).
+                    context = p.chromium.launch_persistent_context(
+                        user_data_dir=temp_profile_dir,
+                        channel="chrome",
+                        headless=False,
+                        no_viewport=True,
+                        args=launch_args,
+                    )
+
+                    # ✅ Inject cookies bằng URL form cho MỌI cookie → tự suy secure/sameSite
+                    #    đúng cho __Secure-/__Host- (session-token được nhận → page logged-in).
                     injected = 0
+                    skipped: List[str] = []
+                    cookie_payloads = []
                     for name, value in (self.cookies or {}).items():
+                        # Bỏ qua các key metadata không phải cookie thật
+                        if name.upper() in ("EMAIL", "PASSWORD", "PROFILE_PATH"):
+                            continue
+                        cookie_payloads.append({
+                            "name": name,
+                            "value": value,
+                            "url": "https://labs.google/",
+                        })
+                    for cp in cookie_payloads:
                         try:
-                            if name.startswith("__Host-"):
-                                context.add_cookies([{"name": name, "value": value, "url": "https://labs.google/"}])
-                            else:
-                                context.add_cookies([{"name": name, "value": value, "domain": "labs.google", "path": "/"}])
+                            context.add_cookies([cp])
                             injected += 1
-                        except Exception:
-                            pass
-                    print(f"  🍪 [CloakBrowser] Injected {injected}/{len(self.cookies or {})} cookies")
+                        except Exception as ce:
+                            skipped.append(f"{cp['name']}: {str(ce)[:60]}")
+                    print(f"  🍪 [Patchright] Injected {injected}/{len(cookie_payloads)} cookies (URL form)")
+                    if skipped:
+                        print(f"  ⚠️ [Patchright] Cookie inject lỗi: {'; '.join(skipped[:3])}")
 
-                    page = context.new_page()
+                    page = context.pages[0] if context.pages else context.new_page()
 
-                    # ✅ Warm-up: navigate google.com trước để build trust score
-                    print(f"  🔥 [CloakBrowser] Warm-up: google.com → labs.google")
+                    # ✅ Warm-up: google.com trước để build trust score
+                    print(f"  🔥 [Patchright] Warm-up: google.com → labs.google")
                     try:
                         page.goto("https://www.google.com", wait_until="domcontentloaded", timeout=15000)
                         time.sleep(0.5)
                     except Exception:
                         pass
 
-                    print(f"  🌐 [CloakBrowser] Navigate đến {target_url}...")
+                    print(f"  🌐 [Patchright] Navigate đến {target_url}...")
                     try:
                         page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
                     except Exception:
                         pass
 
-                    # ✅ Đợi thêm để page fully settle (JS scripts, reCAPTCHA init)
                     time.sleep(2)
 
-                    # Check redirect to login
                     current_url = page.url or ""
+                    print(f"  🔎 [Patchright] URL sau navigate: {current_url[:80]}")
                     if "accounts.google" in current_url or "signin" in current_url.lower():
-                        print("  ⚠️ [CloakBrowser] Redirected to login - cookie không hợp lệ")
+                        print("  ⚠️ [Patchright] Redirected to login - cookie không hợp lệ/hết hạn")
                         return None
 
-                    print("  ⏳ [CloakBrowser] Đợi grecaptcha load...")
-                    page.wait_for_function(
-                        """() => {
-                            return (typeof grecaptcha !== 'undefined' && grecaptcha.enterprise &&
-                                    typeof grecaptcha.enterprise.execute === 'function') ||
-                                   (typeof grecaptcha !== 'undefined' &&
-                                    typeof grecaptcha.execute === 'function');
-                        }""",
-                        timeout=timeout_s * 1000,
+                    # ✅ QUAN TRỌNG: Patchright chạy page.evaluate trong ISOLATED world
+                    #    (cơ chế stealth) → KHÔNG thấy window.grecaptcha (do script trang
+                    #    gắn vào MAIN world). Vì vậy phải execute reCAPTCHA bằng add_script_tag
+                    #    (chạy ở MAIN world), ghi token ra 1 element DOM, rồi đọc lại DOM từ
+                    #    isolated world (DOM dùng chung giữa 2 world).
+                    out_id = "__pr_gre_out"
+                    main_world_js = (
+                        "(function(){"
+                        "var OUT=" + json.dumps(out_id) + ";"
+                        "var SITE=" + json.dumps(site_key) + ";"
+                        "var ACT=" + json.dumps(recaptcha_action) + ";"
+                        "var el=document.getElementById(OUT);"
+                        "if(!el){el=document.createElement('div');el.id=OUT;document.documentElement.appendChild(el);}"
+                        "el.setAttribute('data-status','pending');"
+                        "var started=Date.now();"
+                        "function tryExec(){"
+                        "  if(typeof window.grecaptcha!=='undefined' && window.grecaptcha.enterprise && typeof window.grecaptcha.enterprise.execute==='function'){"
+                        "    window.grecaptcha.enterprise.execute(SITE,{action:ACT}).then(function(tok){"
+                        "      el.setAttribute('data-token',tok||'');el.setAttribute('data-status','done');"
+                        "    }).catch(function(e){el.setAttribute('data-status','error');el.setAttribute('data-error',String(e));});"
+                        "  } else if(typeof window.grecaptcha!=='undefined' && typeof window.grecaptcha.execute==='function'){"
+                        "    window.grecaptcha.execute(SITE,{action:ACT}).then(function(tok){"
+                        "      el.setAttribute('data-token',tok||'');el.setAttribute('data-status','done');"
+                        "    }).catch(function(e){el.setAttribute('data-status','error');el.setAttribute('data-error',String(e));});"
+                        "  } else {"
+                        "    if(Date.now()-started>" + str(int(timeout_s * 1000)) + "){el.setAttribute('data-status','no-grecaptcha');return;}"
+                        "    setTimeout(tryExec,300);"
+                        "  }"
+                        "}"
+                        "tryExec();"
+                        "})();"
                     )
 
-                    print(f"  🔑 [CloakBrowser] Executing reCAPTCHA (action={recaptcha_action})...")
-                    token = page.evaluate(
-                        """async ([siteKey, action]) => {
-                            try {
-                                if (typeof grecaptcha !== 'undefined' && grecaptcha.enterprise) {
-                                    return await grecaptcha.enterprise.execute(siteKey, {action});
-                                } else if (typeof grecaptcha !== 'undefined') {
-                                    return await grecaptcha.execute(siteKey, {action});
-                                }
-                                return 'ERROR:grecaptcha not found';
-                            } catch(e) {
-                                return 'ERROR:' + e.message;
-                            }
-                        }""",
-                        [self.RECAPTCHA_SITE_KEY, recaptcha_action],
-                    )
-
-                    if isinstance(token, str) and token.startswith("ERROR:"):
-                        print(f"  ⚠️ [CloakBrowser] reCAPTCHA error: {token[6:]}")
-                        return None
-                    if isinstance(token, str) and len(token.strip()) > 20:
-                        print(f"  ✅ [CloakBrowser] Token OK (len={len(token)})")
-                        return token
-                    print(f"  ⚠️ [CloakBrowser] Unexpected token result: {token}")
-                    return None
-                finally:
+                    print(f"  🔑 [Patchright] Executing reCAPTCHA ở MAIN world (action={recaptcha_action})...")
                     try:
-                        browser.close()
+                        page.add_script_tag(content=main_world_js)
+                    except Exception as e:
+                        print(f"  ⚠️ [Patchright] add_script_tag lỗi: {e}")
+                        return None
+
+                    # Poll DOM (đọc từ isolated world – DOM dùng chung)
+                    read_js = (
+                        "() => { const el=document.getElementById(" + json.dumps(out_id) + ");"
+                        "if(!el) return null;"
+                        "return {status: el.getAttribute('data-status'), token: el.getAttribute('data-token'), error: el.getAttribute('data-error')}; }"
+                    )
+                    deadline = time.time() + timeout_s
+                    info = None
+                    while time.time() < deadline:
+                        try:
+                            info = page.evaluate(read_js)
+                        except Exception:
+                            info = None
+                        if info and info.get("status") in ("done", "error", "no-grecaptcha"):
+                            break
+                        time.sleep(0.3)
+
+                    if not info or info.get("status") == "no-grecaptcha":
+                        print(f"  ⚠️ [Patchright] grecaptcha KHÔNG load (URL={page.url[:80]})")
+                        return None
+                    if info.get("status") == "error":
+                        print(f"  ⚠️ [Patchright] reCAPTCHA error: {info.get('error')}")
+                        return None
+
+                    token = info.get("token")
+                    if isinstance(token, str) and len(token.strip()) > 20:
+                        if settle_seconds > 0:
+                            print(f"  ⏳ [Patchright] Settle {settle_seconds:.1f}s để assessment đăng ký server...")
+                            time.sleep(settle_seconds)
+                        print(f"  ✅ [Patchright] Token OK (len={len(token)})")
+                        return token
+                    print(f"  ⚠️ [Patchright] Token rỗng/không hợp lệ: status={info.get('status')}")
+                    return None
+            except Exception as e:
+                print(f"  ⚠️ [Patchright] Error: {e}")
+                return None
+            finally:
+                if context is not None:
+                    try:
+                        context.close()
                     except Exception:
                         pass
-            except Exception as e:
-                print(f"  ⚠️ [CloakBrowser] Error: {e}")
-                return None
+                if temp_profile_dir:
+                    try:
+                        import shutil
+                        shutil.rmtree(temp_profile_dir, ignore_errors=True)
+                    except Exception:
+                        pass
 
     def _get_recaptcha_token_headful_bridge(
         self,
@@ -4110,8 +4474,8 @@ class LabsFlowClient:
         """If enabled, fetch reCAPTCHA token and inject into clientContext.
         
         ✅ TOKEN SOURCE PRIORITY (theo RECAPTCHA_SOURCE env var):
-        - "bridge"/"headful": Bridge Server → CloakBrowser → Zendriver → Playwright
-        - "cloak" (default):  CloakBrowser → Zendriver → Playwright
+        - "patchright" (default): Patchright(Chrome thật) → Zendriver → Playwright
+        - "bridge"/"headful": Bridge Server → Patchright → Zendriver → Playwright
         - "zendriver"/"selenium": Zendriver → Playwright
         - "playwright" hoặc khác: Playwright → Zendriver
         
@@ -4131,7 +4495,7 @@ class LabsFlowClient:
         token = None
         token_generated_at = None
         token_started_at = time.time()
-        source_preference = str(_env("RECAPTCHA_SOURCE", "cloak") or "cloak").strip().lower()
+        source_preference = str(_env("RECAPTCHA_SOURCE", "patchright") or "patchright").strip().lower()
 
         def inject_token(source: str, token_value: Optional[str]) -> bool:
             nonlocal token_generated_at
@@ -4141,7 +4505,7 @@ class LabsFlowClient:
             self._record_token_source(source)
             client_context["recaptchaToken"] = token_value
             LabsFlowClient._token_timestamps[cookie_hash] = token_generated_at
-            label_map = {"cloakbrowser": "CloakBrowser", "zendriver": "Zendriver", "bridge": "HeadfulBridge"}
+            label_map = {"patchright": "Patchright", "zendriver": "Zendriver", "bridge": "HeadfulBridge"}
             label = label_map.get(source, "Playwright")
             elapsed = time.time() - token_started_at
             print(f"  ✅ [{label}] Token injected (len={len(token_value)}, ts={token_generated_at:.0f}, elapsed={elapsed:.1f}s)")
@@ -4155,28 +4519,29 @@ class LabsFlowClient:
                 if inject_token("bridge", token):
                     print(f"  ✅ [Token Source] Headful Bridge OK")
                     return True
-                print(f"  ⚠️ [Bridge] Không lấy được token, fallback CloakBrowser")
+                print(f"  ⚠️ [Bridge] Không lấy được token, fallback Patchright")
             except Exception as e:
-                print(f"  ⚠️ [Bridge] Error, fallback CloakBrowser: {e}")
+                print(f"  ⚠️ [Bridge] Error, fallback Patchright: {e}")
 
-        # ── Priority 1: CloakBrowser (stealth Chromium, best trust score) ──────
-        if source_preference in ("bridge", "headful", "cloak", "cloakbrowser"):
-            print(f"  🟢 [Token] Ưu tiên CloakBrowser trước...")
+        # ── Priority 1: Patchright (Chrome THẬT, trust score cao nhất) ──────────
+        # (CloakBrowser đã bị gỡ bỏ — token stealth Chromium luôn bị 403 UNUSUAL_ACTIVITY)
+        if source_preference in ("patchright", "bridge", "headful", "cloak", "cloakbrowser"):
+            print(f"  🟣 [Token] Ưu tiên Patchright (Chrome thật) trước...")
             try:
-                token = self._get_recaptcha_token_cloakbrowser(
+                token = self._get_recaptcha_token_patchright(
                     timeout_s=60,
                     recaptcha_action=recaptcha_action,
                     acquire_lock=acquire_lock,
                 )
-                if inject_token("cloakbrowser", token):
-                    print(f"  ✅ [Token Source] CloakBrowser OK")
+                if inject_token("patchright", token):
+                    print(f"  ✅ [Token Source] Patchright OK")
                     return True
-                print(f"  ⚠️ [CloakBrowser] Không lấy được token, fallback Zendriver")
+                print(f"  ⚠️ [Patchright] Không lấy được token, fallback Zendriver")
             except Exception as e:
-                print(f"  ⚠️ [CloakBrowser] Error, fallback Zendriver: {e}")
+                print(f"  ⚠️ [Patchright] Error, fallback Zendriver: {e}")
 
         # ── Priority 2: Zendriver (temp-profile) ────────────────────────────────
-        if source_preference in ("bridge", "headful", "cloak", "cloakbrowser", "zendriver", "selenium") and self._should_use_zendriver():
+        if source_preference in ("patchright", "bridge", "headful", "cloak", "cloakbrowser", "zendriver", "selenium") and self._should_use_zendriver():
             print(f"  🔵 [Token] Ưu tiên Zendriver/temp-profile trước...")
             try:
                 token = self._get_recaptcha_token_zendriver(
@@ -4190,7 +4555,7 @@ class LabsFlowClient:
             except Exception as e:
                 print(f"  ⚠️ [Zendriver] Error, fallback Playwright: {e}")
 
-        # ── Priority 3: Playwright (fallback) ───────────────────────────────────
+        # ── Priority 4: Playwright (fallback) ───────────────────────────────────
         token = self._get_recaptcha_token_with_playwright(
             timeout_s=90,
             max_retries_on_403=3,
@@ -4358,6 +4723,32 @@ class LabsFlowClient:
         Điều này giúp Google Labs tracking session và có thể ảnh hưởng đến reCAPTCHA trust score.
         """
         return f";{int(time.time() * 1000)}"
+
+    @staticmethod
+    def _extract_prompt_text(prompt: Any) -> str:
+        """Chuẩn hoá prompt về TEXT THUẦN giống payload WebUI/curl.
+
+        File prompt của user có thể chứa dòng dạng JSON: {"prompt": "..."}.
+        WebUI/curl chỉ gửi text thuần trong structuredPrompt.parts[].text.
+        Hàm này bóc lấy text bên trong nếu prompt là JSON {"prompt": "..."},
+        ngược lại trả về nguyên văn.
+        """
+        if prompt is None:
+            return ""
+        if not isinstance(prompt, str):
+            return str(prompt)
+        s = prompt.strip()
+        # Chỉ thử parse khi nhìn giống JSON object
+        if s.startswith("{") and s.endswith("}") and '"prompt"' in s:
+            try:
+                obj = json.loads(s)
+                if isinstance(obj, dict):
+                    inner = obj.get("prompt")
+                    if isinstance(inner, str) and inner.strip():
+                        return inner
+            except Exception:
+                pass
+        return prompt
     
     def _notify_captcha_error_self_heal(self, error_code: int, error_msg: str) -> None:
         """Thông báo cho browser captcha service về lỗi để tự phục hồi.
@@ -4758,11 +5149,12 @@ class LabsFlowClient:
         
         # Bỏ check live status - chạy trực tiếp
         requests_body = []
+        clean_prompt = self._extract_prompt_text(prompt)
         for i in range(num_videos):
             requests_body.append({
                 "aspectRatio": mapped_aspect,
                 "seed": seeds[i],
-                "textInput": {"structuredPrompt": {"parts": [{"text": prompt}]}},
+                "textInput": {"structuredPrompt": {"parts": [{"text": clean_prompt}]}},
                 "videoModelKey": effective_model,
                 "metadata": {},
             })
@@ -4907,6 +5299,12 @@ class LabsFlowClient:
                     if resp.status_code == 403:
                         # ✅ Track token source 403
                         self._on_api_403()
+                        
+                        # ✅ Log FULL response body để chẩn đoán nguyên nhân 403 thực sự
+                        try:
+                            print(f"  🧾 [T2V 403 BODY] {resp.text[:600]}")
+                        except Exception:
+                            pass
                         
                         # ✅ FIX (flow2api): Thông báo cho captcha service tự phục hồi
                         self._notify_captcha_error_self_heal(403, resp.text[:200])
@@ -5475,6 +5873,7 @@ class LabsFlowClient:
         # ✅ FIX: Dùng structuredPrompt thay vì double-encode prompt thành JSON string
         # Format đúng: "textInput": {"structuredPrompt": {"parts": [{"text": "..."}]}}
         requests_body: List[Dict[str, Any]] = []
+        clean_prompt = self._extract_prompt_text(prompt)
         for i in range(num_videos):
             # ✅ Build startImage với cropCoordinates nếu có
             start_image = {"mediaId": media_id}
@@ -5487,7 +5886,7 @@ class LabsFlowClient:
                     "seed": seeds[i],
                     "textInput": {
                         "structuredPrompt": {
-                            "parts": [{"text": prompt}]
+                            "parts": [{"text": clean_prompt}]
                         }
                     },
                     "videoModelKey": effective_model,
@@ -5718,22 +6117,49 @@ class LabsFlowClient:
                     self._reset_403_counter_for_cookie()
                     self._on_api_success()  # ✅ Reset zendriver/playwright 403 counters
 
-                    # Extract operations cho polling
+                    # Extract operations cho polling.
+                    # Labs có 2 response formats:
+                    # 1) {"operations": [...]} cũ
+                    # 2) {"media": [...], "workflows": [...]} mới
+                    # Phải dùng operation/media name THẬT, không được tự tạo UUID giả
+                    # (UUID giả → polling không bao giờ thấy video → task bị coi là fail → gen lại liên tục).
                     operations: List[Dict[str, Any]] = []
-                    if isinstance(result, dict) and "operations" in result:
-                        for i, op in enumerate(result["operations"]):
-                            operations.append({
-                                "operation": {"name": op.get("operation", {}).get("name", "")},
-                                "sceneId": scene_ids[i],
-                                "status": "MEDIA_GENERATION_STATUS_PENDING",
-                            })
-                    else:
-                        for scene_id in scene_ids:
-                            operations.append({
-                                "operation": {"name": str(uuid.uuid4()).replace('-', '')},
-                                "sceneId": scene_id,
-                                "status": "MEDIA_GENERATION_STATUS_PENDING",
-                            })
+                    if isinstance(result, dict):
+                        if "operations" in result and isinstance(result["operations"], list):
+                            for i, op in enumerate(result["operations"]):
+                                op_name = (
+                                    op.get("operation", {}).get("name", "")
+                                    if isinstance(op, dict) else ""
+                                )
+                                operations.append({
+                                    "operation": {"name": op_name},
+                                    "sceneId": scene_ids[i] if i < len(scene_ids) else str(uuid.uuid4()),
+                                    "status": "MEDIA_GENERATION_STATUS_PENDING",
+                                })
+                        elif "media" in result and isinstance(result["media"], list):
+                            media_list = result.get("media", []) or []
+                            workflows = result.get("workflows", []) or []
+                            if workflows:
+                                try:
+                                    wf = workflows[0] or {}
+                                    print(f"  📦 [I2V] Workflow: {wf.get('name', '')}")
+                                except Exception:
+                                    pass
+                            for i, media in enumerate(media_list):
+                                media_name = media.get("name", "") if isinstance(media, dict) else ""
+                                operations.append({
+                                    "operation": {"name": media_name},
+                                    "sceneId": scene_ids[i] if i < len(scene_ids) else str(uuid.uuid4()),
+                                    "status": "MEDIA_GENERATION_STATUS_PENDING",
+                                })
+
+                    if not operations:
+                        self.last_error_detail = (
+                            f"I2V generate thành công nhưng không parse được operations/media để polling. "
+                            f"Response keys: {list(result.keys()) if isinstance(result, dict) else type(result)}"
+                        )
+                        print(f"  ✗ {self.last_error_detail}")
+                        return None
 
                     return operations
 
@@ -5778,6 +6204,7 @@ class LabsFlowClient:
         # Bỏ check live status - chạy trực tiếp
         # Build payload cơ bản - ✅ FIX: Dùng structuredPrompt thay vì double-encode
         requests_body: List[Dict[str, Any]] = []
+        clean_prompt = self._extract_prompt_text(prompt)
         
         for i in range(num_videos):
             # ✅ Build startImage với cropCoordinates nếu có
@@ -5796,7 +6223,7 @@ class LabsFlowClient:
                     "seed": seeds[i],
                     "textInput": {
                         "structuredPrompt": {
-                            "parts": [{"text": prompt}]
+                            "parts": [{"text": clean_prompt}]
                         }
                     },
                     "videoModelKey": model_key,
@@ -6008,24 +6435,35 @@ class LabsFlowClient:
                     self._reset_403_counter_for_cookie()
 
                     operations: List[Dict[str, Any]] = []
-                    if isinstance(result, dict) and "operations" in result:
-                        for i, op in enumerate(result["operations"]):
-                            operations.append(
-                                {
-                                    "operation": {"name": op.get("operation", {}).get("name", "")},
-                                    "sceneId": scene_ids[i],
+                    if isinstance(result, dict):
+                        if "operations" in result and isinstance(result["operations"], list):
+                            for i, op in enumerate(result["operations"]):
+                                op_name = (
+                                    op.get("operation", {}).get("name", "")
+                                    if isinstance(op, dict) else ""
+                                )
+                                operations.append({
+                                    "operation": {"name": op_name},
+                                    "sceneId": scene_ids[i] if i < len(scene_ids) else str(uuid.uuid4()),
                                     "status": "MEDIA_GENERATION_STATUS_PENDING",
-                                }
-                            )
-                    else:
-                        for scene_id in scene_ids:
-                            operations.append(
-                                {
-                                    "operation": {"name": str(uuid.uuid4()).replace("-", "")},
-                                    "sceneId": scene_id,
+                                })
+                        elif "media" in result and isinstance(result["media"], list):
+                            media_list = result.get("media", []) or []
+                            for i, media in enumerate(media_list):
+                                media_name = media.get("name", "") if isinstance(media, dict) else ""
+                                operations.append({
+                                    "operation": {"name": media_name},
+                                    "sceneId": scene_ids[i] if i < len(scene_ids) else str(uuid.uuid4()),
                                     "status": "MEDIA_GENERATION_STATUS_PENDING",
-                                }
-                            )
+                                })
+
+                    if not operations:
+                        self.last_error_detail = (
+                            f"Start-End generate thành công nhưng không parse được operations/media để polling. "
+                            f"Response keys: {list(result.keys()) if isinstance(result, dict) else type(result)}"
+                        )
+                        print(f"  ✗ {self.last_error_detail}")
+                        return None
 
                     return operations
 
@@ -6277,20 +6715,35 @@ class LabsFlowClient:
                 print("  ✓ Upscale jobs started")
 
                 operations = []
-                if isinstance(result, dict) and "operations" in result:
-                    for i, op in enumerate(result["operations"]):
-                        operations.append({
-                            "operation": {"name": op.get("operation", {}).get("name", "")},
-                            "sceneId": scene_ids[i],
-                            "status": "MEDIA_GENERATION_STATUS_PENDING",
-                        })
-                else:
-                    for scene_id in scene_ids:
-                        operations.append({
-                            "operation": {"name": str(uuid.uuid4()).replace('-', '')},
-                            "sceneId": scene_id,
-                            "status": "MEDIA_GENERATION_STATUS_PENDING",
-                        })
+                if isinstance(result, dict):
+                    if "operations" in result and isinstance(result["operations"], list):
+                        for i, op in enumerate(result["operations"]):
+                            op_name = (
+                                op.get("operation", {}).get("name", "")
+                                if isinstance(op, dict) else ""
+                            )
+                            operations.append({
+                                "operation": {"name": op_name},
+                                "sceneId": scene_ids[i] if i < len(scene_ids) else str(uuid.uuid4()),
+                                "status": "MEDIA_GENERATION_STATUS_PENDING",
+                            })
+                    elif "media" in result and isinstance(result["media"], list):
+                        media_list = result.get("media", []) or []
+                        for i, media in enumerate(media_list):
+                            media_name = media.get("name", "") if isinstance(media, dict) else ""
+                            operations.append({
+                                "operation": {"name": media_name},
+                                "sceneId": scene_ids[i] if i < len(scene_ids) else str(uuid.uuid4()),
+                                "status": "MEDIA_GENERATION_STATUS_PENDING",
+                            })
+
+                if not operations:
+                    self.last_error_detail = (
+                        f"Upscale thành công nhưng không parse được operations/media để polling. "
+                        f"Response keys: {list(result.keys()) if isinstance(result, dict) else type(result)}"
+                    )
+                    print(f"  ✗ {self.last_error_detail}")
+                    return None
 
                 return operations
                 

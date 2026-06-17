@@ -16951,6 +16951,13 @@ QUAN TRỌNG:
                     pass
                 return False
             
+            # ✅ Normalize prompt: bóc text thuần nếu prompt là JSON {"prompt":"..."}
+            try:
+                if hasattr(client, "_extract_prompt_text"):
+                    prompt_text = client._extract_prompt_text(prompt_text)
+            except Exception:
+                pass
+            
             for i in range(num_videos):
                 requests_body.append({
                     "aspectRatio": aspect_value,
@@ -17051,10 +17058,32 @@ QUAN TRỌNG:
             if result is None:
                 return False
             
-            operations = result.get('operations', [])
-            
-            if not operations:
-                error_msg = "API response không có operations"
+            # ✅ Hỗ trợ cả 2 response format: {"operations":[...]} cũ và
+            #    {"media":[...],"workflows":[...]} mới. Lấy operation/media name THẬT
+            #    (không tạo UUID giả → tránh polling sai → gen lại liên tục).
+            ops_formatted = []
+            if isinstance(result, dict):
+                if result.get("operations"):
+                    for i, op in enumerate(result["operations"]):
+                        scene_id = scene_ids[i] if i < len(scene_ids) else f"int_{idx}_{i}"
+                        op_name = op.get("operation", {}).get("name", "") if isinstance(op, dict) else ""
+                        ops_formatted.append({
+                            "operation": {"name": op_name},
+                            "sceneId": scene_id,
+                            "status": "MEDIA_GENERATION_STATUS_PENDING"
+                        })
+                elif result.get("media"):
+                    for i, media in enumerate(result["media"]):
+                        scene_id = scene_ids[i] if i < len(scene_ids) else f"int_{idx}_{i}"
+                        media_name = media.get("name", "") if isinstance(media, dict) else ""
+                        ops_formatted.append({
+                            "operation": {"name": media_name},
+                            "sceneId": scene_id,
+                            "status": "MEDIA_GENERATION_STATUS_PENDING"
+                        })
+
+            if not ops_formatted:
+                error_msg = "API response không có operations/media để polling"
                 self.log(f"❌ Integrate: {error_msg}")
                 try:
                     setattr(client, "last_error_detail", error_msg)
@@ -17065,26 +17094,6 @@ QUAN TRỌNG:
             
             # Update progress: 30%
             self.update_task_progress(idx, 30)
-            
-            # ✅ Format operations với sceneId tương ứng (giống các mode khác)
-            ops_formatted = []
-            if isinstance(result, dict) and "operations" in result:
-                for i, op in enumerate(result["operations"]):
-                    # Sử dụng sceneId từ scene_ids nếu có, nếu không dùng default
-                    scene_id = scene_ids[i] if i < len(scene_ids) else f"int_{idx}_{i}"
-                    ops_formatted.append({
-                        "operation": {"name": op.get("operation", {}).get("name", "")},
-                        "sceneId": scene_id,
-                        "status": "MEDIA_GENERATION_STATUS_PENDING"
-                    })
-            else:
-                # Fallback: tạo operations từ scene_ids
-                for i, scene_id in enumerate(scene_ids):
-                    ops_formatted.append({
-                        "operation": {"name": str(uuid.uuid4()).replace('-', '')},
-                        "sceneId": scene_id,
-                        "status": "MEDIA_GENERATION_STATUS_PENDING"
-                    })
             
             # Poll with progress (30% → 90%)
             self.log("⏳ Đang đợi Integrate video...")
@@ -30673,27 +30682,29 @@ def main():
     palette.setColor(QPalette.HighlightedText, QColor(255, 255, 255))
     app.setPalette(palette)
 
-    # --- Auto reCAPTCHA token: CloakBrowser (mặc định) / Bridge / Selenium ---
-    # ✅ RECAPTCHA_SOURCE ưu tiên: "cloak" → CloakBrowser stealth Chromium (best trust score)
-    # Các option: "bridge"/"headful" → Bridge Server, "cloak" → CloakBrowser, "zendriver"/"selenium", "playwright"
+    # --- Auto reCAPTCHA token: Patchright (Chrome thật) / Bridge / Selenium ---
+    # ✅ RECAPTCHA_SOURCE ưu tiên: "patchright" → Patchright + Chrome THẬT (trust score cao nhất)
+    # Các option: "patchright" → Patchright(Chrome thật),
+    #             "bridge"/"headful" → Bridge Server, "zendriver"/"selenium", "playwright"
     os.environ.setdefault("AUTO_RECAPTCHA", "1")
     os.environ.setdefault("RECAPTCHA_MODE", "selenium")  # ✅ Mặc định: Selenium Driver
-    os.environ.setdefault("RECAPTCHA_SOURCE", "cloak")   # ✅ CloakBrowser ưu tiên (stealth Chromium)
+    os.environ.setdefault("RECAPTCHA_SOURCE", "patchright")   # ✅ Patchright + Chrome thật ưu tiên
     os.environ.setdefault("HEADFUL_BRIDGE_URL", "http://127.0.0.1:8899")
     os.environ.setdefault("CAPTCHA_BRIDGE_URL", "http://localhost:3000")
     
     # ✅ Chỉ start bridge server nếu dùng Extension mode
     recaptcha_mode = os.environ.get("RECAPTCHA_MODE", "selenium").lower()
-    recaptcha_source = os.environ.get("RECAPTCHA_SOURCE", "cloak").lower()
+    recaptcha_source = os.environ.get("RECAPTCHA_SOURCE", "patchright").lower()
     if recaptcha_mode in ("extension", "bridge", "ext"):
         ensure_captcha_bridge_server(os.environ["CAPTCHA_BRIDGE_URL"], auto_start=True)
         print("✓ reCAPTCHA mode: Extension (Bridge Server)")
     else:
         source_labels = {
-            "cloak": "CloakBrowser (stealth Chromium)",
-            "cloakbrowser": "CloakBrowser (stealth Chromium)",
-            "bridge": "Headful Bridge Server → CloakBrowser",
-            "headful": "Headful Bridge Server → CloakBrowser",
+            "patchright": "Patchright (Chrome thật)",
+            "cloak": "Patchright (Chrome thật)",
+            "cloakbrowser": "Patchright (Chrome thật)",
+            "bridge": "Headful Bridge Server → Patchright",
+            "headful": "Headful Bridge Server → Patchright",
             "zendriver": "Zendriver (temp-profile)",
             "selenium": "Zendriver (temp-profile)",
             "playwright": "Playwright (fallback)",

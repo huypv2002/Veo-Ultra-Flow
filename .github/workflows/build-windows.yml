@@ -52,6 +52,10 @@ jobs:
           pip install selenium
           pip install flask
 
+          # ✅ Patchright (undetected Playwright + Chrome thật) cho reCAPTCHA token
+          pip install patchright
+          patchright install chromium
+
           # Async browser + deps
           pip install zendriver websockets emoji grapheme mss asyncio-atexit deprecated
 
@@ -72,6 +76,7 @@ jobs:
               'cffi', '_cffi_backend',
               'PIL', 'openpyxl',
               'playwright', 'playwright.sync_api',
+              'patchright', 'patchright.sync_api',
               'selenium', 'selenium.webdriver',
               'flask', 'dotenv',
               'zendriver', 'websockets', 'emoji', 'grapheme',
@@ -164,6 +169,7 @@ jobs:
             --include-package=charset_normalizer `
             --include-package=openpyxl `
             --include-package=playwright `
+            --include-package=patchright `
             --include-package=flask `
             --include-package=dotenv `
             --include-package=zendriver `
@@ -181,6 +187,7 @@ jobs:
             --include-package-data=jwt `
             --include-package-data=openpyxl `
             --include-package-data=playwright `
+            --include-package-data=patchright `
             --include-package-data=flask `
             --include-package-data=dotenv `
             --include-package-data=zendriver `
@@ -223,6 +230,30 @@ jobs:
             echo "Trying alternative path..."
             $altPath = python -c "import subprocess, os; result = subprocess.run(['playwright', 'install', '--dry-run'], capture_output=True, text=True); print(result.stdout[:500] if result.stdout else 'no output')"
             echo "Alt output: $altPath"
+          }
+
+      - name: Copy Patchright driver/browsers into dist
+        run: |
+          $distDir = "main.dist"
+          # 1) Driver (node + JS) — bắt buộc để patchright khởi chạy được
+          $drvSrc = python -c "import patchright, os; print(os.path.join(os.path.dirname(patchright.__file__), 'driver'))"
+          if (Test-Path $drvSrc) {
+            $drvDest = "$distDir\patchright\driver"
+            New-Item -ItemType Directory -Force -Path $drvDest | Out-Null
+            Copy-Item -Recurse -Force "$drvSrc\*" $drvDest
+            echo "Patchright driver copied from $drvSrc"
+          } else {
+            echo "WARNING: Patchright driver not found at $drvSrc"
+          }
+          # 2) Bundled chromium (phòng khi không có Chrome hệ thống)
+          $brSrc = python -c "import patchright, os; print(os.path.join(os.path.dirname(patchright.__file__), 'driver', 'package', '.local-browsers'))"
+          if (Test-Path $brSrc) {
+            $brDest = "$distDir\patchright\driver\package\.local-browsers"
+            New-Item -ItemType Directory -Force -Path $brDest | Out-Null
+            Copy-Item -Recurse -Force "$brSrc\*" $brDest
+            echo "Patchright browsers copied!"
+          } else {
+            echo "INFO: Patchright local browsers not found (dùng Chrome hệ thống qua channel=chrome)"
           }
 
       - name: Create data folders and default JSON files

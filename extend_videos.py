@@ -333,9 +333,16 @@ class ExtendVideoProcessor:
                     resp.raise_for_status()
                     result = resp.json()
                     
-                    operations = result.get("operations", [])
+                    # ✅ Hỗ trợ cả 2 response format: {"operations":[...]} cũ và
+                    #    {"media":[...],"workflows":[...]} mới. Lấy operation/media name THẬT.
+                    op_name = ""
+                    operations = result.get("operations", []) if isinstance(result, dict) else []
                     if operations:
                         op_name = operations[0].get("operation", {}).get("name", "")
+                    elif isinstance(result, dict) and result.get("media"):
+                        media0 = result["media"][0] if result["media"] else {}
+                        op_name = media0.get("name", "") if isinstance(media0, dict) else ""
+                    if op_name:
                         self.log(f"  ✅ Scene đầu đã bắt đầu: {op_name}\n")
                         return {
                             "operations": [{
@@ -628,9 +635,15 @@ class ExtendVideoProcessor:
                     resp.raise_for_status()
                     result = resp.json()
                     
-                    operations = result.get("operations", [])
+                    # ✅ Hỗ trợ cả 2 response format (operations cũ / media+workflows mới)
+                    op_name = ""
+                    operations = result.get("operations", []) if isinstance(result, dict) else []
                     if operations:
                         op_name = operations[0].get("operation", {}).get("name", "")
+                    elif isinstance(result, dict) and result.get("media"):
+                        media0 = result["media"][0] if result["media"] else {}
+                        op_name = media0.get("name", "") if isinstance(media0, dict) else ""
+                    if op_name:
                         self.log(f"  ✅ Extend operation đã bắt đầu: {op_name}\n")
                         return {
                             "operations": [{
