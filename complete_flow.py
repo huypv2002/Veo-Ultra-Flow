@@ -4180,22 +4180,56 @@ class LabsFlowClient:
         lock_ctx = self._get_cookie_lock(cookie_hash) if acquire_lock else nullcontext()
 
         with lock_ctx:
-            # ── 1. Kiểm tra server còn sống không ────────────────────────────
-            try:
-                health_resp = self.session.get(f"{server_url}/health", timeout=3)
-                health_data = health_resp.json() if health_resp.content else {}
-                ws_clients = health_data.get("ws_clients", 0)
-            except Exception as e:
-                self.last_error_detail = f"Extension bridge không phản hồi ({server_url}): {e}"
-                print(f"  ✗ [ExtBridge] Server không phản hồi: {e}")
+            # ── 1. Kiểm tra/auto-start bridge server ─────────────────────────
+            # Thử tối đa 3 lần (server có thể đang khởi động)
+            ws_clients = 0
+            server_ok = False
+            for _attempt in range(3):
+                try:
+                    health_resp = self.session.get(f"{server_url}/health", timeout=3)
+                    if health_resp.status_code == 200 and health_resp.content:
+                        health_data = health_resp.json()
+                        ws_clients = health_data.get("ws_clients", 0)
+                        server_ok = True
+                        break
+                except Exception:
+                    pass
+                # Server chưa up → thử auto-start
+                if _attempt == 0:
+                    try:
+                        from gui_ui_shared import ensure_captcha_bridge_server
+                        ensure_captcha_bridge_server(server_url, auto_start=True)
+                        time.sleep(1.5)
+                    except Exception:
+                        time.sleep(1.0)
+
+            if not server_ok:
+                self.last_error_detail = f"Extension bridge không phản hồi ({server_url}) — bridge chưa start?"
+                print(f"  ✗ [ExtBridge] Server không phản hồi sau 3 lần thử (server={server_url})")
                 return None
+
+            # ── 2. Đợi extension kết nối WS (tối đa 15s) ────────────────────
+            if ws_clients == 0:
+                print(f"  ⏳ [ExtBridge] Chưa có extension kết nối — đợi tối đa 15s...")
+                wait_start = time.time()
+                while time.time() - wait_start < 15:
+                    time.sleep(1.0)
+                    try:
+                        r = self.session.get(f"{server_url}/health", timeout=2)
+                        if r.status_code == 200 and r.content:
+                            ws_clients = r.json().get("ws_clients", 0)
+                            if ws_clients > 0:
+                                break
+                    except Exception:
+                        pass
 
             if ws_clients == 0:
                 self.last_error_detail = (
                     "Không có Chrome Extension nào đang kết nối đến bridge server. "
-                    "Hãy mở Chrome và đảm bảo extension 'Veo3 Ultra Captcha Worker' đã được bật."
+                    "Vui lòng: 1) Load extension/ vào Chrome  2) Mở https://labs.google/fx/tools/flow  "
+                    "3) Kiểm tra popup extension có đèn xanh không."
                 )
-                print(f"  ✗ [ExtBridge] Không có extension nào kết nối WS (server={server_url})")
+                print(f"  ✗ [ExtBridge] Không có extension nào kết nối WS sau 15s (server={server_url})")
                 return None
 
             print(f"  🔌 [ExtBridge] {ws_clients} extension đang kết nối, tạo job...")

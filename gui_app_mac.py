@@ -30692,12 +30692,16 @@ def main():
     os.environ.setdefault("HEADFUL_BRIDGE_URL", "http://127.0.0.1:8899")
     os.environ.setdefault("CAPTCHA_BRIDGE_URL", "http://localhost:3000")
     
-    # ✅ Chỉ start bridge server nếu dùng Extension mode
+    # ✅ Start bridge server nếu RECAPTCHA_SOURCE=extension HOẶC RECAPTCHA_MODE=extension/bridge
     recaptcha_mode = os.environ.get("RECAPTCHA_MODE", "selenium").lower()
     recaptcha_source = os.environ.get("RECAPTCHA_SOURCE", "patchright").lower()
-    if recaptcha_mode in ("extension", "bridge", "ext"):
+    _use_extension_bridge = (
+        recaptcha_source in ("extension", "ext", "chrome_extension")
+        or recaptcha_mode in ("extension", "bridge", "ext")
+    )
+    if _use_extension_bridge:
         ensure_captcha_bridge_server(os.environ["CAPTCHA_BRIDGE_URL"], auto_start=True)
-        print("✓ reCAPTCHA mode: Extension (Bridge Server)")
+        print(f"✓ reCAPTCHA source: Extension Bridge (browser thật) — bridge started")
     else:
         source_labels = {
             "patchright": "Patchright (Chrome thật)",
