@@ -30688,7 +30688,7 @@ def main():
     #             "bridge"/"headful" → Bridge Server, "zendriver"/"selenium", "playwright"
     os.environ.setdefault("AUTO_RECAPTCHA", "1")
     os.environ.setdefault("RECAPTCHA_MODE", "selenium")  # ✅ Mặc định: Selenium Driver
-    os.environ.setdefault("RECAPTCHA_SOURCE", "patchright")   # ✅ Patchright + Chrome thật ưu tiên
+    os.environ.setdefault("RECAPTCHA_SOURCE", "extension")   # ✅ Patchright + Chrome thật ưu tiên
     os.environ.setdefault("HEADFUL_BRIDGE_URL", "http://127.0.0.1:8899")
     os.environ.setdefault("CAPTCHA_BRIDGE_URL", "http://localhost:3000")
     

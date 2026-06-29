@@ -1,0 +1,54 @@
+{
+  "manifest_version": 3,
+  "name": "Veo3 Ultra Captcha Worker",
+  "version": "3.0.0",
+  "description": "Lấy reCAPTCHA Enterprise token từ tab labs.google thật của user cho Veo3 Ultra tool.",
+
+  "permissions": [
+    "storage",
+    "tabs",
+    "scripting",
+    "alarms",
+    "activeTab"
+  ],
+
+  "host_permissions": [
+    "https://labs.google/*",
+    "https://*.google.com/*"
+  ],
+
+  "background": {
+    "service_worker": "background.js"
+  },
+
+  "content_scripts": [
+    {
+      "matches": [
+        "https://labs.google/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Veo3 Ultra Captcha Worker",
+    "default_icon": {
+      "16":  "icon16.png",
+      "32":  "icon32.png",
+      "48":  "icon48.png",
+      "128": "icon128.png"
+    }
+  },
+
+  "options_page": "options.html",
+
+  "icons": {
+    "16":  "icon16.png",
+    "32":  "icon32.png",
+    "48":  "icon48.png",
+    "128": "icon128.png"
+  }
+}

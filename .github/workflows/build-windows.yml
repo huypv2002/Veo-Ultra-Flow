@@ -50,7 +50,7 @@ jobs:
           pip install playwright
           playwright install chromium
           pip install selenium
-          pip install flask
+          pip install flask flask-sock simple-websocket
 
           # ✅ Patchright (undetected Playwright + Chrome thật) cho reCAPTCHA token
           pip install patchright
@@ -78,7 +78,7 @@ jobs:
               'playwright', 'playwright.sync_api',
               'patchright', 'patchright.sync_api',
               'selenium', 'selenium.webdriver',
-              'flask', 'dotenv',
+              'flask', 'flask_sock', 'simple_websocket', 'dotenv',
               'zendriver', 'websockets', 'emoji', 'grapheme',
               'sqlite3', 'ctypes', 'asyncio', 'hashlib', 'uuid', 'json',
           ]
@@ -171,6 +171,8 @@ jobs:
             --include-package=playwright `
             --include-package=patchright `
             --include-package=flask `
+            --include-package=flask_sock `
+            --include-package=simple_websocket `
             --include-package=dotenv `
             --include-package=zendriver `
             --include-package=websockets `
@@ -189,6 +191,8 @@ jobs:
             --include-package-data=playwright `
             --include-package-data=patchright `
             --include-package-data=flask `
+            --include-package-data=flask_sock `
+            --include-package-data=simple_websocket `
             --include-package-data=dotenv `
             --include-package-data=zendriver `
             --include-package-data=emoji `
@@ -254,6 +258,20 @@ jobs:
             echo "Patchright browsers copied!"
           } else {
             echo "INFO: Patchright local browsers not found (dùng Chrome hệ thống qua channel=chrome)"
+          }
+
+      - name: Copy extension folder into dist
+        run: |
+          $dist = "main.dist"
+          $extSrc = "extension"
+          $extDest = "$dist\extension"
+          if (Test-Path $extSrc) {
+            New-Item -ItemType Directory -Force -Path $extDest | Out-Null
+            Copy-Item -Recurse -Force "$extSrc\*" $extDest
+            echo "✅ Extension copied to $extDest"
+            Get-ChildItem $extDest | ForEach-Object { echo "  $($_.Name)" }
+          } else {
+            echo "WARNING: extension/ folder not found, skipping"
           }
 
       - name: Create data folders and default JSON files

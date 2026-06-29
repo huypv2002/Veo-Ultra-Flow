@@ -246,7 +246,9 @@ class ThumbnailGridWidget(QWidget):
 # ==================== END THUMBNAIL GRID WIDGET ====================
 
 
-_CAPTCHA_BRIDGE_HANDLE = None  # Có thể là Thread (embedded server) hoặc Popen (nếu dùng kiểu cũ)
+_CAPTCHA_BRIDGE_HANDLE = None  # Thread chạy embedded bridge server
+_CAPTCHA_BRIDGE_PORT = 3000    # Port mặc định
+_CAPTCHA_BRIDGE_HOST = "127.0.0.1"
 
 
 def ensure_captcha_bridge_server(
@@ -254,54 +256,115 @@ def ensure_captcha_bridge_server(
     auto_start: bool = True,
 ) -> bool:
     """
-    Ensure local captcha bridge server is running (used by ex/ Chrome extension).
-    The flow client will call POST /request-token and poll GET /get-captcha.
+    Đảm bảo Extension Bridge Server (WebSocket + HTTP) đang chạy.
+
+    Server hỗ trợ:
+      - WebSocket /ws   : Chrome Extension kết nối, nhận job, gửi token về
+      - HTTP /health    : Health check (dùng để kiểm tra server còn sống)
+      - HTTP /request-token, /get-captcha : Python tool gọi để request/poll token
+
+    Extension Bridge thay thế hoàn toàn cơ chế Playwright/Patchright:
+    token được lấy từ browser thật của user → trust score cao hơn.
+
+    Args:
+        server_url: URL HTTP của server (mặc định http://localhost:3000)
+        auto_start: Tự động khởi động server nếu chưa chạy
+
+    Returns:
+        True nếu server đang chạy (hoặc đã start thành công)
     """
     global _CAPTCHA_BRIDGE_HANDLE
     url = server_url.rstrip("/")
-    try:
-        r = requests.get(f"{url}/check-trigger", timeout=1.5)
-        if r.status_code == 200:
-            return True
-    except Exception:
-        pass
+
+    # ── 1. Kiểm tra server đã chạy chưa (ưu tiên /health, fallback /check-trigger) ──
+    for endpoint in ("/health", "/check-trigger"):
+        try:
+            r = requests.get(f"{url}{endpoint}", timeout=1.5)
+            if r.status_code == 200:
+                print(f"✅ [BridgeServer] Đang chạy tại {url} (checked {endpoint})")
+                return True
+        except Exception:
+            pass
 
     if not auto_start:
         return False
 
-    # 🔹 CÁCH MỚI: Nhúng Flask server vào cùng process, chạy trong thread nền
+    # ── 2. Parse host:port từ server_url ─────────────────────────────────────
+    import threading
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or 3000
+
+    # ── 3. Kiểm tra flask-sock có sẵn không (cần cho WebSocket) ──────────────
     try:
-        import threading
+        import flask_sock  # noqa: F401
+        ws_available = True
+    except ImportError:
+        ws_available = False
+        print(
+            "⚠️ [BridgeServer] flask-sock chưa cài → WebSocket bị tắt. "
+            "Extension sẽ không kết nối được qua WS.\n"
+            "   Cài bằng: pip install flask-sock"
+        )
 
-        if _CAPTCHA_BRIDGE_HANDLE is None:
-            def _run_server():
-                try:
-                    # Chạy server blocking trong thread riêng
-                    run_bridge_server(host="127.0.0.1", port=3000)
-                except Exception as e:
-                    print(f"❌ Lỗi khi chạy captcha bridge server trong thread: {e}")
-
-            t = threading.Thread(target=_run_server, daemon=True)
-            t.start()
-            _CAPTCHA_BRIDGE_HANDLE = t
-
-        # Đợi server lên (giống logic cũ)
-        for _ in range(30):
+    # ── 4. Start embedded server trong thread riêng ───────────────────────────
+    if _CAPTCHA_BRIDGE_HANDLE is None or not _CAPTCHA_BRIDGE_HANDLE.is_alive():
+        def _run_server():
             try:
-                r = requests.get(f"{url}/check-trigger", timeout=1.0)
+                print(f"🌉 [BridgeServer] Đang khởi động tại {host}:{port} (WebSocket={'ON' if ws_available else 'OFF'})...")
+                run_bridge_server(host=host, port=port)
+            except Exception as e:
+                print(f"❌ [BridgeServer] Lỗi khi chạy: {e}")
+
+        t = threading.Thread(target=_run_server, daemon=True, name="CaptchaBridgeServer")
+        t.start()
+        _CAPTCHA_BRIDGE_HANDLE = t
+        print(f"🌉 [BridgeServer] Thread started (port={port})")
+
+    # ── 5. Đợi server lên tối đa 6s ──────────────────────────────────────────
+    for attempt in range(30):
+        time.sleep(0.2)
+        for endpoint in ("/health", "/check-trigger"):
+            try:
+                r = requests.get(f"{url}{endpoint}", timeout=1.0)
                 if r.status_code == 200:
+                    # Log thông tin WS clients nếu /health trả về
+                    if endpoint == "/health":
+                        data = r.json() if r.content else {}
+                        ws_clients = data.get("ws_clients", 0)
+                        ws_flag = "✅ flask-sock OK" if data.get("ws_enabled") else "⚠️ HTTP-only (no flask-sock)"
+                        print(
+                            f"✅ [BridgeServer] Server sẵn sàng tại {url} "
+                            f"({ws_flag}, ws_clients={ws_clients})"
+                        )
+                    else:
+                        print(f"✅ [BridgeServer] Server sẵn sàng tại {url}")
                     return True
             except Exception:
-                time.sleep(0.2)
-    except Exception as e:
-        print(f"❌ Không thể start embedded captcha bridge server: {e}")
-        return False
+                pass
 
+    print(f"❌ [BridgeServer] Không thể start server tại {url} sau 6s")
     return False
 
 
+def get_captcha_bridge_ws_url(http_url: str = "http://localhost:3000") -> str:
+    """Chuyển HTTP URL thành WebSocket URL cho extension.
+
+    Ví dụ:
+        http://localhost:3000  →  ws://localhost:3000/ws
+        http://127.0.0.1:3000  →  ws://127.0.0.1:3000/ws
+    """
+    from urllib.parse import urlparse
+    parsed = urlparse(http_url.rstrip("/"))
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or 3000
+    return f"ws://{host}:{port}/ws"
+
+
 def _stop_captcha_bridge_server():
-    """Best-effort cleanup. Với embedded thread thì để daemon tự thoát theo process."""
+    """Best-effort cleanup. Daemon thread tự thoát khi main process kết thúc."""
     global _CAPTCHA_BRIDGE_HANDLE
     _CAPTCHA_BRIDGE_HANDLE = None
 

@@ -928,7 +928,9 @@ class LabsFlowClient:
         
         # ✅ Log mode đang dùng
         if self.auto_recaptcha:
-            if self.use_selenium_recaptcha:
+            if self.use_extension_recaptcha:
+                mode_str = f"Extension Bridge (browser thật, WS: {self.captcha_bridge_url})"
+            elif self.use_selenium_recaptcha:
                 browser_mode = self._recaptcha_browser_mode()
                 mode_str = "Selenium Driver (Chrome headful-hidden)" if browser_mode == "hidden" else "Selenium Driver (Chrome visible)"
             else:
@@ -4135,6 +4137,183 @@ class LabsFlowClient:
             print(f"  ⚠️ [Bridge] Error: {e}")
             return None
 
+    def _get_recaptcha_token_via_extension_bridge(
+        self,
+        timeout_s: int = 90,
+        recaptcha_action: str = "VIDEO_GENERATION",
+        acquire_lock: bool = True,
+    ) -> Optional[str]:
+        """Lấy reCAPTCHA token từ Chrome Extension thật qua Extension Bridge Server.
+
+        Flow:
+          1. POST /request-token  → server tạo job và broadcast qua WebSocket tới extension
+          2. Extension mở tab labs.google, execute reCAPTCHA trong MAIN world, gửi token về server
+          3. Python poll GET /get-captcha?request_id=... cho đến khi có token hoặc timeout
+
+        Ưu điểm so với Patchright/Playwright:
+          - Dùng browser thật của user (profile đã đăng nhập lâu, trust score cao)
+          - Không cần mở Chrome riêng - extension chạy trong Chrome user đang dùng
+          - Parallel: nhiều cookie cùng request, extension xử lý song song
+          - Không bị detect automation (MAIN world execution, real user agent)
+
+        Yêu cầu:
+          - captcha_bridge_server.py đang chạy (tự động start qua ensure_captcha_bridge_server)
+          - Extension "Veo3 Ultra Captcha Worker" đã cài và đang kết nối WS
+          - CAPTCHA_BRIDGE_URL env var hoặc self.captcha_bridge_url trỏ đúng server
+
+        Args:
+            timeout_s: Số giây tối đa chờ extension trả token (default 90s)
+            recaptcha_action: action string gửi cho reCAPTCHA (VIDEO_GENERATION / IMAGE_GENERATION)
+            acquire_lock: Nếu True tự acquire per-cookie lock (nối đuôi trong cùng cookie)
+
+        Returns:
+            Token string nếu thành công, None nếu timeout/lỗi
+        """
+        server_url = (self.captcha_bridge_url or "").rstrip("/")
+        if not server_url:
+            server_url = "http://localhost:3000"
+
+        cookie_hash = self._cookie_hash
+
+        # ── Per-cookie lock (nối đuôi các prompt trong cùng 1 cookie) ────────
+        from contextlib import nullcontext
+        lock_ctx = self._get_cookie_lock(cookie_hash) if acquire_lock else nullcontext()
+
+        with lock_ctx:
+            # ── 1. Kiểm tra server còn sống không ────────────────────────────
+            try:
+                health_resp = self.session.get(f"{server_url}/health", timeout=3)
+                health_data = health_resp.json() if health_resp.content else {}
+                ws_clients = health_data.get("ws_clients", 0)
+            except Exception as e:
+                self.last_error_detail = f"Extension bridge không phản hồi ({server_url}): {e}"
+                print(f"  ✗ [ExtBridge] Server không phản hồi: {e}")
+                return None
+
+            if ws_clients == 0:
+                self.last_error_detail = (
+                    "Không có Chrome Extension nào đang kết nối đến bridge server. "
+                    "Hãy mở Chrome và đảm bảo extension 'Veo3 Ultra Captcha Worker' đã được bật."
+                )
+                print(f"  ✗ [ExtBridge] Không có extension nào kết nối WS (server={server_url})")
+                return None
+
+            print(f"  🔌 [ExtBridge] {ws_clients} extension đang kết nối, tạo job...")
+
+            # ── 2. Tạo job request trên server ────────────────────────────────
+            try:
+                req_resp = self.session.post(
+                    f"{server_url}/request-token",
+                    json={
+                        "cookie_hash": cookie_hash,
+                        "action": recaptcha_action,
+                    },
+                    timeout=10,
+                )
+                req_resp.raise_for_status()
+                req_data = req_resp.json()
+                request_id = req_data.get("request_id", "")
+                ws_sent = req_data.get("ws_sent", 0)
+            except Exception as e:
+                self.last_error_detail = f"Không thể tạo token job trên bridge: {e}"
+                print(f"  ✗ [ExtBridge] Tạo job thất bại: {e}")
+                return None
+
+            if not request_id:
+                self.last_error_detail = "Bridge server không trả về request_id"
+                print("  ✗ [ExtBridge] Không nhận được request_id từ server")
+                return None
+
+            print(
+                f"  📤 [ExtBridge] Job created: req_id={request_id[:16]}..., "
+                f"cookie={cookie_hash[:8]}..., action={recaptcha_action}, "
+                f"ws_broadcast={ws_sent}"
+            )
+
+            # ── 3. Poll GET /get-captcha đến khi token về hoặc timeout ───────
+            deadline = time.time() + timeout_s
+            poll_interval = 0.3   # poll nhanh ngay lúc đầu
+            fast_phase_end = time.time() + 15  # 15s đầu poll nhanh
+            poll_count = 0
+            start_time = time.time()
+
+            print(f"  ⏳ [ExtBridge] Đang chờ token (req_id={request_id[:16]}..., timeout={timeout_s}s)...")
+
+            while time.time() < deadline:
+                poll_count += 1
+                elapsed = time.time() - start_time
+
+                try:
+                    r = self.session.get(
+                        f"{server_url}/get-captcha",
+                        params={
+                            "request_id": request_id,
+                            "cookie_hash": cookie_hash,
+                            "clear": "0",   # giữ token để confirm sau
+                        },
+                        timeout=5,
+                    )
+                    r.raise_for_status()
+                    data = r.json() if r.content else {}
+                except Exception as poll_err:
+                    print(f"  ⚠️ [ExtBridge] Poll lỗi (#{poll_count}): {poll_err}")
+                    time.sleep(1.0)
+                    continue
+
+                token = data.get("token")
+                error = data.get("error")
+                pending = data.get("pending", True)
+
+                if error and not pending:
+                    self.last_error_detail = f"Extension báo lỗi: {error}"
+                    print(f"  ✗ [ExtBridge] Extension error sau {elapsed:.1f}s: {error[:100]}")
+                    return None
+
+                if token and len(token.strip()) > 20:
+                    elapsed_total = time.time() - start_time
+                    print(
+                        f"  ✅ [ExtBridge] Token nhận được sau {elapsed_total:.1f}s "
+                        f"(len={len(token)}, polls={poll_count})"
+                    )
+                    # Clear token trên server
+                    try:
+                        self.session.get(
+                            f"{server_url}/get-captcha",
+                            params={
+                                "request_id": request_id,
+                                "cookie_hash": cookie_hash,
+                                "clear": "1",
+                            },
+                            timeout=3,
+                        )
+                    except Exception:
+                        pass
+                    return token
+
+                # Adaptive poll interval: nhanh 15s đầu, rồi chậm dần
+                if time.time() < fast_phase_end:
+                    poll_interval = 0.3
+                else:
+                    poll_interval = min(1.5, poll_interval * 1.2)
+
+                # Log progress mỗi 10 poll
+                if poll_count % 10 == 0:
+                    print(
+                        f"  ⏳ [ExtBridge] Đang chờ... ({elapsed:.0f}s/{timeout_s}s, polls={poll_count})"
+                    )
+
+                time.sleep(poll_interval)
+
+            # Timeout
+            elapsed_total = time.time() - start_time
+            self.last_error_detail = (
+                f"Extension bridge timeout sau {elapsed_total:.0f}s "
+                f"(req_id={request_id[:16]}...). "
+                "Extension có thể chưa kết nối hoặc reCAPTCHA bị chặn."
+            )
+            print(f"  ✗ [ExtBridge] Timeout sau {elapsed_total:.0f}s (polls={poll_count})")
+            return None
+
     def _get_recaptcha_token_zendriver(
         self,
         timeout_s: int = 60,
@@ -4495,7 +4674,7 @@ class LabsFlowClient:
         token = None
         token_generated_at = None
         token_started_at = time.time()
-        source_preference = str(_env("RECAPTCHA_SOURCE", "patchright") or "patchright").strip().lower()
+        source_preference = str(_env("RECAPTCHA_SOURCE", "extension") or "patchright").strip().lower()
 
         def inject_token(source: str, token_value: Optional[str]) -> bool:
             nonlocal token_generated_at
@@ -4505,11 +4684,37 @@ class LabsFlowClient:
             self._record_token_source(source)
             client_context["recaptchaToken"] = token_value
             LabsFlowClient._token_timestamps[cookie_hash] = token_generated_at
-            label_map = {"patchright": "Patchright", "zendriver": "Zendriver", "bridge": "HeadfulBridge"}
+            label_map = {
+                "patchright": "Patchright",
+                "zendriver": "Zendriver",
+                "bridge": "HeadfulBridge",
+                "extension": "ExtensionBridge",
+            }
             label = label_map.get(source, "Playwright")
             elapsed = time.time() - token_started_at
             print(f"  ✅ [{label}] Token injected (len={len(token_value)}, ts={token_generated_at:.0f}, elapsed={elapsed:.1f}s)")
             return True
+
+        # ── Priority -1: Chrome Extension Bridge (RECAPTCHA_SOURCE=extension hoặc use_extension_recaptcha) ──
+        # Dùng browser thật của user → trust score cao nhất, không bị detect automation
+        _use_ext = (
+            source_preference in ("extension", "ext", "chrome_extension")
+            or getattr(self, "use_extension_recaptcha", False)
+        )
+        if _use_ext:
+            print(f"  🔌 [Token] Extension Bridge (browser thật)...")
+            try:
+                token = self._get_recaptcha_token_via_extension_bridge(
+                    timeout_s=90,
+                    recaptcha_action=recaptcha_action,
+                    acquire_lock=acquire_lock,
+                )
+                if inject_token("extension", token):
+                    print(f"  ✅ [Token Source] Extension Bridge OK")
+                    return True
+                print(f"  ⚠️ [ExtBridge] Không lấy được token, fallback Patchright")
+            except Exception as e:
+                print(f"  ⚠️ [ExtBridge] Error, fallback Patchright: {e}")
 
         # ── Priority 0: Headful Bridge Server (nếu RECAPTCHA_SOURCE=bridge/headful) ──
         if source_preference in ("bridge", "headful"):
