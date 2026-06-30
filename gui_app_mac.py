@@ -118,7 +118,7 @@ from gui_app import (
 )
 
 from complete_flow import LabsFlowClient, _parse_cookie_string
-from captcha_bridge_server import run_bridge_server
+from captcha_bridge_server import ensure_captcha_bridge_server, run_bridge_server
 from project_manager import ProjectManager
 from iting_api import authenticate_iting_user, check_iting_session, logout_iting_user, ItingAPI
 from subscription_policies import get_subscription_limits, normalize_subscription_type
@@ -30690,7 +30690,7 @@ def main():
     os.environ.setdefault("RECAPTCHA_MODE", "selenium")  # ✅ Mặc định: Selenium Driver
     os.environ.setdefault("RECAPTCHA_SOURCE", "extension")   # ✅ Patchright + Chrome thật ưu tiên
     os.environ.setdefault("HEADFUL_BRIDGE_URL", "http://127.0.0.1:8899")
-    os.environ.setdefault("CAPTCHA_BRIDGE_URL", "http://localhost:3000")
+    os.environ.setdefault("CAPTCHA_BRIDGE_URL", "http://127.0.0.1:3003")
     
     # ✅ Start bridge server nếu RECAPTCHA_SOURCE=extension HOẶC RECAPTCHA_MODE=extension/bridge
     recaptcha_mode = os.environ.get("RECAPTCHA_MODE", "selenium").lower()

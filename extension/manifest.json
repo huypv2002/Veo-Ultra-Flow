@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Veo3 Ultra Captcha Worker",
-  "version": "3.0.0",
+  "version": "3.1.0",
   "description": "Lấy reCAPTCHA Enterprise token từ tab labs.google thật của user cho Veo3 Ultra tool.",
 
   "permissions": [

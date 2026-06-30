@@ -1,7 +1,7 @@
 "use strict";
 
 const DEFAULT_SETTINGS = {
-  serverUrl:     "ws://127.0.0.1:3000/ws",
+  serverUrl:     "ws://127.0.0.1:3003/ws",
   clientLabel:   "",
   autoReconnect: true,
   openTabIfNone: true,

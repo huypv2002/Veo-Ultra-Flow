@@ -31,7 +31,7 @@ Run:
 
 Hoặc import và gọi:
   from captcha_bridge_server import run_bridge_server
-  run_bridge_server(host="127.0.0.1", port=3000)
+  run_bridge_server(host="127.0.0.1", port=3003)
 """
 
 from __future__ import annotations
@@ -231,6 +231,8 @@ class BridgeState:
 
 # ── Singleton state ────────────────────────────────────────────────────────────
 state = BridgeState()
+_server_thread: Optional[threading.Thread] = None
+_server_lock = threading.Lock()
 
 
 def write_trigger_file(needs_token: bool) -> None:
@@ -541,7 +543,7 @@ _cleanup_thread.start()
 # ═══════════════════════════════════════════════════════════════════════════════
 # Public API (import trong GUI)
 # ═══════════════════════════════════════════════════════════════════════════════
-def run_bridge_server(host: str = "127.0.0.1", port: int = 3000) -> None:
+def run_bridge_server(host: str = "127.0.0.1", port: int = 3003) -> None:
     """
     Chạy bridge server (blocking).
     Dùng được cả khi import trong GUI (chạy trong thread) lẫn CLI.
@@ -553,10 +555,59 @@ def run_bridge_server(host: str = "127.0.0.1", port: int = 3000) -> None:
     app.run(host=host, port=port, debug=False, use_reloader=False)
 
 
+def ensure_captcha_bridge_server(bridge_url: str = "http://127.0.0.1:3003", auto_start: bool = True) -> bool:
+    """
+    Đảm bảo captcha bridge server đang chạy.
+
+    - Nếu /health đã sống -> trả True
+    - Nếu chưa sống và auto_start=True -> start background thread rồi đợi ngắn
+    - Nếu không start được -> trả False
+    """
+    global _server_thread
+
+    def _is_healthy(url: str) -> bool:
+        try:
+            import requests
+            resp = requests.get(f"{url.rstrip('/')}/health", timeout=1.5)
+            return resp.ok
+        except Exception:
+            return False
+
+    if _is_healthy(bridge_url):
+        return True
+
+    if not auto_start:
+        return False
+
+    from urllib.parse import urlparse
+
+    parsed = urlparse(bridge_url)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or (443 if parsed.scheme == "https" else 3003)
+
+    with _server_lock:
+        if _server_thread is None or not _server_thread.is_alive():
+            _server_thread = threading.Thread(
+                target=run_bridge_server,
+                kwargs={"host": host, "port": port},
+                daemon=True,
+                name="captcha-bridge-server",
+            )
+            _server_thread.start()
+
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        if _is_healthy(bridge_url):
+            return True
+        time.sleep(0.2)
+
+    return False
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="Extension Bridge Server for reCAPTCHA tokens")
     p.add_argument("--host", default="127.0.0.1")
-    p.add_argument("--port", type=int, default=3000)
+    p.add_argument("--port", type=int, default=3003)
     args = p.parse_args()
     run_bridge_server(host=args.host, port=args.port)
     return 0

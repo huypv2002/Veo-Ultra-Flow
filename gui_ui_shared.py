@@ -246,13 +246,8 @@ class ThumbnailGridWidget(QWidget):
 # ==================== END THUMBNAIL GRID WIDGET ====================
 
 
-_CAPTCHA_BRIDGE_HANDLE = None  # Thread chạy embedded bridge server
-_CAPTCHA_BRIDGE_PORT = 3000    # Port mặc định
-_CAPTCHA_BRIDGE_HOST = "127.0.0.1"
-
-
 def ensure_captcha_bridge_server(
-    server_url: str = "http://localhost:3000",
+    server_url: str = "http://127.0.0.1:3003",
     auto_start: bool = True,
 ) -> bool:
     """
@@ -267,99 +262,28 @@ def ensure_captcha_bridge_server(
     token được lấy từ browser thật của user → trust score cao hơn.
 
     Args:
-        server_url: URL HTTP của server (mặc định http://localhost:3000)
+        server_url: URL HTTP của server (mặc định http://127.0.0.1:3003)
         auto_start: Tự động khởi động server nếu chưa chạy
 
     Returns:
         True nếu server đang chạy (hoặc đã start thành công)
     """
-    global _CAPTCHA_BRIDGE_HANDLE
-    url = server_url.rstrip("/")
+    from captcha_bridge_server import ensure_captcha_bridge_server as _ensure_bridge_server
 
-    # ── 1. Kiểm tra server đã chạy chưa (ưu tiên /health, fallback /check-trigger) ──
-    for endpoint in ("/health", "/check-trigger"):
-        try:
-            r = requests.get(f"{url}{endpoint}", timeout=1.5)
-            if r.status_code == 200:
-                print(f"✅ [BridgeServer] Đang chạy tại {url} (checked {endpoint})")
-                return True
-        except Exception:
-            pass
-
-    if not auto_start:
-        return False
-
-    # ── 2. Parse host:port từ server_url ─────────────────────────────────────
-    import threading
-    from urllib.parse import urlparse
-
-    parsed = urlparse(url)
-    host = parsed.hostname or "127.0.0.1"
-    port = parsed.port or 3000
-
-    # ── 3. Kiểm tra flask-sock có sẵn không (cần cho WebSocket) ──────────────
-    try:
-        import flask_sock  # noqa: F401
-        ws_available = True
-    except ImportError:
-        ws_available = False
-        print(
-            "⚠️ [BridgeServer] flask-sock chưa cài → WebSocket bị tắt. "
-            "Extension sẽ không kết nối được qua WS.\n"
-            "   Cài bằng: pip install flask-sock"
-        )
-
-    # ── 4. Start embedded server trong thread riêng ───────────────────────────
-    if _CAPTCHA_BRIDGE_HANDLE is None or not _CAPTCHA_BRIDGE_HANDLE.is_alive():
-        def _run_server():
-            try:
-                print(f"🌉 [BridgeServer] Đang khởi động tại {host}:{port} (WebSocket={'ON' if ws_available else 'OFF'})...")
-                run_bridge_server(host=host, port=port)
-            except Exception as e:
-                print(f"❌ [BridgeServer] Lỗi khi chạy: {e}")
-
-        t = threading.Thread(target=_run_server, daemon=True, name="CaptchaBridgeServer")
-        t.start()
-        _CAPTCHA_BRIDGE_HANDLE = t
-        print(f"🌉 [BridgeServer] Thread started (port={port})")
-
-    # ── 5. Đợi server lên tối đa 6s ──────────────────────────────────────────
-    for attempt in range(30):
-        time.sleep(0.2)
-        for endpoint in ("/health", "/check-trigger"):
-            try:
-                r = requests.get(f"{url}{endpoint}", timeout=1.0)
-                if r.status_code == 200:
-                    # Log thông tin WS clients nếu /health trả về
-                    if endpoint == "/health":
-                        data = r.json() if r.content else {}
-                        ws_clients = data.get("ws_clients", 0)
-                        ws_flag = "✅ flask-sock OK" if data.get("ws_enabled") else "⚠️ HTTP-only (no flask-sock)"
-                        print(
-                            f"✅ [BridgeServer] Server sẵn sàng tại {url} "
-                            f"({ws_flag}, ws_clients={ws_clients})"
-                        )
-                    else:
-                        print(f"✅ [BridgeServer] Server sẵn sàng tại {url}")
-                    return True
-            except Exception:
-                pass
-
-    print(f"❌ [BridgeServer] Không thể start server tại {url} sau 6s")
-    return False
+    return _ensure_bridge_server(server_url, auto_start=auto_start)
 
 
-def get_captcha_bridge_ws_url(http_url: str = "http://localhost:3000") -> str:
+def get_captcha_bridge_ws_url(http_url: str = "http://127.0.0.1:3003") -> str:
     """Chuyển HTTP URL thành WebSocket URL cho extension.
 
     Ví dụ:
-        http://localhost:3000  →  ws://localhost:3000/ws
-        http://127.0.0.1:3000  →  ws://127.0.0.1:3000/ws
+        http://localhost:3003  →  ws://localhost:3003/ws
+        http://127.0.0.1:3003  →  ws://127.0.0.1:3003/ws
     """
     from urllib.parse import urlparse
     parsed = urlparse(http_url.rstrip("/"))
     host = parsed.hostname or "127.0.0.1"
-    port = parsed.port or 3000
+    port = parsed.port or 3003
     return f"ws://{host}:{port}/ws"
 
 

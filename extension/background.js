@@ -1,19 +1,25 @@
 /**
- * Veo3 Ultra Captcha Worker v3.0 - Background Service Worker
+ * Veo3 Ultra Captcha Worker v3.1 - Background Service Worker
  *
- * ── Tại sao viết lại? ──────────────────────────────────────────────────────
- * v2 mở tab mới → Chrome coi đó là "cold" session → reCAPTCHA Enterprise
- * gán trust score thấp → token bị reject 403 UNUSUAL_ACTIVITY.
+ * ── Flow v3.1 (chrome.scripting.executeScript world:"MAIN") ─────────────
  *
- * ── Cách hoạt động mới ────────────────────────────────────────────────────
  * 1. Tìm tab labs.google ĐÃ MỞ của user (có history, cookies, hành vi thật)
  * 2. Nếu chưa có → mở 1 tab foreground để user thấy và đăng nhập nếu cần
- * 3. Inject content script vào tab đó (không dùng executeScript MAIN world
- *    vì có thể bị CSP block; content script tự inject <script> tag an toàn)
- * 4. Content script execute grecaptcha trong MAIN world qua <script> tag
- * 5. Nhận token qua chrome.tabs.sendMessage → gửi về Bridge Server qua WS
+ * 3. Inject content.js (ISOLATED world) nếu chưa có — để lắng nghe postMessage
+ * 4. Dùng chrome.scripting.executeScript({ world: "MAIN", func }) để inject
+ *    một function trực tiếp vào MAIN world của page
+ *    → Function này gọi grecaptcha.enterprise.execute()
+ *    → postMessage({ __veo3_ns: "token_result", req_id, token/error })
+ * 5. content.js (ISOLATED) nhận postMessage → chrome.runtime.sendMessage
+ * 6. background.js nhận token → gửi về Bridge Server qua WebSocket
  *
- * ── Trust score tối đa ────────────────────────────────────────────────────
+ * ── Tại sao dùng chrome.scripting.executeScript thay vì <script> tag? ──
+ * - <script>.textContent injection bị CSP của labs.google chặn
+ * - chrome.scripting.executeScript với world:"MAIN" là Chrome API có
+ *   elevated privilege → KHÔNG bị CSP block dù site có CSP nghiêm ngặt
+ * - Function vẫn chạy trong MAIN world → truy cập được window.grecaptcha
+ *
+ * ── Trust score tối đa ──────────────────────────────────────────────────
  * - Tab đã đăng nhập Google, có cookies thật, không bị automation flag
  * - Không dùng Playwright / CDP / headless → không có automation markers
  * - reCAPTCHA thấy session user thật → score cao nhất có thể
@@ -24,7 +30,7 @@
 // ═══════════════════════════════════════════════════════════
 // Constants
 // ═══════════════════════════════════════════════════════════
-const EXT_VERSION = "3.0.0";
+const EXT_VERSION = "3.1.0";
 const SITE_KEY    = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV";
 const TARGET_URL  = "https://labs.google/fx/tools/flow";
 const TARGET_ORIGIN = "https://labs.google";
@@ -36,7 +42,7 @@ const WS_RECONNECT_DELAY_MS    = 3000;   // Delay reconnect WS
 const WS_HEARTBEAT_MS          = 20000;  // Ping server mỗi 20s
 
 const DEFAULT_SETTINGS = {
-  serverUrl:     "ws://127.0.0.1:3000/ws",
+  serverUrl:     "ws://127.0.0.1:3003/ws",
   clientLabel:   "",
   autoReconnect: true,
   openTabIfNone: true,   // Tự mở tab nếu không có tab labs.google nào
@@ -88,7 +94,7 @@ function broadcastStats() {
 }
 
 // ═══════════════════════════════════════════════════════════
-// Tab management — trái tim của v3
+// Tab management
 // ═══════════════════════════════════════════════════════════
 
 /**
@@ -112,7 +118,6 @@ async function findLabsTab() {
 
 /**
  * Mở tab labs.google mới (foreground), đợi load xong rồi trả tabId.
- * Gắn cờ để biết chúng ta tạo ra tab này (để đóng sau nếu cần).
  */
 async function openLabsTab() {
   return new Promise((resolve, reject) => {
@@ -170,7 +175,7 @@ async function getOrOpenLabsTab(settings) {
 }
 
 // ═══════════════════════════════════════════════════════════
-// Inject content script nếu chưa có
+// Inject content script nếu chưa có (ISOLATED world)
 // ═══════════════════════════════════════════════════════════
 async function ensureContentScriptInjected(tabId) {
   // Thử ping content script trước
@@ -179,7 +184,7 @@ async function ensureContentScriptInjected(tabId) {
     if (pong?.pong) return; // Đã có rồi
   } catch (_) {}
 
-  // Inject
+  // Inject content.js vào ISOLATED world
   try {
     await chrome.scripting.executeScript({
       target: { tabId },
@@ -189,8 +194,84 @@ async function ensureContentScriptInjected(tabId) {
     await sleep(300);
   } catch (err) {
     // Có thể đã inject rồi (duplicate injection không phải lỗi nghiêm trọng)
-    console.warn("[Veo3] executeScript warn:", err?.message);
+    console.warn("[Veo3] executeScript (content.js) warn:", err?.message);
   }
+}
+
+// ═══════════════════════════════════════════════════════════
+// MAIN-world captcha executor function
+// ═══════════════════════════════════════════════════════════
+//
+// Function này sẽ được chrome.scripting.executeScript inject vào
+// MAIN world của page. Nó chạy trong context của page JS,
+// truy cập được window.grecaptcha, và KHÔNG bị CSP block.
+//
+// ⚠️ Function phải self-contained: không closure, không reference
+//    tới biến ngoài scope. Args được truyền qua `args` array.
+//
+/**
+ * @param {string} reqId   - Request ID để correlate kết quả
+ * @param {string} siteKey - reCAPTCHA site key
+ * @param {string} action  - reCAPTCHA action (e.g. "VIDEO_GENERATION")
+ */
+function _mainWorldCaptchaExecutor(reqId, siteKey, action) {
+  (async () => {
+    const postResult = (token, error) => {
+      window.postMessage({
+        __veo3_ns: "token_result",
+        req_id:    reqId,
+        token:     token || null,
+        error:     error || null,
+      }, "*");
+    };
+
+    try {
+      // ── Đợi grecaptcha.enterprise sẵn sàng ─────────────────────────
+      let retries = 0;
+      const MAX_RETRIES = 50; // 50 × 200ms = 10s max wait
+
+      while (
+        (!window.grecaptcha ||
+         !window.grecaptcha.enterprise ||
+         typeof window.grecaptcha.enterprise.execute !== "function") &&
+        retries < MAX_RETRIES
+      ) {
+        await new Promise((r) => setTimeout(r, 200));
+        retries++;
+      }
+
+      if (!window.grecaptcha?.enterprise?.execute) {
+        postResult(null, "grecaptcha.enterprise.execute không khả dụng sau " + (MAX_RETRIES * 200) + "ms");
+        return;
+      }
+
+      console.log(
+        `[Veo3-MainWorld] ▶ Executing reCAPTCHA (req_id=${reqId?.slice(0, 12)}... action=${action})`
+      );
+
+      // ── Gọi grecaptcha.enterprise.execute ──────────────────────────
+      const token = await window.grecaptcha.enterprise.execute(siteKey, {
+        action: action,
+      });
+
+      if (!token || typeof token !== "string") {
+        postResult(null, "Token rỗng hoặc không phải string");
+        return;
+      }
+
+      console.log(
+        `[Veo3-MainWorld] ✅ Token OK (req_id=${reqId?.slice(0, 12)}... len=${token.length})`
+      );
+      postResult(token, null);
+
+    } catch (err) {
+      console.error(
+        `[Veo3-MainWorld] ❌ Error (req_id=${reqId?.slice(0, 12)}...):`,
+        err
+      );
+      postResult(null, err?.message || String(err));
+    }
+  })();
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -232,7 +313,7 @@ function onJobDone() {
 }
 
 // ═══════════════════════════════════════════════════════════
-// Core job runner
+// Core job runner (v3.1 — dùng chrome.scripting.executeScript MAIN world)
 // ═══════════════════════════════════════════════════════════
 async function runJob(jobData) {
   activeJobs++;
@@ -252,40 +333,42 @@ async function runJob(jobData) {
     const { tabId, isNew } = await getOrOpenLabsTab(settings);
     stats.lastTabId = tabId;
 
-    // Đảm bảo content script đã được inject
+    // ── Bước 1: Đảm bảo content.js (ISOLATED world) đã được inject ────
+    // content.js lắng nghe postMessage từ MAIN world và forward về đây
     await ensureContentScriptInjected(tabId);
 
-    // ── Tạo Promise đợi token qua token_from_content message ─────────────
+    // ── Bước 2: Tạo Promise đợi token từ content script ──────────────
     // Content script sẽ gọi chrome.runtime.sendMessage({type:"token_from_content"})
-    // sau khi grecaptcha.execute() hoàn thành. Handler ở dưới resolve/reject Promise này.
+    // sau khi MAIN-world function postMessage kết quả.
     const tokenPromise = new Promise((resolve, reject) => {
       const timer = setTimeout(
         () => {
           pendingJobs.delete(reqId);
           reject(new Error(`Token timeout sau ${TOKEN_TIMEOUT_MS}ms`));
         },
-        TOKEN_TIMEOUT_MS + 3000
+        TOKEN_TIMEOUT_MS + 5000  // Thêm 5s buffer cho injection overhead
       );
       pendingJobs.set(reqId, { resolve, reject, timer });
     });
 
-    // ── Gửi lệnh get_token tới content script (chỉ để kích hoạt injection) ─
-    const ack = await sendTabMessage(tabId, {
-      type:       "get_token",
-      req_id:     reqId,
-      action,
-      site_key:   siteKey,
-      timeout_ms: TOKEN_TIMEOUT_MS,
-    }, 8000).catch((e) => ({ status: "error", error: e.message }));
+    // ── Bước 3: Inject function vào MAIN world qua chrome.scripting ──
+    // Đây là điểm khác biệt chính so với v3.0:
+    //   v3.0: gửi message "get_token" → content script inject <script> tag → CSP block
+    //   v3.1: chrome.scripting.executeScript world:"MAIN" → bypass CSP hoàn toàn
+    console.log(`[Veo3] Injecting MAIN-world executor (req_id=${reqId.slice(0, 12)}...)`);
 
-    if (ack?.status === "error") {
-      // Content script không respond → cancel pending và báo lỗi
-      const pending = pendingJobs.get(reqId);
-      if (pending) { clearTimeout(pending.timer); pendingJobs.delete(reqId); }
-      throw new Error("Content script không phản hồi: " + ack.error);
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        world:  "MAIN",
+        func:   _mainWorldCaptchaExecutor,
+        args:   [reqId, siteKey, action],
+      });
+    } catch (injectErr) {
+      throw new Error("Không thể inject MAIN-world script: " + (injectErr?.message || String(injectErr)));
     }
 
-    // ── Đợi token thật từ token_from_content ─────────────────────────────
+    // ── Bước 4: Đợi token từ content script (forward từ MAIN world) ──
     token = await tokenPromise;
 
     if (isNew) {
@@ -296,7 +379,7 @@ async function runJob(jobData) {
     errorMsg = err?.message || String(err);
   }
 
-  // ── Gửi kết quả về server ────────────────────────────────────────────────
+  // ── Gửi kết quả về server ────────────────────────────────────────────
   if (token) {
     stats.totalSuccess++;
     stats.lastTokenAt = new Date().toISOString();
@@ -416,7 +499,7 @@ function wsSend(data) {
 }
 
 // ═══════════════════════════════════════════════════════════
-// Message handler (popup / options)
+// Message handler (popup / options / content script)
 // ═══════════════════════════════════════════════════════════
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   switch (msg.type) {
@@ -451,7 +534,8 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       sendResponse({ ok: true });
       return true;
 
-    // ── Nhận kết quả từ content script (internal messaging) ──────────────
+    // ── Nhận kết quả từ content script (ISOLATED → background) ─────────
+    // content.js nhận postMessage từ MAIN-world function rồi forward về đây
     case "token_from_content": {
       const { req_id, token, error } = msg;
       const pending = pendingJobs.get(req_id);

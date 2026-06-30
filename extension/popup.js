@@ -196,7 +196,7 @@ $("clearLog").addEventListener("click", () => {
 
 // ── Init ───────────────────────────────────────────────────────────────────────
 document.addEventListener("DOMContentLoaded", () => {
-  log("Popup loaded v3.0.0", "info");
+  log("Popup loaded v3.1.0", "info");
   refreshStats();
   statsRefreshTimer = setInterval(refreshStats, 2000);
 });

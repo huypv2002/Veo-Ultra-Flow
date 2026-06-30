@@ -919,7 +919,7 @@ class LabsFlowClient:
             self.use_extension_recaptcha = False
         
         # ✅ Extension mode settings (chỉ dùng khi use_extension_recaptcha = True)
-        self.captcha_bridge_url: str = _env("CAPTCHA_BRIDGE_URL", "http://localhost:3000") or "http://localhost:3000"
+        self.captcha_bridge_url: str = _env("CAPTCHA_BRIDGE_URL", "http://127.0.0.1:3003") or "http://127.0.0.1:3003"
         
         # ✅ Selenium driver settings (chỉ dùng khi use_selenium_recaptcha = True)
         # Headful-only: Flow/reCAPTCHA reject true headless more often; use hidden off-screen Chrome instead.
@@ -1860,6 +1860,13 @@ class LabsFlowClient:
         if hasattr(self.session, 'proxies') and self.session.proxies:
             self.session.proxies = {}
             print(f"  🔄 [Proxy Session] Đã xóa proxy, trở về direct connection")
+
+    def _get_local_bridge_session(self) -> requests.Session:
+        """Session riêng cho bridge local, không dùng proxy/env của Labs session."""
+        sess = requests.Session()
+        sess.trust_env = False
+        sess.proxies = {}
+        return sess
     
     def _get_cookie_source(self) -> str:
         """Lấy source của cookie: 'profile' hoặc 'import'."""
@@ -4171,7 +4178,7 @@ class LabsFlowClient:
         """
         server_url = (self.captcha_bridge_url or "").rstrip("/")
         if not server_url:
-            server_url = "http://localhost:3000"
+            server_url = "http://127.0.0.1:3003"
 
         cookie_hash = self._cookie_hash
 
@@ -4180,13 +4187,15 @@ class LabsFlowClient:
         lock_ctx = self._get_cookie_lock(cookie_hash) if acquire_lock else nullcontext()
 
         with lock_ctx:
+            bridge_session = self._get_local_bridge_session()
+
             # ── 1. Kiểm tra/auto-start bridge server ─────────────────────────
             # Thử tối đa 3 lần (server có thể đang khởi động)
             ws_clients = 0
             server_ok = False
             for _attempt in range(3):
                 try:
-                    health_resp = self.session.get(f"{server_url}/health", timeout=3)
+                    health_resp = bridge_session.get(f"{server_url}/health", timeout=3)
                     if health_resp.status_code == 200 and health_resp.content:
                         health_data = health_resp.json()
                         ws_clients = health_data.get("ws_clients", 0)
@@ -4215,7 +4224,7 @@ class LabsFlowClient:
                 while time.time() - wait_start < 15:
                     time.sleep(1.0)
                     try:
-                        r = self.session.get(f"{server_url}/health", timeout=2)
+                        r = bridge_session.get(f"{server_url}/health", timeout=2)
                         if r.status_code == 200 and r.content:
                             ws_clients = r.json().get("ws_clients", 0)
                             if ws_clients > 0:
@@ -4236,7 +4245,7 @@ class LabsFlowClient:
 
             # ── 2. Tạo job request trên server ────────────────────────────────
             try:
-                req_resp = self.session.post(
+                req_resp = bridge_session.post(
                     f"{server_url}/request-token",
                     json={
                         "cookie_hash": cookie_hash,
@@ -4278,7 +4287,7 @@ class LabsFlowClient:
                 elapsed = time.time() - start_time
 
                 try:
-                    r = self.session.get(
+                    r = bridge_session.get(
                         f"{server_url}/get-captcha",
                         params={
                             "request_id": request_id,
@@ -4311,7 +4320,7 @@ class LabsFlowClient:
                     )
                     # Clear token trên server
                     try:
-                        self.session.get(
+                        bridge_session.get(
                             f"{server_url}/get-captcha",
                             params={
                                 "request_id": request_id,
