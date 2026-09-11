@@ -1,585 +1,911 @@
 /**
- * Veo3 Ultra Captcha Worker v3.1 - Background Service Worker
+ * Veo3 Ultra Flow Bridge - Background Service Worker (v4.0.0)
  *
- * ── Flow v3.1 (chrome.scripting.executeScript world:"MAIN") ─────────────
- *
- * 1. Tìm tab labs.google ĐÃ MỞ của user (có history, cookies, hành vi thật)
- * 2. Nếu chưa có → mở 1 tab foreground để user thấy và đăng nhập nếu cần
- * 3. Inject content.js (ISOLATED world) nếu chưa có — để lắng nghe postMessage
- * 4. Dùng chrome.scripting.executeScript({ world: "MAIN", func }) để inject
- *    một function trực tiếp vào MAIN world của page
- *    → Function này gọi grecaptcha.enterprise.execute()
- *    → postMessage({ __veo3_ns: "token_result", req_id, token/error })
- * 5. content.js (ISOLATED) nhận postMessage → chrome.runtime.sendMessage
- * 6. background.js nhận token → gửi về Bridge Server qua WebSocket
- *
- * ── Tại sao dùng chrome.scripting.executeScript thay vì <script> tag? ──
- * - <script>.textContent injection bị CSP của labs.google chặn
- * - chrome.scripting.executeScript với world:"MAIN" là Chrome API có
- *   elevated privilege → KHÔNG bị CSP block dù site có CSP nghiêm ngặt
- * - Function vẫn chạy trong MAIN world → truy cập được window.grecaptcha
- *
- * ── Trust score tối đa ──────────────────────────────────────────────────
- * - Tab đã đăng nhập Google, có cookies thật, không bị automation flag
- * - Không dùng Playwright / CDP / headless → không có automation markers
- * - reCAPTCHA thấy session user thật → score cao nhất có thể
+ * Implements batchexecute RPC bridge over Google Flow (flow.google.com)
+ * with reCAPTCHA Enterprise execution and real session cookie inheritance.
  */
-
 "use strict";
 
-// ═══════════════════════════════════════════════════════════
-// Constants
-// ═══════════════════════════════════════════════════════════
-const EXT_VERSION = "3.1.0";
-const SITE_KEY    = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV";
-const TARGET_URL  = "https://labs.google/fx/tools/flow";
-const TARGET_ORIGIN = "https://labs.google";
+const EXT_VERSION = "4.0.0";
+const SITE_KEY = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV";
+const FLOW_URL = "https://flow.google.com/";
+const FLOW_TAB_URLS = [
+  "https://flow.google.com/*",
+  "https://labs.google/fx/*",
+  "https://labs.google/*",
+];
 
-const MAX_CONCURRENT_JOBS      = 3;      // Tối đa 3 job song song (cùng dùng 1 tab)
-const TOKEN_TIMEOUT_MS         = 25000;  // Timeout lấy token / job (25s)
-const TAB_LOAD_TIMEOUT_MS      = 30000;  // Timeout đợi tab mới load
-const WS_RECONNECT_DELAY_MS    = 3000;   // Delay reconnect WS
-const WS_HEARTBEAT_MS          = 20000;  // Ping server mỗi 20s
+const CAPTCHA_SLOT = "__CAPTCHA__";
+const MAX_RPC_TEXT = 32000000;
 
-const DEFAULT_SETTINGS = {
-  serverUrl:     "ws://127.0.0.1:3003/ws",
-  clientLabel:   "",
-  autoReconnect: true,
-  openTabIfNone: true,   // Tự mở tab nếu không có tab labs.google nào
-};
-
-// ═══════════════════════════════════════════════════════════
 // State
-// ═══════════════════════════════════════════════════════════
-let ws              = null;
-let wsConnected     = false;
-let wsReconnectTimer = null;
-let wsHeartbeatTimer = null;
-let activeJobs      = 0;
-let jobQueue        = [];
+let ws = null;
+let wsConnected = false;
+let extensionClientId = null;
+let flowKey = null;
+let state = "idle";
+let workTabId = null;
+let manualDisconnect = false;
+let requestLog = [];
 
-let stats = {
-  connected:     false,
-  totalReceived: 0,
-  totalSuccess:  0,
-  totalError:    0,
-  totalTimeout:  0,
-  lastTokenAt:   null,
-  lastErrorAt:   null,
-  serverUrl:     DEFAULT_SETTINGS.serverUrl,
-  lastTabId:     null,
+let metrics = {
+  tokenCapturedAt: null,
+  requestCount: 0,
+  successCount: 0,
+  failedCount: 0,
+  lastError: null,
 };
 
-// Map reqId → resolve/reject (để nhận kết quả từ content script)
-const pendingJobs = new Map(); // reqId → { resolve, reject, timer }
-
-// ═══════════════════════════════════════════════════════════
-// Settings
-// ═══════════════════════════════════════════════════════════
-function getSettings() {
-  return new Promise((resolve) => {
-    chrome.storage.local.get(DEFAULT_SETTINGS, (s) => resolve({ ...DEFAULT_SETTINGS, ...s }));
-  });
-}
-
-// ═══════════════════════════════════════════════════════════
-// Notify popup
-// ═══════════════════════════════════════════════════════════
-function notifyPopup(type, extra = {}) {
-  chrome.runtime.sendMessage({ type, ...extra }).catch(() => {});
+// ─── Logging & UI Broadcast ─────────────────────────────────
+function addRequestLog(entry) {
+  requestLog.unshift(entry);
+  if (requestLog.length > 50) requestLog.pop();
+  chrome.storage.local.set({ requestLog }).catch(() => {});
+  broadcastStats();
 }
 
 function broadcastStats() {
-  notifyPopup("stats_update", { stats: { ...stats, activeJobs, queued: jobQueue.length } });
+  chrome.runtime.sendMessage({
+    type: "STATS_UPDATE",
+    stats: {
+      wsConnected,
+      state,
+      flowKeyPresent: !!flowKey,
+      clientCount: 1,
+      metrics,
+      log: requestLog.slice(0, 15),
+    },
+  }).catch(() => {});
 }
 
-// ═══════════════════════════════════════════════════════════
-// Tab management
-// ═══════════════════════════════════════════════════════════
+// ─── Initialization ─────────────────────────────────────────
+chrome.runtime.onInstalled.addListener(init);
+chrome.runtime.onStartup.addListener(init);
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+  if (alarm.name === "reconnect") connectToBridge();
+  if (alarm.name === "keepAlive") keepAlive();
+});
 
-/**
- * Tìm tab labs.google đã mở, ưu tiên tab active / tab đã load xong.
- * Trả về tabId hoặc null.
- */
-async function findLabsTab() {
-  return new Promise((resolve) => {
-    chrome.tabs.query({ url: "https://labs.google/*" }, (tabs) => {
-      if (!tabs || tabs.length === 0) { resolve(null); return; }
+async function init() {
+  const data = await chrome.storage.local.get(["clientId", "flowKey", "requestLog"]);
+  if (data.clientId) extensionClientId = data.clientId;
+  if (data.flowKey) flowKey = data.flowKey;
+  if (Array.isArray(data.requestLog)) requestLog = data.requestLog;
 
-      // Ưu tiên: active → complete status → any
-      const active   = tabs.find((t) => t.active && t.status === "complete");
-      const complete = tabs.find((t) => t.status === "complete");
-      const any      = tabs[0];
-
-      resolve((active || complete || any)?.id ?? null);
-    });
-  });
+  chrome.alarms.create("keepAlive", { periodInMinutes: 0.5 });
+  connectToBridge();
 }
 
-/**
- * Mở tab labs.google mới (foreground), đợi load xong rồi trả tabId.
- */
-async function openLabsTab() {
-  return new Promise((resolve, reject) => {
-    chrome.tabs.create({ url: TARGET_URL, active: true }, (tab) => {
-      if (chrome.runtime.lastError) {
-        reject(new Error(chrome.runtime.lastError.message));
-        return;
-      }
-
-      const tabId  = tab.id;
-      let settled  = false;
-      const settle = (ok, reason) => {
-        if (settled) return;
-        settled = true;
-        chrome.tabs.onUpdated.removeListener(listener);
-        clearTimeout(timer);
-        if (ok) resolve(tabId);
-        else    reject(new Error(reason));
-      };
-
-      const listener = (id, info) => {
-        if (id === tabId && info.status === "complete") settle(true);
-      };
-
-      const timer = setTimeout(
-        () => settle(false, `Tab load timeout (${TAB_LOAD_TIMEOUT_MS}ms)`),
-        TAB_LOAD_TIMEOUT_MS
-      );
-
-      chrome.tabs.onUpdated.addListener(listener);
-    });
-  });
-}
-
-/**
- * Lấy hoặc mở tab labs.google.
- * Trả { tabId, isNew }
- */
-async function getOrOpenLabsTab(settings) {
-  let tabId = await findLabsTab();
-  if (tabId !== null) return { tabId, isNew: false };
-
-  if (!settings.openTabIfNone) {
-    throw new Error(
-      "Không tìm thấy tab labs.google nào đang mở. " +
-      "Vui lòng mở https://labs.google/fx/tools/flow trong Chrome rồi thử lại."
-    );
-  }
-
-  console.log("[Veo3] Không có tab labs.google → mở tab mới...");
-  tabId = await openLabsTab();
-  // Đợi thêm để page JS khởi động hoàn toàn
-  await sleep(2000);
-  return { tabId, isNew: true };
-}
-
-// ═══════════════════════════════════════════════════════════
-// Inject content script nếu chưa có (ISOLATED world)
-// ═══════════════════════════════════════════════════════════
-async function ensureContentScriptInjected(tabId) {
-  // Thử ping content script trước
-  try {
-    const pong = await sendTabMessage(tabId, { type: "ping" }, 1500);
-    if (pong?.pong) return; // Đã có rồi
-  } catch (_) {}
-
-  // Inject content.js vào ISOLATED world
-  try {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      files: ["content.js"],
-    });
-    // Đợi script khởi động
-    await sleep(300);
-  } catch (err) {
-    // Có thể đã inject rồi (duplicate injection không phải lỗi nghiêm trọng)
-    console.warn("[Veo3] executeScript (content.js) warn:", err?.message);
-  }
-}
-
-// ═══════════════════════════════════════════════════════════
-// MAIN-world captcha executor function
-// ═══════════════════════════════════════════════════════════
-//
-// Function này sẽ được chrome.scripting.executeScript inject vào
-// MAIN world của page. Nó chạy trong context của page JS,
-// truy cập được window.grecaptcha, và KHÔNG bị CSP block.
-//
-// ⚠️ Function phải self-contained: không closure, không reference
-//    tới biến ngoài scope. Args được truyền qua `args` array.
-//
-/**
- * @param {string} reqId   - Request ID để correlate kết quả
- * @param {string} siteKey - reCAPTCHA site key
- * @param {string} action  - reCAPTCHA action (e.g. "VIDEO_GENERATION")
- */
-function _mainWorldCaptchaExecutor(reqId, siteKey, action) {
-  (async () => {
-    const postResult = (token, error) => {
-      window.postMessage({
-        __veo3_ns: "token_result",
-        req_id:    reqId,
-        token:     token || null,
-        error:     error || null,
-      }, "*");
-    };
-
-    try {
-      // ── Đợi grecaptcha.enterprise sẵn sàng ─────────────────────────
-      let retries = 0;
-      const MAX_RETRIES = 50; // 50 × 200ms = 10s max wait
-
-      while (
-        (!window.grecaptcha ||
-         !window.grecaptcha.enterprise ||
-         typeof window.grecaptcha.enterprise.execute !== "function") &&
-        retries < MAX_RETRIES
-      ) {
-        await new Promise((r) => setTimeout(r, 200));
-        retries++;
-      }
-
-      if (!window.grecaptcha?.enterprise?.execute) {
-        postResult(null, "grecaptcha.enterprise.execute không khả dụng sau " + (MAX_RETRIES * 200) + "ms");
-        return;
-      }
-
-      console.log(
-        `[Veo3-MainWorld] ▶ Executing reCAPTCHA (req_id=${reqId?.slice(0, 12)}... action=${action})`
-      );
-
-      // ── Gọi grecaptcha.enterprise.execute ──────────────────────────
-      const token = await window.grecaptcha.enterprise.execute(siteKey, {
-        action: action,
-      });
-
-      if (!token || typeof token !== "string") {
-        postResult(null, "Token rỗng hoặc không phải string");
-        return;
-      }
-
-      console.log(
-        `[Veo3-MainWorld] ✅ Token OK (req_id=${reqId?.slice(0, 12)}... len=${token.length})`
-      );
-      postResult(token, null);
-
-    } catch (err) {
-      console.error(
-        `[Veo3-MainWorld] ❌ Error (req_id=${reqId?.slice(0, 12)}...):`,
-        err
-      );
-      postResult(null, err?.message || String(err));
-    }
-  })();
-}
-
-// ═══════════════════════════════════════════════════════════
-// Send message to tab with timeout
-// ═══════════════════════════════════════════════════════════
-function sendTabMessage(tabId, msg, timeoutMs = 5000) {
-  return new Promise((resolve, reject) => {
-    const t = setTimeout(
-      () => reject(new Error(`sendTabMessage timeout (${timeoutMs}ms)`)),
-      timeoutMs
-    );
-    chrome.tabs.sendMessage(tabId, msg, (resp) => {
-      clearTimeout(t);
-      if (chrome.runtime.lastError) {
-        reject(new Error(chrome.runtime.lastError.message));
-      } else {
-        resolve(resp);
-      }
-    });
-  });
-}
-
-// ═══════════════════════════════════════════════════════════
-// Job queue & concurrency
-// ═══════════════════════════════════════════════════════════
-function enqueueJob(jobData) {
-  if (activeJobs < MAX_CONCURRENT_JOBS) {
-    runJob(jobData);
+function keepAlive() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    connectToBridge();
   } else {
-    console.log(`[Veo3] Queue full (${activeJobs}/${MAX_CONCURRENT_JOBS}), queuing ${jobData.req_id?.slice(0, 12)}`);
-    jobQueue.push(jobData);
-  }
-}
-
-function onJobDone() {
-  activeJobs = Math.max(0, activeJobs - 1);
-  if (jobQueue.length > 0) runJob(jobQueue.shift());
-  broadcastStats();
-}
-
-// ═══════════════════════════════════════════════════════════
-// Core job runner (v3.1 — dùng chrome.scripting.executeScript MAIN world)
-// ═══════════════════════════════════════════════════════════
-async function runJob(jobData) {
-  activeJobs++;
-  broadcastStats();
-
-  const reqId   = jobData.req_id  || "";
-  const action  = jobData.action  || "VIDEO_GENERATION";
-  const siteKey = jobData.site_key || SITE_KEY;
-
-  console.log(`[Veo3] ▶ Job start: req_id=${reqId.slice(0, 16)}... action=${action}`);
-
-  let token    = null;
-  let errorMsg = null;
-
-  try {
-    const settings = await getSettings();
-    const { tabId, isNew } = await getOrOpenLabsTab(settings);
-    stats.lastTabId = tabId;
-
-    // ── Bước 1: Đảm bảo content.js (ISOLATED world) đã được inject ────
-    // content.js lắng nghe postMessage từ MAIN world và forward về đây
-    await ensureContentScriptInjected(tabId);
-
-    // ── Bước 2: Tạo Promise đợi token từ content script ──────────────
-    // Content script sẽ gọi chrome.runtime.sendMessage({type:"token_from_content"})
-    // sau khi MAIN-world function postMessage kết quả.
-    const tokenPromise = new Promise((resolve, reject) => {
-      const timer = setTimeout(
-        () => {
-          pendingJobs.delete(reqId);
-          reject(new Error(`Token timeout sau ${TOKEN_TIMEOUT_MS}ms`));
-        },
-        TOKEN_TIMEOUT_MS + 5000  // Thêm 5s buffer cho injection overhead
-      );
-      pendingJobs.set(reqId, { resolve, reject, timer });
-    });
-
-    // ── Bước 3: Inject function vào MAIN world qua chrome.scripting ──
-    // Đây là điểm khác biệt chính so với v3.0:
-    //   v3.0: gửi message "get_token" → content script inject <script> tag → CSP block
-    //   v3.1: chrome.scripting.executeScript world:"MAIN" → bypass CSP hoàn toàn
-    console.log(`[Veo3] Injecting MAIN-world executor (req_id=${reqId.slice(0, 12)}...)`);
-
     try {
-      await chrome.scripting.executeScript({
-        target: { tabId },
-        world:  "MAIN",
-        func:   _mainWorldCaptchaExecutor,
-        args:   [reqId, siteKey, action],
-      });
-    } catch (injectErr) {
-      throw new Error("Không thể inject MAIN-world script: " + (injectErr?.message || String(injectErr)));
-    }
-
-    // ── Bước 4: Đợi token từ content script (forward từ MAIN world) ──
-    token = await tokenPromise;
-
-    if (isNew) {
-      chrome.tabs.remove(tabId).catch(() => {});
-    }
-
-  } catch (err) {
-    errorMsg = err?.message || String(err);
+      ws.send(JSON.stringify({ type: "ping" }));
+    } catch (e) {}
   }
-
-  // ── Gửi kết quả về server ────────────────────────────────────────────
-  if (token) {
-    stats.totalSuccess++;
-    stats.lastTokenAt = new Date().toISOString();
-    console.log(`[Veo3] ✅ Token OK (req_id=${reqId.slice(0, 16)}... len=${token.length})`);
-    wsSend({ type: "token_result", req_id: reqId, token, action });
-  } else {
-    const isTimeout = /timeout/i.test(errorMsg || "");
-    if (isTimeout) stats.totalTimeout++;
-    else           stats.totalError++;
-    stats.lastErrorAt = new Date().toISOString();
-    console.error(`[Veo3] ❌ Job failed (req_id=${reqId.slice(0, 16)}...): ${errorMsg}`);
-    wsSend({ type: "token_result", req_id: reqId, error: errorMsg });
-  }
-
-  onJobDone();
 }
 
-// ═══════════════════════════════════════════════════════════
-// WebSocket
-// ═══════════════════════════════════════════════════════════
-function closeWS() {
-  if (wsHeartbeatTimer)  { clearInterval(wsHeartbeatTimer);  wsHeartbeatTimer  = null; }
-  if (wsReconnectTimer)  { clearTimeout(wsReconnectTimer);   wsReconnectTimer  = null; }
-  if (ws) {
-    ws.onclose = null;
-    try { ws.close(); } catch (_) {}
-    ws = null;
-  }
-  wsConnected       = false;
-  stats.connected   = false;
-  broadcastStats();
-}
+// ─── WebSocket Connection ───────────────────────────────────
+function connectToBridge() {
+  if (manualDisconnect) return;
+  if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) return;
 
-async function connectWS() {
-  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
-
-  const settings  = await getSettings();
-  const url       = settings.serverUrl;
-  stats.serverUrl = url;
-
-  console.log(`[Veo3] Connecting WS → ${url}`);
-  notifyPopup("ws_connecting", { url });
+  const serverHost = "127.0.0.1:3003";
+  const wsUrl = `ws://${serverHost}/ws`;
 
   try {
-    ws = new WebSocket(url);
-  } catch (err) {
-    console.error("[Veo3] WS create error:", err);
-    scheduleReconnect(settings);
+    ws = new WebSocket(wsUrl);
+  } catch (e) {
+    console.error("[Veo3 Bridge] WS connect error:", e);
+    scheduleReconnect();
     return;
   }
 
-  ws.onopen = () => {
-    console.log("[Veo3] WS connected:", url);
-    wsConnected     = true;
-    stats.connected = true;
+  ws.onopen = async () => {
+    wsConnected = true;
+    console.log("[Veo3 Bridge] Connected to bridge server:", wsUrl);
+    chrome.alarms.clear("reconnect");
 
-    wsSend({
-      type:         "register",
-      client_label: settings.clientLabel || `veo3-ext-${Date.now()}`,
-      version:      EXT_VERSION,
-    });
+    if (!extensionClientId) {
+      extensionClientId = `veo3-${Math.random().toString(36).substring(2, 8)}`;
+      await chrome.storage.local.set({ clientId: extensionClientId });
+    }
 
-    if (wsHeartbeatTimer) clearInterval(wsHeartbeatTimer);
-    wsHeartbeatTimer = setInterval(() => {
-      if (wsConnected) wsSend({ type: "ping" });
-    }, WS_HEARTBEAT_MS);
+    ws.send(JSON.stringify({
+      type: "extension_ready",
+      clientId: extensionClientId,
+      client_label: "Veo3 Ultra Extension v4.0",
+      flowKeyPresent: true,
+    }));
 
     broadcastStats();
-    notifyPopup("ws_connected", { url });
+    // Try to inspect open Flow tab to capture session
+    captureSessionFromFlowTab();
   };
 
-  ws.onmessage = (event) => {
-    let data;
-    try { data = JSON.parse(event.data); } catch (_) { return; }
+  ws.onmessage = async (event) => {
+    try {
+      const msg = JSON.parse(event.data);
+      await dispatchBridgeMessage(msg);
+    } catch (err) {
+      console.error("[Veo3 Bridge] Error handling message:", err);
+    }
+  };
 
-    const t = data.type;
+  ws.onclose = () => {
+    wsConnected = false;
+    broadcastStats();
+    scheduleReconnect();
+  };
 
-    if (t === "pong" || t === "register_ack") return;
+  ws.onerror = (err) => {
+    wsConnected = false;
+    broadcastStats();
+  };
+}
 
-    if (t === "connected") {
-      notifyPopup("ws_connected", { url, client_id: data.client_id });
+function scheduleReconnect() {
+  chrome.alarms.create("reconnect", { delayInMinutes: 0.1 });
+}
+
+function sendToBridge(payload) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(payload));
+  }
+}
+
+// ─── Tab Management ─────────────────────────────────────────
+function isFlowUrl(url) {
+  if (!url) return false;
+  return url.includes("flow.google.com") || url.includes("labs.google");
+}
+
+async function getOrOpenFlowTab() {
+  if (workTabId !== null) {
+    try {
+      const tab = await chrome.tabs.get(workTabId);
+      if (tab && isFlowUrl(tab.url || tab.pendingUrl)) {
+        return tab;
+      }
+    } catch (e) {
+      workTabId = null;
+    }
+  }
+
+  // 1. Check open tabs
+  try {
+    const matchedTabs = await chrome.tabs.query({ url: FLOW_TAB_URLS }).catch(() => []);
+    if (matchedTabs && matchedTabs.length > 0) {
+      workTabId = matchedTabs[0].id;
+      return matchedTabs[0];
+    }
+    const allTabs = await chrome.tabs.query({}).catch(() => []);
+    const existing = allTabs.find((t) => isFlowUrl(t.url || t.pendingUrl));
+    if (existing) {
+      workTabId = existing.id;
+      return existing;
+    }
+  } catch (e) {
+    console.warn("[Veo3 Bridge] Error querying tabs:", e);
+  }
+
+  // 2. Open new tab to flow.google.com
+  try {
+    const tab = await chrome.tabs.create({ url: FLOW_URL, active: false });
+    workTabId = tab.id;
+    await waitForTabComplete(workTabId);
+    await sleep(2500);
+    return tab;
+  } catch (err) {
+    console.error("[Veo3 Bridge] Failed to create Flow tab:", err);
+    return null;
+  }
+}
+
+function waitForTabComplete(tabId, maxWaitMs = 15000) {
+  return new Promise((resolve) => {
+    function listener(updatedTabId, changeInfo, tab) {
+      if (updatedTabId === tabId && changeInfo.status === "complete") {
+        chrome.tabs.onUpdated.removeListener(listener);
+        resolve(tab);
+      }
+    }
+    chrome.tabs.onUpdated.addListener(listener);
+    setTimeout(() => {
+      chrome.tabs.onUpdated.removeListener(listener);
+      chrome.tabs.get(tabId).then(resolve).catch(() => resolve(null));
+    }, maxWaitMs);
+  });
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ─── Captcha Solving ─────────────────────────────────────────
+async function solveCaptcha(requestId, pageAction = "VIDEO_GENERATION") {
+  const tab = await getOrOpenFlowTab();
+  if (!tab) return { error: "NO_FLOW_TAB" };
+
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      world: "MAIN",
+      args: [SITE_KEY, pageAction],
+      func: async (siteKey, action) => {
+        const waitForG = (timeout = 25000) =>
+          new Promise((resolve, reject) => {
+            const start = Date.now();
+            let injected = false;
+            const check = () => {
+              if (typeof window.grecaptcha?.enterprise?.execute === "function") return resolve();
+              if (typeof window.grecaptcha?.enterprise?.ready === "function") {
+                window.grecaptcha.enterprise.ready(() => {
+                  if (typeof window.grecaptcha?.enterprise?.execute === "function") resolve();
+                });
+              }
+              if (typeof window.grecaptcha?.execute === "function") return resolve();
+              if (!injected && Date.now() - start > 1500) {
+                injected = true;
+                try {
+                  if (!document.querySelector('script[src*="recaptcha/enterprise.js"]')) {
+                    const s = document.createElement("script");
+                    s.src = `https://www.google.com/recaptcha/enterprise.js?render=${siteKey}`;
+                    s.async = true;
+                    s.defer = true;
+                    (document.head || document.documentElement).appendChild(s);
+                  }
+                } catch (e) {}
+              }
+              if (Date.now() - start > timeout) return reject(new Error("grecaptcha timeout"));
+              setTimeout(check, 250);
+            };
+            check();
+          });
+
+        try {
+          await waitForG();
+          let t = null;
+          if (typeof window.grecaptcha?.enterprise?.execute === "function") {
+            t = await window.grecaptcha.enterprise.execute(siteKey, { action });
+          } else if (typeof window.grecaptcha?.execute === "function") {
+            t = await window.grecaptcha.execute(siteKey, { action });
+          }
+          return { token: t };
+        } catch (e) {
+          return { error: e.message };
+        }
+      },
+    });
+
+    return results?.[0]?.result || { error: "NO_SCRIPT_RESULT" };
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
+// ─── batchexecute RPC Execution ──────────────────────────────
+async function runBatchRpc(cmd) {
+  const tab = await getOrOpenFlowTab();
+  if (!tab) return { error: "NO_FLOW_TAB" };
+
+  let freq = cmd.freq;
+  if (cmd.captchaAction) {
+    const solved = await solveCaptcha(cmd.id, cmd.captchaAction);
+    if (!solved?.token) {
+      return { error: `CAPTCHA_FAILED: ${solved?.error || "no token"}` };
+    }
+    freq = freq.split(CAPTCHA_SLOT).join(solved.token);
+  }
+
+  const [injected] = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    world: "MAIN",
+    args: [cmd.rpcid, freq, MAX_RPC_TEXT],
+    func: async (rpcid, freqStr, maxText) => {
+      // Direct in-tab inspection of video elements and network entries
+      if (rpcid === "query_page_videos") {
+        const videos = Array.from(document.querySelectorAll("video")).map((v) => ({
+          src: v.src || v.currentSrc,
+          width: v.videoWidth,
+          height: v.videoHeight,
+          duration: v.duration,
+        }));
+        const entries = performance
+          .getEntriesByType("resource")
+          .filter(
+            (e) =>
+              e.name.includes(".mp4") ||
+              e.name.includes("video") ||
+              e.name.includes("flow-content") ||
+              e.name.includes("videofx") ||
+              e.name.includes("googleusercontent")
+          )
+          .map((e) => e.name);
+        return { status: 200, text: JSON.stringify({ videos, entries: entries.slice(-30) }) };
+      }
+
+      // Authenticated fetch inside Flow tab context (inherits all tab cookies & credentials)
+      if (rpcid === "page_fetch") {
+        try {
+          const p = JSON.parse(freqStr);
+          const r = await fetch(p.url, { credentials: "include", method: p.method || "GET" });
+          if (p.asBase64) {
+            const buf = await r.arrayBuffer();
+            const bytes = new Uint8Array(buf);
+            const len = bytes.byteLength;
+            let binary = "";
+            for (let i = 0; i < len; i += 32768) {
+              binary += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i + 32768, len)));
+            }
+            return {
+              status: r.status,
+              text: JSON.stringify({ ok: r.ok, size: len, base64: btoa(binary) }),
+            };
+          }
+          const text = await r.text();
+          return { status: r.status, text: JSON.stringify({ ok: r.ok, text }) };
+        } catch (e) {
+          return { status: 500, text: JSON.stringify({ error: e.message }) };
+        }
+      }
+
+      const wiz = globalThis.WIZ_global_data || {};
+      const at = wiz.SNlM0e;
+      const sid = wiz.FdrFJe;
+      const bl = wiz.cfb2h;
+      if (!at) return { error: "NO_AT_TOKEN" };
+
+      const reqid = Math.floor(Math.random() * 900000) + 100000;
+      const url =
+        `/_/AiSandboxAngularFrontend/data/batchexecute?rpcids=${encodeURIComponent(rpcid)}` +
+        `&f.sid=${encodeURIComponent(sid || "")}&bl=${encodeURIComponent(bl || "")}` +
+        `&hl=vi&_reqid=${reqid}&rt=c`;
+
+      try {
+        const resp = await fetch(url, {
+          method: "POST",
+          credentials: "include",
+          headers: {
+            "content-type": "application/x-www-form-urlencoded;charset=UTF-8",
+            "x-same-domain": "1",
+          },
+          body: new URLSearchParams({ "f.req": freqStr, at }),
+        });
+        const text = await resp.text();
+        return { status: resp.status, text: text.slice(0, maxText) };
+      } catch (e) {
+        return { error: e.message };
+      }
+    },
+  });
+
+  return injected?.result || { error: "NO_INJECTION_RESULT" };
+}
+
+// ─── Direct REST / API Fetch in Tab ──────────────────────────
+async function runApiFetch(cmd) {
+  const tab = await getOrOpenFlowTab();
+  if (!tab) return { error: "NO_FLOW_TAB" };
+
+  const { id, url, method, headers, body, captchaAction } = cmd;
+
+  let recaptchaToken = null;
+  if (captchaAction) {
+    const solved = await solveCaptcha(id, captchaAction);
+    if (solved?.token) {
+      recaptchaToken = solved.token;
+    }
+  }
+
+  const [injected] = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    world: "MAIN",
+    args: [url, method || "POST", headers || {}, body, recaptchaToken],
+    func: async (fetchUrl, fetchMethod, reqHeaders, reqBody, rToken) => {
+      let authHeader = reqHeaders["authorization"] || reqHeaders["Authorization"];
+      if (!authHeader) {
+        try {
+          const sRes = await fetch("https://labs.google/fx/api/auth/session", { credentials: "include" });
+          if (sRes.ok) {
+            const sData = await sRes.json();
+            if (sData && sData.access_token) {
+              authHeader = `Bearer ${sData.access_token}`;
+            }
+          }
+        } catch (e) {}
+      }
+
+      let finalBody = reqBody;
+      if (typeof reqBody === "object" && reqBody !== null) {
+        if (rToken) {
+          if (reqBody.clientContext) {
+            reqBody.clientContext.recaptchaContext = {
+              token: rToken,
+              applicationType: "RECAPTCHA_APPLICATION_TYPE_WEB",
+            };
+          }
+        }
+        finalBody = JSON.stringify(reqBody);
+      }
+
+      const sendHeaders = {
+        "accept": "*/*",
+        "content-type": "text/plain;charset=UTF-8",
+        ...reqHeaders,
+      };
+      if (authHeader) {
+        sendHeaders["authorization"] = authHeader;
+      }
+
+      try {
+        const resp = await fetch(fetchUrl, {
+          method: fetchMethod,
+          credentials: "include",
+          headers: sendHeaders,
+          body: fetchMethod === "GET" ? undefined : finalBody,
+        });
+        const text = await resp.text();
+        return { status: resp.status, ok: resp.ok, text };
+      } catch (err) {
+        return { error: err.message };
+      }
+    },
+  });
+
+  return injected?.result || { error: "NO_INJECTION_RESULT" };
+}
+
+// ─── Message Dispatcher ──────────────────────────────────────
+async function dispatchBridgeMessage(msg) {
+  if (!msg) return;
+
+  // 1. Direct REST / API Fetch in tab
+  if (msg.method === "api_fetch" || (msg.method === "batch_rpc" && msg.params?.rpcid === "api_fetch")) {
+    const { id, params } = msg;
+    let fetchParams = params || {};
+    if (params?.freq && typeof params.freq === "string") {
+      try {
+        const parsed = JSON.parse(params.freq);
+        fetchParams = { ...fetchParams, ...parsed };
+      } catch (e) {}
+    }
+    fetchParams.id = id;
+    fetchParams.captchaAction = fetchParams.captchaAction || params?.captchaAction;
+
+    state = "running";
+    metrics.requestCount++;
+    const logId = id || `fetch-${Date.now()}`;
+    addRequestLog({
+      id: logId,
+      time: new Date().toLocaleTimeString(),
+      type: "api_fetch",
+      status: "running",
+      action: fetchParams.captchaAction || "FETCH",
+    });
+
+    try {
+      const out = await runApiFetch(fetchParams);
+      if (out.error) {
+        metrics.failedCount++;
+        metrics.lastError = out.error;
+        sendToBridge({ id, status: out.status || 502, error: out.error, data: out.text });
+        updateLogStatus(logId, "failed", out.error);
+      } else {
+        metrics.successCount++;
+        sendToBridge({ id, status: out.status, data: out.text });
+        updateLogStatus(logId, "success");
+      }
+    } catch (e) {
+      metrics.failedCount++;
+      metrics.lastError = e.message;
+      sendToBridge({ id, status: 500, error: e.message });
+      updateLogStatus(logId, "error", e.message);
+    } finally {
+      state = "idle";
+      broadcastStats();
+    }
+    return;
+  }
+
+  // 1b. Get Real Cookies from Chrome Extension
+  if (msg.method === "get_cookies") {
+    try {
+      const domains = [".google.com", "google.com", "flow.google.com", "labs.google", ".labs.google"];
+      const cookieMap = new Map();
+      for (const d of domains) {
+        try {
+          const list = await chrome.cookies.getAll({ domain: d });
+          for (const c of list || []) {
+            if (c && c.name && c.value) cookieMap.set(c.name, c.value);
+          }
+        } catch (e) {}
+      }
+      try {
+        const flowList = await chrome.cookies.getAll({ url: "https://flow.google.com/" });
+        for (const c of flowList || []) {
+          if (c && c.name && c.value) cookieMap.set(c.name, c.value);
+        }
+      } catch (e) {}
+      const cookieStr = Array.from(cookieMap.entries()).map(([k, v]) => `${k}=${v}`).join("; ");
+      sendToBridge({ id: msg.id, status: 200, data: cookieStr });
+    } catch (err) {
+      sendToBridge({ id: msg.id, status: 500, error: err.message });
+    }
+    return;
+  }
+
+  // 1c. Get Flow Tab State & Media URLs
+  if (msg.method === "get_flow_state") {
+    const tab = await getOrOpenFlowTab();
+    if (!tab) {
+      sendToBridge({ id: msg.id, status: 502, error: "NO_FLOW_TAB" });
+      return;
+    }
+    try {
+      const [injected] = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        world: "MAIN",
+        func: () => {
+          const videos = Array.from(document.querySelectorAll('video')).map(v => v.src || v.currentSrc);
+          const entries = performance.getEntriesByType('resource')
+            .filter(e => e.name.includes('.mp4') || e.name.includes('video') || e.name.includes('flow-content') || e.name.includes('videofx'))
+            .map(e => e.name);
+          return {
+            title: document.title,
+            url: window.location.href,
+            videos,
+            resourceVideos: entries.slice(-20)
+          };
+        },
+      });
+      sendToBridge({ id: msg.id, status: 200, data: JSON.stringify(injected?.result) });
+    } catch (e) {
+      sendToBridge({ id: msg.id, status: 500, error: e.message });
+    }
+    return;
+  }
+
+  // 1d. Native Chrome Download
+  if (msg.method === "download_file") {
+    const { url, filename } = msg.params || {};
+    if (!url) {
+      sendToBridge({ id: msg.id, status: 400, error: "MISSING_URL" });
+      return;
+    }
+    try {
+      chrome.downloads.download({
+        url,
+        filename: filename || "video.mp4",
+        conflictAction: "overwrite",
+        saveAs: false,
+      }, (downloadId) => {
+        if (chrome.runtime.lastError) {
+          sendToBridge({ id: msg.id, status: 500, error: chrome.runtime.lastError.message });
+        } else {
+          sendToBridge({ id: msg.id, status: 200, data: JSON.stringify({ downloadId, filename }) });
+        }
+      });
+    } catch (e) {
+      sendToBridge({ id: msg.id, status: 500, error: e.message });
+    }
+    return;
+  }
+
+  // 1e. Background Fetch (No page CSP, returns Base64 binary)
+  if (msg.method === "bg_fetch") {
+    const { url, asBase64 } = msg.params || {};
+    if (!url) {
+      sendToBridge({ id: msg.id, status: 400, error: "MISSING_URL" });
+      return;
+    }
+    try {
+      const resp = await fetch(url, { credentials: "include" });
+      if (!resp.ok) {
+        sendToBridge({ id: msg.id, status: resp.status, error: `HTTP ${resp.status}` });
+        return;
+      }
+      if (asBase64) {
+        const buf = await resp.arrayBuffer();
+        const bytes = new Uint8Array(buf);
+        const len = bytes.byteLength;
+        let binary = "";
+        for (let i = 0; i < len; i += 32768) {
+          binary += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i + 32768, len)));
+        }
+        sendToBridge({ id: msg.id, status: 200, data: JSON.stringify({ ok: true, size: len, base64: btoa(binary) }) });
+      } else {
+        const text = await resp.text();
+        sendToBridge({ id: msg.id, status: 200, data: text });
+      }
+    } catch (err) {
+      sendToBridge({ id: msg.id, status: 500, error: err.message });
+    }
+    return;
+  }
+
+  // 2. Extension Reload Command
+  if (msg.method === "reload") {
+    sendToBridge({ id: msg.id, status: 200, data: "reloading" });
+    setTimeout(() => { chrome.runtime.reload(); }, 200);
+    return;
+  }
+
+  // 3. batchexecute RPC request
+  if (msg.method === "batch_rpc") {
+    const { id, params } = msg;
+    const { rpcid, freq, captchaAction } = params || {};
+    if (!rpcid || !freq) {
+      sendToBridge({ id, status: 400, error: "INVALID_BATCH_RPC" });
       return;
     }
 
-    if (t === "get_token") {
-      console.log(`[Veo3] Job received: req_id=${data.req_id?.slice(0, 16)}...`);
-      stats.totalReceived++;
-      broadcastStats();
-      enqueueJob(data);
-    }
-  };
+    state = "running";
+    metrics.requestCount++;
+    const logId = id || `rpc-${Date.now()}`;
+    addRequestLog({
+      id: logId,
+      time: new Date().toLocaleTimeString(),
+      type: rpcid,
+      status: "running",
+      action: captchaAction || "RPC",
+    });
 
-  ws.onclose = (ev) => {
-    console.log(`[Veo3] WS closed (code=${ev.code})`);
-    wsConnected       = false;
-    stats.connected   = false;
-    ws                = null;
-    if (wsHeartbeatTimer) { clearInterval(wsHeartbeatTimer); wsHeartbeatTimer = null; }
-    broadcastStats();
-    notifyPopup("ws_disconnected");
-    scheduleReconnect(settings);
-  };
-
-  ws.onerror = () => {}; // onclose sẽ xử lý
-}
-
-function scheduleReconnect(settings) {
-  if (!settings?.autoReconnect || wsReconnectTimer) return;
-  wsReconnectTimer = setTimeout(() => { wsReconnectTimer = null; connectWS(); }, WS_RECONNECT_DELAY_MS);
-}
-
-function wsSend(data) {
-  if (ws?.readyState === WebSocket.OPEN) {
-    try { ws.send(JSON.stringify(data)); return true; } catch (_) {}
-  }
-  return false;
-}
-
-// ═══════════════════════════════════════════════════════════
-// Message handler (popup / options / content script)
-// ═══════════════════════════════════════════════════════════
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  switch (msg.type) {
-    case "get_stats":
-      sendResponse({ stats: { ...stats, activeJobs, queued: jobQueue.length } });
-      return true;
-
-    case "reconnect":
-      closeWS();
-      connectWS();
-      sendResponse({ ok: true });
-      return true;
-
-    case "disconnect":
-      closeWS();
-      sendResponse({ ok: true });
-      return true;
-
-    case "open_labs_tab":
-      chrome.tabs.create({ url: TARGET_URL, active: true });
-      sendResponse({ ok: true });
-      return true;
-
-    case "test_token":
-      // Test job thủ công từ popup — dùng tab đang mở của user
-      enqueueJob({
-        req_id:    "test_" + Date.now(),
-        action:    msg.action || "VIDEO_GENERATION",
-        site_key:  SITE_KEY,
-        cookie_hash: "test",
-      });
-      sendResponse({ ok: true });
-      return true;
-
-    // ── Nhận kết quả từ content script (ISOLATED → background) ─────────
-    // content.js nhận postMessage từ MAIN-world function rồi forward về đây
-    case "token_from_content": {
-      const { req_id, token, error } = msg;
-      const pending = pendingJobs.get(req_id);
-      if (pending) {
-        clearTimeout(pending.timer);
-        pendingJobs.delete(req_id);
-        if (token) pending.resolve(token);
-        else       pending.reject(new Error(error || "No token"));
+    try {
+      const out = await runBatchRpc({ id, rpcid, freq, captchaAction });
+      if (out.error) {
+        metrics.failedCount++;
+        metrics.lastError = out.error;
+        sendToBridge({ id, status: 502, error: out.error });
+        updateLogStatus(logId, "failed", out.error);
+      } else {
+        metrics.successCount++;
+        sendToBridge({ id, status: out.status, data: out.text });
+        updateLogStatus(logId, "success");
       }
-      return false;
+    } catch (e) {
+      metrics.failedCount++;
+      metrics.lastError = e.message;
+      sendToBridge({ id, status: 500, error: e.message });
+      updateLogStatus(logId, "error", e.message);
+    } finally {
+      state = "idle";
+      broadcastStats();
     }
   }
-  return false;
-});
 
-// ═══════════════════════════════════════════════════════════
-// Settings change → reconnect
-// ═══════════════════════════════════════════════════════════
-chrome.storage.onChanged.addListener((changes, area) => {
-  if (area !== "local") return;
-  if (changes.serverUrl || changes.clientLabel) {
-    console.log("[Veo3] Settings changed → reconnecting...");
-    closeWS();
-    connectWS();
+  // 2. Legacy get_token request
+  else if (msg.type === "get_token") {
+    const { req_id, action } = msg;
+    metrics.requestCount++;
+    try {
+      const solved = await solveCaptcha(req_id, action || "VIDEO_GENERATION");
+      if (solved?.token) {
+        metrics.successCount++;
+        sendToBridge({ type: "token_result", req_id, token: solved.token });
+      } else {
+        metrics.failedCount++;
+        sendToBridge({ type: "token_result", req_id, error: solved?.error || "NO_TOKEN" });
+      }
+    } catch (e) {
+      metrics.failedCount++;
+      sendToBridge({ type: "token_result", req_id, error: e.message });
+    }
+    broadcastStats();
   }
-});
 
-// ═══════════════════════════════════════════════════════════
-// Alarm: keep service worker alive (MV3 tắt sau 30s idle)
-// ═══════════════════════════════════════════════════════════
-chrome.alarms.create("keepalive", { periodInMinutes: 0.4 });
-chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === "keepalive" && !wsConnected && !wsReconnectTimer) {
-    connectWS();
+  // 3. Status check
+  else if (msg.method === "get_status") {
+    sendToBridge({
+      id: msg.id,
+      status: 200,
+      data: {
+        wsConnected,
+        state,
+        flowKeyPresent: !!flowKey,
+        metrics,
+      },
+    });
   }
+
+  // 4. Request account info update
+  else if (msg.type === "request_account_info" || msg.method === "get_account_info") {
+    captureSessionFromFlowTab();
+  }
+}
+
+function updateLogStatus(logId, status, error = null) {
+  const item = requestLog.find((l) => l.id === logId);
+  if (item) {
+    item.status = status;
+    if (error) item.error = error;
+  }
+  chrome.storage.local.set({ requestLog }).catch(() => {});
+  broadcastStats();
+}
+
+// ─── Session / Token Capture ─────────────────────────────────
+async function captureSessionFromFlowTab() {
+  const tab = await getOrOpenFlowTab();
+  if (!tab) return;
+
+  try {
+    const [result] = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      world: "MAIN",
+      func: () => {
+        const wiz = globalThis.WIZ_global_data || {};
+        let email = null;
+        if (typeof wiz.oPEP7c === "string" && wiz.oPEP7c.includes("@")) {
+          email = wiz.oPEP7c;
+        }
+        if (!email) {
+          const accBtn = document.querySelector('a[aria-label*="@"], button[aria-label*="@"], [data-email]');
+          if (accBtn) {
+            const attr = accBtn.getAttribute("data-email") || accBtn.getAttribute("aria-label") || "";
+            const match = attr.match(/([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/);
+            if (match) email = match[1];
+          }
+        }
+        if (!email) {
+          const match = document.documentElement.innerHTML.match(/["']([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})["']/);
+          if (match) email = match[1];
+        }
+        return {
+          at: wiz.SNlM0e || null,
+          sid: wiz.FdrFJe || null,
+          bl: wiz.cfb2h || null,
+          email: email || null,
+        };
+      },
+    });
+
+    const wizData = result?.result;
+    if (wizData?.at) {
+      sendToBridge({
+        type: "token_captured",
+        clientId: extensionClientId,
+        flowKey: wizData.at,
+        wiz: wizData,
+        email: wizData.email || null,
+      });
+      console.log("[Veo3 Bridge] Synced WIZ_global_data & Email to bridge server:", wizData.email);
+
+      // Check cookies for flow.google.com, labs.google, and google.com
+      let cookieStr = "";
+      try {
+        const cookieSources = [
+          chrome.cookies.getAll({ url: "https://flow.google.com/" }),
+          chrome.cookies.getAll({ url: "https://labs.google/" }),
+          chrome.cookies.getAll({ domain: ".google.com" }),
+          chrome.cookies.getAll({ domain: "google.com" }),
+          chrome.cookies.getAll({ domain: "labs.google" }),
+          chrome.cookies.getAll({ domain: ".labs.google" })
+        ];
+        const cookieArrays = await Promise.allSettled(cookieSources);
+        const cookieMap = new Map();
+        for (const res of cookieArrays) {
+          if (res.status === "fulfilled" && Array.isArray(res.value)) {
+            for (const c of res.value) {
+              if (c && c.name && c.value) {
+                cookieMap.set(c.name, c.value);
+              }
+            }
+          }
+        }
+        if (cookieMap.size > 0) {
+          cookieStr = Array.from(cookieMap.entries()).map(([k, v]) => `${k}=${v}`).join("; ");
+        }
+      } catch (ce) {
+        console.warn("[Veo3 Bridge] Cookie extraction notice:", ce);
+      }
+
+      // Auto-fetch OAuth2 Bearer Access Token (ya29...) from labs session endpoint
+      let accessToken = flowKey || null;
+      try {
+        const sessionRes = await fetch("https://labs.google/fx/api/auth/session", { credentials: "include" });
+        if (sessionRes.ok) {
+          const sessionData = await sessionRes.json();
+          if (sessionData && sessionData.access_token) {
+            accessToken = sessionData.access_token;
+            flowKey = accessToken;
+            chrome.storage.local.set({ flowKey });
+          }
+        }
+      } catch (se) {
+        console.warn("[Veo3 Bridge] Session token fetch notice:", se);
+      }
+
+      if (accessToken && accessToken.startsWith("ya29.")) {
+        sendToBridge({
+          type: "token_captured",
+          clientId: extensionClientId,
+          flowKey: accessToken,
+        });
+      }
+
+      // Check credits & plan via nzlxg
+      try {
+        const creditRes = await runBatchRpc({
+          rpcid: "nzlxg",
+          freq: '[[["nzlxg","[]",null,"generic"]]]',
+        });
+        if (creditRes?.text) {
+          const match = creditRes.text.match(/\[(\d+),\s*(\d+)/);
+          if (match) {
+            const credits = parseInt(match[1], 10);
+            const tier = parseInt(match[2], 10);
+            const plan = (tier === 2)
+              ? "Ultra (Tier 2)"
+              : (tier === 1 || tier === 3)
+              ? "Pro (Tier 1)"
+              : `Tier ${tier}`;
+            sendToBridge({
+              type: "account_info",
+              clientId: extensionClientId,
+              email: wizData.email || `Profile (${extensionClientId})`,
+              credits: credits,
+              tier: `TIER_${tier}`,
+              plan: plan,
+              cookie: cookieStr,
+              access_token: accessToken || flowKey || null,
+            });
+            console.log(`[Veo3 Bridge] Synced Account: ${wizData.email || extensionClientId} -> ${credits} credits (${plan}) [has_at=${!!accessToken}]`);
+          }
+        }
+      } catch (ce) {}
+    }
+  } catch (e) {}
+}
+
+// Intercept Bearer tokens if present
+chrome.webRequest.onBeforeSendHeaders.addListener(
+  (details) => {
+    if (!details?.requestHeaders?.length) return;
+    const authHeader = details.requestHeaders.find(
+      (h) => h.name?.toLowerCase() === "authorization"
+    );
+    const value = authHeader?.value || "";
+    if (value.startsWith("Bearer ya29.")) {
+      const token = value.replace(/^Bearer\s+/i, "").trim();
+      flowKey = token;
+      metrics.tokenCapturedAt = Date.now();
+      chrome.storage.local.set({ flowKey, metrics });
+      sendToBridge({
+        type: "token_captured",
+        clientId: extensionClientId,
+        flowKey: token,
+      });
+    }
+  },
+  { urls: ["https://aisandbox-pa.googleapis.com/*", "https://flow.google.com/*", "https://labs.google/*"] },
+  ["requestHeaders", "extraHeaders"]
+);
+
+// ─── Popup Messaging ─────────────────────────────────────────
+chrome.runtime.onMessage.addListener((msg, _, reply) => {
+  if (msg.type === "GET_STATS") {
+    reply({
+      wsConnected,
+      state,
+      flowKeyPresent: !!flowKey,
+      metrics,
+      log: requestLog,
+    });
+    return true;
+  }
+  if (msg.type === "RECONNECT") {
+    connectToBridge();
+    reply({ ok: true });
+    return true;
+  }
+  if (msg.type === "OPEN_FLOW") {
+    chrome.tabs.create({ url: FLOW_URL });
+    reply({ ok: true });
+    return true;
+  }
+  return true;
 });
 
-// ═══════════════════════════════════════════════════════════
-// Utility
-// ═══════════════════════════════════════════════════════════
-function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
-
-// ═══════════════════════════════════════════════════════════
-// Init
-// ═══════════════════════════════════════════════════════════
-console.log(`[Veo3] Service worker v${EXT_VERSION} started`);
-connectWS();
+console.log(`[Veo3 Bridge] Extension Service Worker active (v${EXT_VERSION})`);

@@ -42,7 +42,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, Slot, QObject, QStandardPaths, QMetaObject, QEvent
 from PySide6.QtGui import QFont, QColor, QPalette, QPixmap, QTextOption
 
-from gui_dialogs import AdPopupDialog, ClickableLabel, CookieManagerDialog, CustomIntegrateDialog, ExtendProjectEditDialog, MatchingEditDialog
+from gui_dialogs import AdPopupDialog, ClickableLabel, CookieManagerDialog, AccountManagerDialog, CustomIntegrateDialog, ExtendProjectEditDialog, MatchingEditDialog
 from gui_ui_shared import FlowTaskData, FrameExtractionWorker, NoScrollComboBox, NoScrollDoubleSpinBox, NoScrollSpinBox, ThumbnailGridWidget, WorkerSignals
 from gui_flow_tab import FlowTabMixin
 from gui_video_tab import VideoTabMixin
@@ -902,10 +902,11 @@ class GoogleLabsFlowQt6(QMainWindow, FlowTabMixin, VideoTabMixin):
         self.main_tabs[0].setChecked(True)
         
         layout.addStretch()
-        self.btn_cookie = QPushButton("🔑 Cài Đặt Cookie")
+        self.btn_cookie = QPushButton("👤 Quản Trị Tài Khoản")
         self.btn_cookie.setCheckable(False)
         self.btn_cookie.setFixedHeight(38)
         self.btn_cookie.setObjectName("reportTab")
+        self.btn_cookie.setToolTip("Quản trị tài khoản Google Flow, xem Credits, Gmail, Gói Plan và Profile Chrome")
         self.btn_cookie.clicked.connect(self.show_cookie_dialog)
         layout.addWidget(self.btn_cookie)
         
@@ -3903,6 +3904,36 @@ class GoogleLabsFlowQt6(QMainWindow, FlowTabMixin, VideoTabMixin):
 
         return max_cookies_allowed, unlimited_cookies
 
+    def _get_tier_for_cookie(self, cookie_index: Optional[int] = None, client=None) -> str:
+        """Lấy chính xác userPaygateTier (PAYGATE_TIER_ONE cho Pro, PAYGATE_TIER_TWO cho Ultra)."""
+        # 1. Từ client.user_tier nếu client đã check
+        if client and hasattr(client, 'user_tier') and client.user_tier:
+            ut = str(client.user_tier).upper()
+            if "2" in ut or "TWO" in ut or "ULTRA" in ut:
+                return "PAYGATE_TIER_TWO"
+            elif "1" in ut or "ONE" in ut or "PRO" in ut or "3" in ut or "THREE" in ut:
+                return "PAYGATE_TIER_ONE"
+
+        # 2. Từ self.account_metadata theo cookie_index
+        if cookie_index is not None and hasattr(self, 'account_metadata') and self.account_metadata:
+            if 0 <= cookie_index < len(self.account_metadata):
+                meta = self.account_metadata[cookie_index]
+                tier_str = str(meta.get("tier") or meta.get("plan") or "").upper()
+                if "2" in tier_str or "TWO" in tier_str or "ULTRA" in tier_str:
+                    return "PAYGATE_TIER_TWO"
+                elif "1" in tier_str or "ONE" in tier_str or "PRO" in tier_str or "3" in tier_str or "THREE" in tier_str:
+                    return "PAYGATE_TIER_ONE"
+
+        # 3. Tra cứu theo email hoặc hash
+        if hasattr(self, 'account_metadata') and self.account_metadata:
+            for meta in self.account_metadata:
+                t = str(meta.get("tier") or meta.get("plan") or "").upper()
+                if "1" in t or "ONE" in t or "PRO" in t or "3" in t:
+                    # Nếu có bất kỳ acc Pro nào
+                    return "PAYGATE_TIER_ONE"
+
+        return "PAYGATE_TIER_ONE"
+
     def _split_pasted_cookie_blocks(self, cookie_text: str) -> List[str]:
         """Tách nhiều cookie được dán trong 1 ô text."""
         text = (cookie_text or "").strip()
@@ -3958,6 +3989,9 @@ class GoogleLabsFlowQt6(QMainWindow, FlowTabMixin, VideoTabMixin):
             while len(self.cookie_labels) < len(self.cookies_list):
                 self.cookie_labels.append("")
             
+            # ✅ Load account metadata (Gmail, Plan, Credits, Source)
+            self.account_metadata = list(data.get('account_metadata', []) or [])
+            
             # ✅ Load cookie runtime status (expired/errors) from previous session
             self._init_cookie_status()  # Initialize with defaults first
             saved_expired = list(data.get('cookie_expired', []) or [])
@@ -4011,6 +4045,7 @@ class GoogleLabsFlowQt6(QMainWindow, FlowTabMixin, VideoTabMixin):
             payload = {
                 'cookies_list': cookies_list,
                 'cookie_labels': labels,
+                'account_metadata': getattr(self, 'account_metadata', []),
                 'saved_at': datetime.now().isoformat(),
                 'cookie_expired': expired,
                 'cookie_errors': [e if e else "" for e in errors],
@@ -4084,12 +4119,12 @@ class GoogleLabsFlowQt6(QMainWindow, FlowTabMixin, VideoTabMixin):
         return len(self.cookies_list)
 
     def show_cookie_dialog(self) -> bool:
-        """Dialog cookie: chỉ hỗ trợ paste trực tiếp 1 hoặc nhiều cookie."""
-        dialog = CookieManagerDialog(
+        """Dialog quản trị tài khoản: hiển thị Gmail, Credits, Gói Plan và Profile Chrome."""
+        dialog = AccountManagerDialog(
             self,
-            title="Cài Đặt Cookie",
-            header_text="Cookie Manager",
-            info_text="Chỉ hỗ trợ dán trực tiếp 1 hoặc nhiều cookie. Các chức năng auto-login, lấy cookie, quản lý account và profile đã bị loại bỏ.",
+            title="Quản Trị Tài Khoản Google Flow Ultra / Pro",
+            header_text="Quản Trị Tài Khoản (Google Flow)",
+            info_text="Quản lý danh sách tài khoản Google Flow Ultra / Pro. Tự động đồng bộ số Credits, Gmail và Gói Plan.",
             prefill_existing=True,
         )
         return dialog.exec() == QDialog.Accepted
@@ -4118,11 +4153,24 @@ class GoogleLabsFlowQt6(QMainWindow, FlowTabMixin, VideoTabMixin):
             
             client = LabsFlowClient(cookies)
             
-            # Bước 1: Fetch access token (bước đầu)
+            # Bước 1: Ưu tiên batchexecute RPC nzlxg (Google Flow BOQ)
+            try:
+                from flow_batch import RPC_CREDITS, credits_request, first_payload, read_credits
+                c_res = client.batch_rpc(RPC_CREDITS, credits_request(), timeout=15)
+                if c_res.get("ok"):
+                    raw_data = c_res.get("data", "")
+                    payload = first_payload(raw_data, RPC_CREDITS)
+                    info = read_credits(payload)
+                    if info:
+                        return True, f"✅ Cookie live (Flow RPC) - Credits: {info.remaining:,} (Tier {info.tier})"
+            except Exception as e:
+                pass
+
+            # Bước 2: Fetch access token (fallback REST)
             if not client.fetch_access_token():
                 return False, "❌ Cookie chết (không fetch được token)"
             
-            # Bước 2: Ưu tiên - Check credits (chính xác hơn)
+            # Bước 3: Ưu tiên - Check credits (chính xác hơn)
             try:
                 success, credits_data, msg = self.check_cookie_credits(cookie_str)
                 if success and credits_data:
@@ -4134,7 +4182,7 @@ class GoogleLabsFlowQt6(QMainWindow, FlowTabMixin, VideoTabMixin):
             except Exception as e:
                 self.log(f"⚠️ Check credits lỗi: {e}, thử cách khác...")
             
-            # Bước 3: Fallback - Test set model (thử nhiều model khác nhau)
+            # Bước 4: Fallback - Test set model (thử nhiều model khác nhau)
             test_models = [
                 "veo_3_1_t2v_fast_ultra",
                 "veo_3_1_t2v_fast", 
@@ -4164,13 +4212,35 @@ class GoogleLabsFlowQt6(QMainWindow, FlowTabMixin, VideoTabMixin):
         """
         try:
             import requests
-            from bs4 import BeautifulSoup
             import re
+            try:
+                from bs4 import BeautifulSoup
+            except ImportError:
+                BeautifulSoup = None
             from complete_flow import LabsFlowClient  # Ensure this import
             
             cookies_dict = _parse_cookie_string(cookie_str)
             if not cookies_dict:
                 return False, {}, "Cookie không hợp lệ"
+
+            # ── 1. Ưu tiên kiểm tra Credits qua Google Flow batchexecute RPC (nzlxg) ──
+            try:
+                from flow_batch import RPC_CREDITS, credits_request, first_payload, read_credits
+                client = LabsFlowClient(cookies_dict, profile_path=profile_path)
+                c_res = client.batch_rpc(RPC_CREDITS, credits_request(), timeout=15)
+                if c_res.get("ok"):
+                    raw_data = c_res.get("data", "")
+                    payload = first_payload(raw_data, RPC_CREDITS)
+                    info = read_credits(payload)
+                    if info:
+                        self.log(f"✅ [batchexecute] Flow Credits OK: {info.remaining:,} (Tier {info.tier})")
+                        return True, {
+                            "credits": info.remaining,
+                            "userPaygateTier": f"{info.tier}",
+                            "apiKey": "batchexecute",
+                        }, f"✅ Credits: {info.remaining:,} (Flow RPC)"
+            except Exception as rpc_err:
+                self.log(f"ℹ️ [batchexecute] RPC credits notice: {rpc_err}")
             
             # ✅ OPTIMIZATION: Try cached API key first if available
             if cached_api_key:
@@ -9775,7 +9845,7 @@ class GoogleLabsFlowQt6(QMainWindow, FlowTabMixin, VideoTabMixin):
                     return False
             
             tool = "PINHOLE"
-            tier = "PAYGATE_TIER_TWO"
+            tier = self._get_tier_for_cookie(cookie_index, client)
             
             aspect_map = {
                 "16:9": "VIDEO_ASPECT_RATIO_LANDSCAPE",
@@ -10166,7 +10236,7 @@ class GoogleLabsFlowQt6(QMainWindow, FlowTabMixin, VideoTabMixin):
                     return False
             
             tool = "PINHOLE"
-            tier = "PAYGATE_TIER_TWO"
+            tier = self._get_tier_for_cookie(cookie_index, client)
             
             aspect_map = {
                 "16:9": "VIDEO_ASPECT_RATIO_LANDSCAPE",
@@ -15845,7 +15915,7 @@ QUAN TRỌNG:
             
             idx = task.task_index
             tool = "PINHOLE"
-            tier = "PAYGATE_TIER_TWO"
+            tier = self._get_tier_for_cookie(getattr(task, "_cookie_index", None), client)
             
             aspect_map = {
                 "16:9": "VIDEO_ASPECT_RATIO_LANDSCAPE",
@@ -16734,7 +16804,7 @@ QUAN TRỌNG:
             
             idx = task.prompt_index
             tool = "PINHOLE"
-            tier = "PAYGATE_TIER_TWO"
+            tier = self._get_tier_for_cookie(getattr(task, "_cookie_index", None), client)
             
             aspect_map = {
                 "16:9": "VIDEO_ASPECT_RATIO_LANDSCAPE",
@@ -17176,7 +17246,7 @@ QUAN TRỌNG:
                 return None
             
             tool = "PINHOLE"
-            tier = "PAYGATE_TIER_TWO"
+            tier = self._get_tier_for_cookie(getattr(task, "_cookie_index", None), client)
             
             aspect_map = {
                 "16:9": "VIDEO_ASPECT_RATIO_LANDSCAPE",
@@ -17469,7 +17539,7 @@ QUAN TRỌNG:
                 return None
             
             tool = "PINHOLE"
-            tier = "PAYGATE_TIER_TWO"
+            tier = self._get_tier_for_cookie(client=client)
             
             aspect_map = {
                 "16:9": "VIDEO_ASPECT_RATIO_LANDSCAPE",
@@ -17530,7 +17600,7 @@ QUAN TRỌNG:
         """
         try:
             tool = "PINHOLE"
-            tier = "PAYGATE_TIER_TWO"
+            tier = self._get_tier_for_cookie(client=client)
             
             aspect_map = {
                 "16:9": "VIDEO_ASPECT_RATIO_LANDSCAPE",
@@ -17716,7 +17786,7 @@ QUAN TRỌNG:
             import uuid
             project_id = str(uuid.uuid4())
             tool = "PINHOLE"
-            tier = "PAYGATE_TIER_TWO"
+            tier = self._get_tier_for_cookie(client=client)
             
             operations = client.generate_videos(
                 project_id=project_id,
@@ -20920,7 +20990,7 @@ OUTPUT: Định dạng plain text, không có JSON, không có markdown, không 
                 session_id = f";{int(_time.time() * 1000)}"
                 client_context = {
                     "tool": tool,
-                    "userPaygateTier": "PAYGATE_TIER_TWO",
+                    "userPaygateTier": self._get_tier_for_cookie(client=client),
                     "sessionId": session_id,
                 }
                 try:

@@ -1,54 +1,96 @@
 {
   "manifest_version": 3,
-  "name": "Veo3 Ultra Captcha Worker",
-  "version": "3.1.0",
-  "description": "Lấy reCAPTCHA Enterprise token từ tab labs.google thật của user cho Veo3 Ultra tool.",
-
+  "name": "Veo3 Ultra Flow Bridge & Captcha Worker",
+  "version": "4.0.0",
+  "description": "Google Flow batchexecute RPC Bridge and reCAPTCHA Enterprise Worker for Veo3 Ultra.",
+  "icons": {
+    "16": "icon16.png",
+    "32": "icon32.png",
+    "48": "icon48.png",
+    "128": "icon128.png"
+  },
   "permissions": [
+    "cookies",
     "storage",
+    "alarms",
     "tabs",
     "scripting",
-    "alarms",
-    "activeTab"
+    "declarativeNetRequest",
+    "webRequest",
+    "downloads"
   ],
-
   "host_permissions": [
+    "https://*.google.com/*",
+    "https://*.googleusercontent.com/*",
+    "https://*.googlevideo.com/*",
+    "https://flow.google.com/*",
     "https://labs.google/*",
-    "https://*.google.com/*"
+    "https://flow-content.google/*",
+    "https://storage.googleapis.com/*",
+    "https://aisandbox-pa.googleapis.com/*",
+    "https://www.google.com/recaptcha/*",
+    "https://www.gstatic.com/recaptcha/*",
+    "http://127.0.0.1:3003/*",
+    "http://localhost:3003/*",
+    "ws://127.0.0.1:3003/*"
   ],
-
   "background": {
     "service_worker": "background.js"
   },
-
   "content_scripts": [
     {
       "matches": [
-        "https://labs.google/*"
+        "https://flow.google.com/*",
+        "https://labs.google/fx/tools/flow*",
+        "https://labs.google/fx/*/tools/flow*"
       ],
-      "js": ["content.js"],
-      "run_at": "document_idle",
-      "all_frames": false
+      "js": [
+        "injected.js"
+      ],
+      "world": "MAIN",
+      "run_at": "document_start"
+    },
+    {
+      "matches": [
+        "https://flow.google.com/*",
+        "https://labs.google/fx/tools/flow*",
+        "https://labs.google/fx/*/tools/flow*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "world": "ISOLATED",
+      "run_at": "document_start"
     }
   ],
-
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "injected.js"
+      ],
+      "matches": [
+        "https://labs.google/*",
+        "https://flow.google.com/*"
+      ]
+    }
+  ],
+  "declarative_net_request": {
+    "rule_resources": [
+      {
+        "id": "flow_rules",
+        "enabled": true,
+        "path": "rules.json"
+      }
+    ]
+  },
   "action": {
     "default_popup": "popup.html",
-    "default_title": "Veo3 Ultra Captcha Worker",
+    "default_title": "Veo3 Ultra Flow Bridge",
     "default_icon": {
-      "16":  "icon16.png",
-      "32":  "icon32.png",
-      "48":  "icon48.png",
+      "16": "icon16.png",
+      "32": "icon32.png",
+      "48": "icon48.png",
       "128": "icon128.png"
     }
-  },
-
-  "options_page": "options.html",
-
-  "icons": {
-    "16":  "icon16.png",
-    "32":  "icon32.png",
-    "48":  "icon48.png",
-    "128": "icon128.png"
   }
 }

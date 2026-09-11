@@ -21,7 +21,10 @@ import socket
 import hashlib
 import hmac
 import base64
-import jwt
+try:
+    import jwt
+except ImportError:
+    jwt = None
 from datetime import datetime, timedelta
 from typing import Dict, Optional, Tuple
 from supabase_manager import supabase_manager
@@ -173,9 +176,9 @@ class ItingAPI:
             
             return True, payload
             
-        except jwt.ExpiredSignatureError:
+        except getattr(jwt, "ExpiredSignatureError", Exception):
             return False, {"error": "Token expired"}
-        except jwt.InvalidTokenError as e:
+        except getattr(jwt, "InvalidTokenError", Exception) as e:
             return False, {"error": f"Invalid token: {str(e)}"}
         except Exception as e:
             return False, {"error": f"Token validation error: {str(e)}"}

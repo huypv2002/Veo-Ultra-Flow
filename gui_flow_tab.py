@@ -4425,7 +4425,12 @@ class FlowTabMixin:
                         client_context["tool"] = "PINHOLE"
                         
                         # ✅ Thêm userPaygateTier (giống generate_videos)
-                        client_context["userPaygateTier"] = "PAYGATE_TIER_TWO"
+                        if hasattr(self, '_get_tier_for_cookie'):
+                            client_context["userPaygateTier"] = self._get_tier_for_cookie(job.get("cookie_index"), job_client)
+                        elif hasattr(job_client, 'user_tier') and ("1" in str(job_client.user_tier) or "PRO" in str(job_client.user_tier).upper()):
+                            client_context["userPaygateTier"] = "PAYGATE_TIER_ONE"
+                        else:
+                            client_context["userPaygateTier"] = "PAYGATE_TIER_TWO"
 
                         # ✅ Đảm bảo imageInputs là array (theo curl example)
                         if image_inputs is None:

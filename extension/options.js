@@ -1,5 +1,11 @@
 "use strict";
 
+if (window.location.search.includes("reload=1")) {
+  console.log("[Veo3] Triggering extension reload...");
+  chrome.runtime.reload();
+  setTimeout(() => window.close(), 300);
+}
+
 const DEFAULT_SETTINGS = {
   serverUrl:     "ws://127.0.0.1:3003/ws",
   clientLabel:   "",

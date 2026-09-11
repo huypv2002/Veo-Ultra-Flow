@@ -42,6 +42,24 @@ try:
 except Exception:
     pass
 
+# ✅ Import batchexecute RPC codec and bridge server
+try:
+    from flow_batch import (
+        RPC_CREDITS, RPC_GEN_IMAGE, RPC_GEN_VIDEO, RPC_OPERATION, RPC_MEDIA, RPC_UPLOAD_IMAGE,
+        credits_request, image_request, video_request, upload_request, operation_request, media_request,
+        read_credits, read_images, read_uploaded_media_id, read_video_media_id, read_operation, read_media_urls,
+        first_payload, parse_envelope, resolve_video_model, resolve_video_aspect, resolve_image_model, resolve_aspect,
+        CAPTCHA_IMAGE, CAPTCHA_VIDEO, DEFAULT_PROJECT_ID, IMAGE_MODEL
+    )
+except ImportError:
+    pass
+
+try:
+    from captcha_bridge_server import bridge_batch_rpc, ensure_captcha_bridge_server
+except ImportError:
+    bridge_batch_rpc = None
+    ensure_captcha_bridge_server = None
+
 
 def _env(name: str, default: Optional[str] = None) -> Optional[str]:
     value = os.getenv(name)
@@ -997,6 +1015,42 @@ class LabsFlowClient:
             LabsFlowClient._token_timestamps: Dict[str, float] = {}
         # Token được coi là "fresh" nếu < TOKEN_MAX_AGE_SECONDS
         self.TOKEN_MAX_AGE_SECONDS = 90  # 90s (buffer 30s trước khi hết hạn 120s)
+        self.credits: Optional[int] = None
+        self.user_tier: Optional[str] = None
+
+    def batch_rpc(
+        self,
+        rpcid: str,
+        freq: str,
+        captcha_action: Optional[str] = None,
+        timeout: int = 120,
+    ) -> Dict[str, Any]:
+        """Execute a Google Flow batchexecute RPC via the Extension Bridge."""
+        server_url = (self.captcha_bridge_url or "http://127.0.0.1:3003").rstrip("/")
+        if ensure_captcha_bridge_server:
+            ensure_captcha_bridge_server(server_url, auto_start=True)
+        if bridge_batch_rpc:
+            return bridge_batch_rpc(
+                rpcid=rpcid,
+                freq=freq,
+                captcha_action=captcha_action,
+                timeout=timeout,
+                server_url=server_url,
+            )
+        try:
+            r = self.session.post(
+                f"{server_url}/batch-rpc",
+                json={
+                    "rpcid": rpcid,
+                    "freq": freq,
+                    "captcha_action": captcha_action,
+                    "timeout": timeout,
+                },
+                timeout=timeout + 5,
+            )
+            return r.json()
+        except Exception as e:
+            return {"ok": False, "status": 500, "error": str(e)}
     
     @classmethod
     def cleanup_selenium_driver(cls):
@@ -5193,9 +5247,48 @@ class LabsFlowClient:
             return base_key
     
     def fetch_access_token(self) -> bool:
-        """Fetch access token from labs session. Returns True if successful."""
+        """Fetch access token from labs session or validate via batchexecute RPC (nzlxg).
+        Returns True if successful.
+        """
+        # ── 1. Kiểm tra phiên & credits qua Google Flow batchexecute RPC (nzlxg) ──
+        rpc_live = False
         try:
-            print("→ Fetching access token from labs session...")
+            freq = credits_request()
+            rpc_res = self.batch_rpc(RPC_CREDITS, freq, timeout=15)
+            if rpc_res.get("ok"):
+                raw_text = rpc_res.get("data", "")
+                if raw_text:
+                    payload = first_payload(raw_text, RPC_CREDITS)
+                    credits, tier = read_credits(payload)
+                    self.credits = credits
+                    self.user_tier = tier
+                    rpc_live = True
+                    print(f"  ✓ [batchexecute] Phiên Flow Live qua RPC nzlxg! Credits: {credits:,} ({tier})")
+        except Exception as rpc_err:
+            print(f"  ℹ️ [batchexecute] RPC nzlxg check notice: {rpc_err}")
+
+        # ── 2. Nếu đã có token OAuth2 hợp lệ (ya29...), giữ nguyên ──
+        if getattr(self, "access_token", None) and str(self.access_token).startswith("ya29."):
+            return True
+
+        # ── 3. Ưu tiên lấy OAuth2 Access Token (ya29...) từ Extension Bridge ──
+        try:
+            bridge_url = (self.captcha_bridge_url or "http://127.0.0.1:3003").rstrip("/")
+            r = self.session.get(f"{bridge_url}/accounts", timeout=3)
+            if r.status_code == 200:
+                acc_data = r.json()
+                for acc in acc_data.get("accounts", []):
+                    token_candidate = acc.get("access_token")
+                    if token_candidate and str(token_candidate).startswith("ya29."):
+                        self.access_token = token_candidate
+                        print(f"  ✓ Access token từ Extension Bridge: {self.access_token[:20]}...")
+                        return True
+        except Exception:
+            pass
+
+        # ── 4. Fallback kiểm tra session endpoint với cookies ─────────
+        try:
+            print("→ Fetching access token from labs session (fallback)...")
             url = "https://labs.google/fx/api/auth/session"
             
             # ✅ Lưu token cũ để detect token không thay đổi
@@ -5205,84 +5298,57 @@ class LabsFlowClient:
                 url,
                 headers=self._labs_headers(),
                 cookies=self.cookies,
-                timeout=60,
+                timeout=30,
             )
-            resp.raise_for_status()
             
-            if resp.status_code != 200:
-                print(f"  ✗ Session returned status {resp.status_code}")
-                return False
-            
-            try:
-                data = resp.json()
-            except Exception:
-                print("  ✗ Session response is not JSON")
-                return False
-            
-            # Try direct access_token field first
-            token = None
-            if isinstance(data, dict):
-                token = data.get("access_token")
-                # ✅ Log thêm thông tin session để debug 401
-                expires_str = data.get("expires") or data.get("accessTokenExpires") or data.get("exp")
-                if expires_str:
-                    print(f"  📋 [Session] Token expires: {expires_str}")
-                # Log session user info nếu có
-                user_info = data.get("user", {})
-                if user_info:
-                    print(f"  📋 [Session] User: {user_info.get('email', user_info.get('name', 'unknown'))}")
-                if not token:
-                    token = _extract_bearer_like(data)
-            
-            if not token:
-                print("  ✗ No access_token found in session response")
-                print(f"  Response: {json.dumps(data, indent=2)}")
-                # Fallbacks: env vars and local files
-                # 1) Environment variables
-                env_token = _normalize_bearer(_env("ACCESS_TOKEN") or _env("BEARER_TOKEN"))
-                if env_token:
-                    self.access_token = env_token
-                    print("  ✓ Access token from environment variables")
-                    return True
-                # 2) Local files commonly used to store bearer tokens
-                candidate_files = [
-                    _env("BEARER_TOKEN_FILE"),
-                    "bearer.token",
-                    "access_token.txt",
-                    "token.txt",
-                ]
-                for fp in candidate_files:
-                    if not fp:
-                        continue
-                    content = _read_file(fp)
-                    token_from_file = _normalize_bearer(content)
-                    if token_from_file:
-                        self.access_token = token_from_file
-                        print(f"  ✓ Access token loaded from file: {fp}")
-                        return True
-                return False
-            
-            self.access_token = token
-            
-            # ✅ Detect token không thay đổi → có thể session expired
-            if old_token and token == old_token:
-                if not hasattr(self, '_same_token_count'):
-                    self._same_token_count = 0
-                self._same_token_count += 1
-                print(f"  ⚠️ [Token] Cùng token sau {self._same_token_count} lần fetch (có thể session expired)")
-                # Log full response khi token không đổi nhiều lần
-                if self._same_token_count >= 2:
-                    print(f"  📋 [Token Debug] Full session response keys: {list(data.keys()) if isinstance(data, dict) else type(data)}")
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                    token = None
                     if isinstance(data, dict):
-                        # Log token length và expiry info
-                        print(f"  📋 [Token Debug] Token length: {len(token)}, starts: {token[:30]}..., ends: ...{token[-20:]}")
-            else:
-                self._same_token_count = 0
+                        token = data.get("access_token")
+                        if not token:
+                            token = _extract_bearer_like(data)
+                    if token:
+                        self.access_token = token
+                        print(f"  ✓ Access token retrieved: {token[:20]}...")
+                        return True
+                except Exception:
+                    pass
             
-            print(f"  ✓ Access token retrieved: {token[:20]}...")
-            return True
+            # Fallbacks: env vars and local files
+            env_token = _normalize_bearer(_env("ACCESS_TOKEN") or _env("BEARER_TOKEN"))
+            if env_token:
+                self.access_token = env_token
+                print("  ✓ Access token from environment variables")
+                return True
+
+            candidate_files = [
+                _env("BEARER_TOKEN_FILE"),
+                "bearer.token",
+                "access_token.txt",
+                "token.txt",
+            ]
+            for fp in candidate_files:
+                if not fp:
+                    continue
+                content = _read_file(fp)
+                token_from_file = _normalize_bearer(content)
+                if token_from_file:
+                    self.access_token = token_from_file
+                    print(f"  ✓ Access token loaded from file: {fp}")
+                    return True
+
+            # If access_token was already set earlier, keep it
+            if self.access_token:
+                return True
+
+            print("  ✗ No access token found and Flow extension not connected yet")
+            return False
             
         except Exception as e:
+            if self.access_token:
+                return True
             print(f"  ✗ Failed to fetch access token: {e}")
             return False
     
@@ -5411,18 +5477,87 @@ class LabsFlowClient:
         # ✅ FIX (flow2api fallback): Thêm sessionId vào clientContext - flow2api luôn gửi sessionId
         batch_id = str(uuid.uuid4())
         session_id = self._generate_session_id()
+        effective_tier = user_tier
+        if hasattr(self, 'user_tier') and self.user_tier:
+            ut = str(self.user_tier).upper()
+            if "1" in ut or "ONE" in ut or "PRO" in ut or "3" in ut:
+                effective_tier = "PAYGATE_TIER_ONE"
+            elif "2" in ut or "TWO" in ut or "ULTRA" in ut:
+                effective_tier = "PAYGATE_TIER_TWO"
+
         payload = {
             "mediaGenerationContext": {"batchId": batch_id, "audioFailurePreference": "BLOCK_SILENCED_VIDEOS"},
             "clientContext": {
                 "sessionId": session_id,
                 "projectId": project_id,
                 "tool": tool,
-                "userPaygateTier": user_tier,
+                "userPaygateTier": effective_tier,
             },
             "requests": requests_body,
             "useV2ModelConfig": True,
         }
+
+        # ── 1. Ưu tiên sinh Video qua Google Flow batchexecute RPC (eb1hJf) ──
+        try:
+            target_proj = project_id or getattr(self, "flow_project_id", None) or DEFAULT_PROJECT_ID
+            dur = 4 if ("4s" in (model_key or "") or "lite_4s" in (model_key or "")) else 8
+            target_model = resolve_video_model(model_key, duration=dur)
+            vid_aspect = resolve_video_aspect(mapped_aspect)
+
+            print(f"  🌱 [batchexecute] Sinh seed base frame cho T2V qua RPC ogiZ0b...")
+            img_freq = image_request(
+                prompt=clean_prompt,
+                project_id=target_proj,
+                count=1,
+                aspect=mapped_aspect,
+                seed=seeds[0] if seeds else None,
+            )
+            img_res = self.batch_rpc(RPC_GEN_IMAGE, img_freq, captcha_action=CAPTCHA_IMAGE, timeout=60)
+            seed_media_id = None
+            if img_res.get("ok"):
+                raw_img = img_res.get("data", "")
+                if raw_img:
+                    payload_img = first_payload(raw_img, RPC_GEN_IMAGE)
+                    imgs = read_images(payload_img)
+                    if imgs:
+                        seed_media_id = imgs[0].media_id
+                        print(f"  ✓ [batchexecute] Seed base frame media_id={seed_media_id}")
+
+            if seed_media_id:
+                print(f"  🎬 [batchexecute] Khởi tạo video Veo 3.1 qua RPC eb1hJf (model: {target_model})...")
+                rpc_operations = []
+                for i in range(num_videos):
+                    vid_freq = video_request(
+                        prompt=clean_prompt,
+                        project_id=target_proj,
+                        source_media_id=seed_media_id,
+                        aspect=vid_aspect,
+                        model=target_model,
+                    )
+                    vid_res = self.batch_rpc(RPC_GEN_VIDEO, vid_freq, captcha_action=CAPTCHA_VIDEO, timeout=90)
+                    if not vid_res.get("ok"):
+                        print(f"  ⚠️ [batchexecute] eb1hJf attempt failed: {vid_res.get('error')}")
+                        break
+                    raw_vid = vid_res.get("data", "")
+                    payload_vid = first_payload(raw_vid, RPC_GEN_VIDEO)
+                    media_id, op_id = read_video_media_id(payload_vid)
+                    if media_id:
+                        op_entry = {
+                            "name": op_id or media_id,
+                            "operationId": op_id or media_id,
+                            "mediaId": media_id,
+                            "sceneId": scene_ids[i] if i < len(scene_ids) else str(uuid.uuid4()),
+                            "status": "ACTIVE",
+                        }
+                        rpc_operations.append(op_entry)
+                        print(f"  ✓ [batchexecute] Video đã khởi tạo: media_id={media_id}, op_id={op_id}")
+
+                if rpc_operations:
+                    return rpc_operations
+        except Exception as rpc_err:
+            print(f"  ℹ️ [batchexecute] T2V notice: {rpc_err}")
         
+        # ── 2. Fallback REST API cũ ──────────────────────────────────────────
         # ✅ Lock được giữ liên tục từ khi request token đến khi gọi API xong (nối đuôi hoàn toàn)
         # Đảm bảo không có khoảng trống giữa các bước
         with self._token_and_api_with_lock():
@@ -5701,6 +5836,40 @@ class LabsFlowClient:
     
     def check_video_status(self, operations: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         """Check the status of video generation operations."""
+        # ── 1. Ưu tiên polling qua batchexecute RPC (as29s) ──
+        has_rpc_media = any(bool(op.get("mediaId")) for op in (operations or []) if isinstance(op, dict))
+        if has_rpc_media:
+            updated_ops = []
+            for op in operations:
+                if not isinstance(op, dict):
+                    continue
+                op_copy = dict(op)
+                media_id = op.get("mediaId")
+                if media_id:
+                    try:
+                        freq = media_request(media_id)
+                        res = self.batch_rpc(RPC_MEDIA, freq, timeout=30)
+                        if res.get("ok"):
+                            raw = res.get("data", "")
+                            if raw:
+                                payload = first_payload(raw, RPC_MEDIA)
+                                urls = read_media_urls(payload, media_id)
+                                if urls.video:
+                                    op_copy["status"] = "COMPLETE"
+                                    op_copy["video"] = {
+                                        "url": urls.video,
+                                        "fifeUrl": urls.video,
+                                        "mediaUrl": urls.video,
+                                    }
+                                    print(f"  ✓ [batchexecute] Video sẵn sàng: {urls.video[:60]}...")
+                                else:
+                                    op_copy["status"] = "ACTIVE"
+                    except Exception:
+                        pass
+                updated_ops.append(op_copy)
+            return {"operations": updated_ops}
+
+        # ── 2. Fallback REST polling ──
         try:
             url = "https://aisandbox-pa.googleapis.com/v1/video:batchCheckAsyncVideoGenerationStatus"
             payload = {"operations": operations}
@@ -5734,8 +5903,8 @@ class LabsFlowClient:
     def upload_flow_image(self, image_path: str, max_retries: int = 3) -> Optional[str]:
         """Upload image specifically for Flow (Image-to-Image reference).
         
-        Uses the correct Flow endpoint: v1/flow/uploadImage
-        Returns plain media ID like "5899c158-..." instead of asset key "CAM..."
+        Uses batchexecute RPC maseQ with fallback to v1/flow/uploadImage.
+        Returns plain media ID like "5899c158-..."
         
         Args:
             image_path: Path to image file
@@ -5744,9 +5913,38 @@ class LabsFlowClient:
         Returns:
             Media ID string (plain UUID format) or None on failure
         """
-        # Ensure we have flow_project_id for this upload
-        flow_project_id = getattr(self, 'flow_project_id', None) or "f29ebccd-1f46-4bd4-91ad-b1f4a093878f"
+        flow_project_id = getattr(self, 'flow_project_id', None) or DEFAULT_PROJECT_ID
+
+        # ── 1. Ưu tiên upload qua batchexecute RPC (maseQ) ──
+        try:
+            with open(image_path, 'rb') as f:
+                image_data = f.read()
+            image_b64 = base64.b64encode(image_data).decode('utf-8')
+            import mimetypes
+            mime_type, _ = mimetypes.guess_type(image_path)
+            if not mime_type:
+                mime_type = "image/jpeg"
+            filename = os.path.basename(image_path)
+
+            freq = upload_request(
+                image_b64=image_b64,
+                project_id=flow_project_id,
+                mime_type=mime_type,
+                file_name=filename,
+            )
+            res = self.batch_rpc(RPC_UPLOAD_IMAGE, freq, captcha_action=CAPTCHA_IMAGE, timeout=60)
+            if res.get("ok"):
+                raw = res.get("data", "")
+                if raw:
+                    payload = first_payload(raw, RPC_UPLOAD_IMAGE)
+                    media_id = read_uploaded_media_id(payload)
+                    if media_id:
+                        print(f"  ✓ [batchexecute] Ảnh upload thành công qua RPC maseQ: media_id={media_id}")
+                        return media_id
+        except Exception as rpc_err:
+            print(f"  ℹ️ [batchexecute] Upload RPC notice: {rpc_err}")
         
+        # ── 2. Fallback REST upload ──
         for attempt in range(max_retries):
             try:
                 if attempt > 0:
@@ -6148,6 +6346,14 @@ class LabsFlowClient:
         # - Dùng recaptchaContext thay vì recaptchaToken
         batch_id = str(uuid.uuid4())
         session_id = f";{int(time.time() * 1000)}"
+        effective_tier = user_tier
+        if hasattr(self, 'user_tier') and self.user_tier:
+            ut = str(self.user_tier).upper()
+            if "1" in ut or "ONE" in ut or "PRO" in ut or "3" in ut:
+                effective_tier = "PAYGATE_TIER_ONE"
+            elif "2" in ut or "TWO" in ut or "ULTRA" in ut:
+                effective_tier = "PAYGATE_TIER_TWO"
+
         payload = {
             "mediaGenerationContext": {
                 "batchId": batch_id,
@@ -6156,13 +6362,57 @@ class LabsFlowClient:
             "clientContext": {
                 "projectId": project_id,
                 "tool": tool,
-                "userPaygateTier": user_tier,
+                "userPaygateTier": effective_tier,
                 "sessionId": session_id,  # ✅ Thêm sessionId theo format curl
             },
             "requests": requests_body,
             "useV2ModelConfig": True,
         }
+
+        # ── 1. Ưu tiên sinh Video I2V qua Google Flow batchexecute RPC (eb1hJf) ──
+        try:
+            target_proj = project_id or getattr(self, "flow_project_id", None) or DEFAULT_PROJECT_ID
+            dur = 4 if ("4s" in (model_key or "") or "lite_4s" in (model_key or "")) else 8
+            target_model = resolve_video_model(model_key, duration=dur)
+            vid_aspect = resolve_video_aspect(mapped_aspect)
+
+            if media_id:
+                print(f"  🎬 [batchexecute] Khởi tạo I2V Veo 3.1 qua RPC eb1hJf (model: {target_model}, media_id={media_id})...")
+                rpc_operations = []
+                for i in range(num_videos):
+                    vid_freq = video_request(
+                        prompt=clean_prompt,
+                        project_id=target_proj,
+                        source_media_id=media_id,
+                        aspect=vid_aspect,
+                        model=target_model,
+                        seed=seeds[i] if seeds else None,
+                        crop_coordinates=crop_coordinates,
+                    )
+                    vid_res = self.batch_rpc(RPC_GEN_VIDEO, vid_freq, captcha_action=CAPTCHA_VIDEO, timeout=90)
+                    if not vid_res.get("ok"):
+                        print(f"  ⚠️ [batchexecute] I2V eb1hJf attempt failed: {vid_res.get('error')}")
+                        break
+                    raw_vid = vid_res.get("data", "")
+                    payload_vid = first_payload(raw_vid, RPC_GEN_VIDEO)
+                    res_media_id, op_id = read_video_media_id(payload_vid)
+                    if res_media_id:
+                        op_entry = {
+                            "name": op_id or res_media_id,
+                            "operationId": op_id or res_media_id,
+                            "mediaId": res_media_id,
+                            "sceneId": scene_ids[i] if i < len(scene_ids) else str(uuid.uuid4()),
+                            "status": "ACTIVE",
+                        }
+                        rpc_operations.append(op_entry)
+                        print(f"  ✓ [batchexecute] I2V video đã khởi tạo: media_id={res_media_id}, op_id={op_id}")
+
+                if rpc_operations:
+                    return rpc_operations
+        except Exception as rpc_err:
+            print(f"  ℹ️ [batchexecute] I2V notice: {rpc_err}")
         
+        # ── 2. Fallback REST API cũ ──────────────────────────────────────────
         # Đảm bảo toàn bộ quá trình lấy token + gọi API được nối đuôi, không bị chen giữa
         with self._token_and_api_with_lock():
             max_retries = 5
@@ -6485,6 +6735,14 @@ class LabsFlowClient:
         batch_id = str(uuid.uuid4())
         # ✅ Thêm sessionId theo format: ";timestamp"
         session_id = f";{int(time.time() * 1000)}"
+        effective_tier = user_tier
+        if hasattr(self, 'user_tier') and self.user_tier:
+            ut = str(self.user_tier).upper()
+            if "1" in ut or "ONE" in ut or "PRO" in ut or "3" in ut:
+                effective_tier = "PAYGATE_TIER_ONE"
+            elif "2" in ut or "TWO" in ut or "ULTRA" in ut:
+                effective_tier = "PAYGATE_TIER_TWO"
+
         payload: Dict[str, Any] = {
             "mediaGenerationContext": {
                 "batchId": batch_id,
@@ -6493,7 +6751,7 @@ class LabsFlowClient:
             "clientContext": {
                 "projectId": project_id,
                 "tool": tool,
-                "userPaygateTier": user_tier,
+                "userPaygateTier": effective_tier,
                 "sessionId": session_id,  # ✅ Thêm sessionId theo format WebUI
             },
             "requests": requests_body,
@@ -7335,10 +7593,59 @@ class LabsFlowClient:
         if not requests_payload:
             self.last_error_detail = "Empty Flow image payload"
             return None
-        project = project_id or self.flow_project_id
-        if not project:
-            self.last_error_detail = "Missing FLOW_PROJECT_ID"
-            return None
+        project = project_id or getattr(self, "flow_project_id", None) or DEFAULT_PROJECT_ID
+
+        # ── 1. Ưu tiên sinh ảnh qua Google Flow batchexecute RPC (ogiZ0b) ──
+        try:
+            first_req = requests_payload[0] if requests_payload else {}
+            prompt_str = ""
+            if isinstance(first_req, dict):
+                prompt_str = (
+                    first_req.get("prompt")
+                    or first_req.get("textInput", {}).get("prompt")
+                    or ""
+                )
+                if not prompt_str and isinstance(first_req.get("textInput", {}).get("structuredPrompt", {}).get("parts"), list):
+                    parts = first_req["textInput"]["structuredPrompt"]["parts"]
+                    if parts and isinstance(parts[0], dict):
+                        prompt_str = parts[0].get("text", "")
+            
+            aspect_str = (first_req.get("aspectRatio") if isinstance(first_req, dict) else None) or "IMAGE_ASPECT_RATIO_LANDSCAPE"
+            count = len(requests_payload)
+
+            if prompt_str:
+                print(f"  🎨 [batchexecute] Sinh {count} ảnh qua RPC ogiZ0b...")
+                img_freq = image_request(
+                    prompt=prompt_str,
+                    project_id=project,
+                    count=count,
+                    aspect=aspect_str,
+                )
+                img_res = self.batch_rpc(RPC_GEN_IMAGE, img_freq, captcha_action=CAPTCHA_IMAGE, timeout=90)
+                if img_res.get("ok"):
+                    raw_img = img_res.get("data", "")
+                    payload_img = first_payload(raw_img, RPC_GEN_IMAGE)
+                    imgs = read_images(payload_img)
+                    if imgs:
+                        print(f"  ✓ [batchexecute] Sinh thành công {len(imgs)} ảnh qua RPC ogiZ0b")
+                        media_list = []
+                        for item in imgs:
+                            media_list.append({
+                                "name": item.media_id,
+                                "image": {
+                                    "generatedImage": {
+                                        "fifeUrl": item.url or item.fife_url,
+                                        "mediaId": item.media_id,
+                                    }
+                                },
+                                "signedUri": item.url or item.fife_url,
+                                "fifeUrl": item.url or item.fife_url,
+                            })
+                        return {"media": media_list}
+        except Exception as rpc_err:
+            print(f"  ℹ️ [batchexecute] Flow image notice: {rpc_err}")
+
+        # ── 2. Fallback REST API cũ ──────────────────────────────────────────
         url = f"https://aisandbox-pa.googleapis.com/v1/projects/{project}/flowMedia:batchGenerateImages"
         
         # Bỏ check live status - chạy trực tiếp

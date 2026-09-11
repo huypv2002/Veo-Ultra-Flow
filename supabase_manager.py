@@ -13,7 +13,10 @@ import hashlib
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any
 import requests
-import bcrypt  # Database lưu bcrypt hash
+try:
+    import bcrypt  # Database lưu bcrypt hash
+except ImportError:
+    bcrypt = None
 
 from subscription_policies import (
     get_subscription_limits,

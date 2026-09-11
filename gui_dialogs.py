@@ -23,8 +23,25 @@ class ClickableLabel(QLabel):
         super().mouseReleaseEvent(event)
 
 
-class CookieManagerDialog(QDialog):
-    """Dialog quản lý cookie dạng grid, chỉ hỗ trợ paste trực tiếp."""
+def format_plan_name(tier: Any) -> str:
+    """Chuẩn hóa tên gói dịch vụ Google Flow (Ultra vs Pro)."""
+    if not tier:
+        return "Tự động nhận diện"
+    t = str(tier).strip().upper()
+    if "2" in t or "TWO" in t or "ULTRA" in t:
+        return "⚡ Ultra (Tier 2)"
+    elif "1" in t or "ONE" in t or "PRO" in t or "3" in t or "THREE" in t:
+        return "🔷 Pro (Tier 1)"
+    elif "0" in t or "FREE" in t or "NOT_PAID" in t:
+        return "Standard / Free"
+    return f"Tier {tier}"
+
+
+class AccountManagerDialog(QDialog):
+    """Dialog Quản Trị Tài Khoản Google Flow Ultra / Pro.
+    Chỉ làm việc qua quét Chrome Profiles từ tiện ích Veo Flow Bridge.
+    Tự động nhận diện Gmail, Gói Plan (Ultra/Pro), Số Credits và câng bằng tải giữa 2 Profile.
+    """
 
     REQUIRED_COOKIE_NAMES = [
         "__Host-next-auth.csrf-token",
@@ -36,186 +53,334 @@ class CookieManagerDialog(QDialog):
         self,
         parent_app,
         *,
-        title: str = "Cài Đặt Cookie",
-        header_text: str = "Cookie Manager",
+        title: str = "Quản Trị Tài Khoản",
+        header_text: str = "Quản Trị Tài Khoản (Google Flow Multi-Profile)",
         info_text: str = "",
         prefill_existing: bool = True,
     ):
-        super().__init__(parent_app)
+        super().__init__(parent_app if isinstance(parent_app, QWidget) else None)
         self.parent_app = parent_app
-        self.setWindowTitle(title)
-        self.setMinimumSize(1160, 720)
-        self.resize(1220, 760)
+        self.setWindowTitle("Quản Trị Tài Khoản Google Flow Ultra / Pro")
+        self.setMinimumSize(1100, 640)
+        self.resize(1180, 680)
 
         self.max_cookies_allowed, self.unlimited_cookies = self.parent_app._get_cookie_limit_for_dialog()
-        
-        # ✅ Cookie blocks giờ bao gồm cả label: list of (cookie_str, label)
-        # Format: [(cookie_string, label), ...]
+
+        # Danh sách tài khoản chuẩn hóa
+        # Mỗi phần tử: {email, plan, credits, tier, status, source, note, cookie, client_id}
+        self.accounts: List[Dict[str, Any]] = []
+
+        # Backward-compatible cookie_blocks: [(cookie_str, label), ...]
         self.cookie_blocks: List[Tuple[str, str]] = []
-        
-        if prefill_existing and parent_app.cookies_list:
-            # Load existing cookies (without labels - use empty labels)
-            for cookie_str in parent_app.cookies_list:
-                if hasattr(parent_app, 'cookie_labels') and parent_app.cookie_labels:
-                    # Try to get label from stored labels
-                    idx = parent_app.cookies_list.index(cookie_str)
-                    label = parent_app.cookie_labels[idx] if idx < len(parent_app.cookie_labels) else ""
-                else:
-                    label = ""
-                self.cookie_blocks.append((cookie_str, label))
+
+        # Nạp dữ liệu tài khoản đã lưu
+        if prefill_existing:
+            self._load_initial_accounts()
 
         self._build_ui(header_text, info_text)
         self._setup_refresh_timer()
         self._refresh_grid()
 
+        # Tự động quét profiles sau khi mở dialog
+        QTimer.singleShot(150, self._scan_extension_profiles)
+
+    def _load_initial_accounts(self) -> None:
+        """Nạp dữ liệu tài khoản từ app và file cache .cookies_temp.json."""
+        self.accounts = []
+        saved_meta_map: Dict[str, Dict[str, Any]] = {}
+
+        # Thử đọc metadata tài khoản đã lưu từ .cookies_temp.json
+        try:
+            cookie_file = self.parent_app._get_local_cookies_file_path()
+            if os.path.exists(cookie_file):
+                with open(cookie_file, "r", encoding="utf-8") as f:
+                    cdata = json.load(f)
+                saved_meta_list = cdata.get("account_metadata", [])
+                for item in saved_meta_list:
+                    ck = item.get("cookie", "").strip()
+                    if ck:
+                        saved_meta_map[self._get_cookie_hash(ck)] = item
+                    em = item.get("email", "").strip()
+                    if em:
+                        saved_meta_map[em.lower()] = item
+        except Exception:
+            pass
+
+        # Đọc metadata từ in-memory parent_app.account_metadata nếu có
+        app_meta_list = list(getattr(self.parent_app, "account_metadata", []) or [])
+        for item in app_meta_list:
+            ck = item.get("cookie", "").strip()
+            if ck:
+                saved_meta_map[self._get_cookie_hash(ck)] = item
+            em = item.get("email", "").strip()
+            if em:
+                saved_meta_map[em.lower()] = item
+
+        # Nạp từ parent_app.cookies_list
+        cookies_list = list(getattr(self.parent_app, "cookies_list", []) or [])
+        labels_list = list(getattr(self.parent_app, "cookie_labels", []) or [])
+
+        for idx, cookie_str in enumerate(cookies_list):
+            label = labels_list[idx] if idx < len(labels_list) else ""
+            chash = self._get_cookie_hash(cookie_str)
+            meta = saved_meta_map.get(chash) or saved_meta_map.get(label.lower()) or {}
+
+            email = meta.get("email") or label or f"Profile #{idx + 1}"
+            tier = meta.get("tier") or "TIER_2"
+            plan = format_plan_name(meta.get("plan") or tier)
+            credits = meta.get("credits")
+            status = meta.get("status") or "🟢 Live (Extension)"
+            source = meta.get("source") or "🌐 Chrome Profile"
+            note = meta.get("note") or ""
+
+            acc = {
+                "email": email,
+                "plan": plan,
+                "credits": credits,
+                "tier": tier,
+                "status": status,
+                "source": source,
+                "note": note,
+                "cookie": cookie_str,
+                "client_id": meta.get("client_id", ""),
+            }
+            self.accounts.append(acc)
+
+        self._sync_cookie_blocks()
+
+    def _sync_cookie_blocks(self) -> None:
+        """Đồng bộ cookie_blocks tương thích ngược với các logic cũ."""
+        self.cookie_blocks = []
+        for acc in self.accounts:
+            ck = acc.get("cookie", "")
+            lb = acc.get("email", "")
+            self.cookie_blocks.append((ck, lb))
+
     def _build_ui(self, header_text: str, info_text: str) -> None:
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(14)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(12)
 
         shell = QFrame()
         shell.setStyleSheet("""
-            QFrame#cookieShell {
+            QFrame#accountShell {
                 background: #ffffff;
                 border: 1px solid #d8e2f0;
                 border-radius: 18px;
             }
         """)
-        shell.setObjectName("cookieShell")
+        shell.setObjectName("accountShell")
         shell_layout = QVBoxLayout(shell)
         shell_layout.setContentsMargins(20, 20, 20, 20)
-        shell_layout.setSpacing(16)
+        shell_layout.setSpacing(14)
         layout.addWidget(shell)
 
+        # ── Header Bar ──────────────────────────────────────────────
         top = QHBoxLayout()
         top.setSpacing(12)
 
         title_col = QVBoxLayout()
-        title_col.setSpacing(6)
+        title_col.setSpacing(4)
 
-        header = QLabel(header_text)
-        header.setStyleSheet("font-size: 22px; font-weight: 700; color: #0f172a;")
+        header = QLabel("👤 Quản Trị Tài Khoản (Google Flow Multi-Profile)")
+        header.setStyleSheet("font-size: 22px; font-weight: 800; color: #0f172a;")
         title_col.addWidget(header)
 
-        limit_text = "Không giới hạn" if self.unlimited_cookies else f"{self.max_cookies_allowed} cookie"
         subtitle = QLabel(
-            f"{info_text}\nGiới hạn hiện tại: {limit_text}. Mỗi cookie nên là một block riêng, cách nhau bằng một dòng trống."
+            "Tự động quét và nhận diện tài khoản Google Flow từ các Profile Chrome đang mở. "
+            "Hiển thị chính xác Gmail, Gói Plan (Ultra/Pro), Số Credits còn lại và cân bằng tải tự động."
         )
         subtitle.setWordWrap(True)
         subtitle.setStyleSheet("color: #475569; font-size: 12px; line-height: 1.4;")
         title_col.addWidget(subtitle)
-
         top.addLayout(title_col, 1)
 
-        badge = QLabel("Direct Paste Only")
-        badge.setAlignment(Qt.AlignCenter)
-        badge.setFixedHeight(34)
-        badge.setStyleSheet("""
+        # Badges góc phải
+        badges_col = QVBoxLayout()
+        badges_col.setSpacing(4)
+        badges_col.setAlignment(Qt.AlignRight | Qt.AlignTop)
+
+        b_row = QHBoxLayout()
+        b_row.setSpacing(8)
+
+        badge_multi = QLabel("⚡ Multi-Profile Ready")
+        badge_multi.setAlignment(Qt.AlignCenter)
+        badge_multi.setFixedHeight(30)
+        badge_multi.setStyleSheet("""
             QLabel {
-                padding: 0 14px;
-                background: #e0f2fe;
-                color: #0369a1;
-                border: 1px solid #bae6fd;
-                border-radius: 17px;
-                font-size: 12px;
+                padding: 0 12px;
+                background: #ecfdf5;
+                color: #047857;
+                border: 1px solid #a7f3d0;
+                border-radius: 15px;
+                font-size: 11px;
                 font-weight: 700;
             }
         """)
-        top.addWidget(badge, 0, Qt.AlignTop)
+        b_row.addWidget(badge_multi)
+
+        badge_port = QLabel("🌐 Bridge: 127.0.0.1:3003")
+        badge_port.setAlignment(Qt.AlignCenter)
+        badge_port.setFixedHeight(30)
+        badge_port.setStyleSheet("""
+            QLabel {
+                padding: 0 12px;
+                background: #eff6ff;
+                color: #1d4ed8;
+                border: 1px solid #bfdbfe;
+                border-radius: 15px;
+                font-size: 11px;
+                font-weight: 700;
+            }
+        """)
+        b_row.addWidget(badge_port)
+        badges_col.addLayout(b_row)
+
+        top.addLayout(badges_col)
         shell_layout.addLayout(top)
 
-        content = QHBoxLayout()
-        content.setSpacing(16)
-        shell_layout.addLayout(content, 1)
-
-        left_card = self._make_card("Dán Cookie", "Paste từng cookie hoặc nhiều cookie cùng lúc.")
-        left_layout = left_card.layout()
-
-        self.cookie_edit = QTextEdit()
-        self.cookie_edit.setPlaceholderText(
-            "Ví dụ:\n__Host-next-auth.csrf-token=...; __Secure-next-auth.callback-url=...; __Secure-next-auth.session-token=...\n\n"
-            "Cookie thứ 2 đặt cách nhau bằng 1 dòng trống."
-        )
-        self.cookie_edit.setMinimumHeight(340)
-        self.cookie_edit.setStyleSheet("""
-            QTextEdit {
-                border: 1px solid #cbd5e1;
+        # ── Banner Hướng Dẫn 2 Profile Chrome ────────────────────────
+        guide_banner = QFrame()
+        guide_banner.setStyleSheet("""
+            QFrame {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #f0fdf4, stop:1 #eff6ff);
+                border: 1px solid #bbf7d0;
                 border-radius: 12px;
-                padding: 12px;
-                background: #f8fafc;
-                color: #0f172a;
-                font-family: 'SF Mono', 'Menlo', 'Consolas', monospace;
-                font-size: 12px;
+                padding: 10px 14px;
             }
         """)
-        left_layout.addWidget(self.cookie_edit, 1)
+        guide_layout = QHBoxLayout(guide_banner)
+        guide_layout.setContentsMargins(14, 10, 14, 10)
+        guide_layout.setSpacing(12)
 
-        # ✅ Label input field
-        label_row = QHBoxLayout()
-        label_row.setSpacing(10)
-        
-        label_hint = QLabel("Nhãn cookie (tùy chọn):")
-        label_hint.setStyleSheet("color: #475569; font-size: 12px;")
-        label_row.addWidget(label_hint)
-        
-        self.label_edit = QLineEdit()
-        self.label_edit.setPlaceholderText("Nhập nhãn để dễ nhận diện cookie (ví dụ: tên tài khoản)")
-        self.label_edit.setStyleSheet("""
-            QLineEdit {
-                border: 1px solid #cbd5e1;
+        guide_icon = QLabel("💡")
+        guide_icon.setStyleSheet("font-size: 24px;")
+        guide_layout.addWidget(guide_icon, 0, Qt.AlignVCenter)
+
+        guide_text = QLabel(
+            "<b>Hướng dẫn sử dụng nhiều Profile Chrome (Ultra & Pro):</b><br/>"
+            "• Mở <b>Chrome Profile 1</b> (Tài khoản Ultra) và <b>Chrome Profile 2</b> (Tài khoản Pro / Ultra).<br/>"
+            "• Đảm bảo tiện ích <b>Veo Flow Bridge</b> đã được BẬT ở cả 2 profile và đang mở tab <code>flow.google.com</code>.<br/>"
+            "• Bấm nút <b>'🔄 Quét Extension Profiles'</b> (hoặc hệ thống tự quét khi mở). Hệ thống sẽ tự động cân bằng tải luân phiên giữa 2 profile khi tạo video!"
+        )
+        guide_text.setWordWrap(True)
+        guide_text.setStyleSheet("color: #166534; font-size: 12px; line-height: 1.5;")
+        guide_layout.addWidget(guide_text, 1)
+
+        shell_layout.addWidget(guide_banner)
+
+        # ── Bảng Danh Sách Tài Khoản (Chiếm Trọn Chiều Rộng) ─────────
+        table_card = QFrame()
+        table_card.setStyleSheet("""
+            QFrame {
+                background: #ffffff;
+                border: 1px solid #e2e8f0;
+                border-radius: 16px;
+            }
+        """)
+        table_layout = QVBoxLayout(table_card)
+        table_layout.setContentsMargins(16, 16, 16, 16)
+        table_layout.setSpacing(12)
+
+        # ── Toolbar trên bảng: Hàng 1 (Tiêu đề + Nút thao tác) ────────
+        top_bar = QHBoxLayout()
+        top_bar.setSpacing(10)
+
+        card_title = QLabel("📋 Danh Sách Chrome Profile Đã Kết Nối")
+        card_title.setStyleSheet("font-size: 15px; font-weight: 800; color: #0f172a;")
+        top_bar.addWidget(card_title, 1)
+
+        # Nút Quét Extension Profiles
+        self.btn_scan_extension = QPushButton("🔄 Quét Extension Profiles")
+        self.btn_scan_extension.setToolTip("Quét tất cả Profile Chrome đang mở có gắn extension Veo Flow Bridge")
+        self.btn_scan_extension.setStyleSheet("""
+            QPushButton {
+                background: #0284c7;
+                color: white;
+                font-weight: 700;
+                padding: 9px 18px;
                 border-radius: 8px;
-                padding: 8px;
-                background: #f8fafc;
-                color: #0f172a;
-                font-size: 12px;
+                font-size: 13px;
             }
+            QPushButton:hover { background: #0369a1; }
         """)
-        label_row.addWidget(self.label_edit)
-        left_layout.addLayout(label_row)
+        self.btn_scan_extension.clicked.connect(self._scan_extension_profiles)
+        top_bar.addWidget(self.btn_scan_extension)
 
-        input_actions = QHBoxLayout()
-        input_actions.setSpacing(10)
+        # Nút Làm Mới Credits
+        self.btn_check_all_credits = QPushButton("⚡ Làm Mới Credits")
+        self.btn_check_all_credits.setToolTip("Cập nhật lại số credits và gói plan mới nhất từ các Profile Chrome")
+        self.btn_check_all_credits.setStyleSheet("""
+            QPushButton {
+                background: #7c3aed;
+                color: white;
+                font-weight: 700;
+                padding: 9px 18px;
+                border-radius: 8px;
+                font-size: 13px;
+            }
+            QPushButton:hover { background: #6d28d9; }
+        """)
+        self.btn_check_all_credits.clicked.connect(self._scan_extension_profiles)
+        top_bar.addWidget(self.btn_check_all_credits)
 
-        self.btn_add = QPushButton("Thêm vào bảng")
-        self.btn_add.setStyleSheet(self._primary_button_style())
-        self.btn_add.clicked.connect(self._add_from_input)
-        input_actions.addWidget(self.btn_add)
+        # Nút Xóa dòng chọn
+        self.btn_remove = QPushButton("🗑️ Xóa dòng chọn")
+        self.btn_remove.setStyleSheet(self._secondary_button_style())
+        self.btn_remove.clicked.connect(self._remove_selected)
+        top_bar.addWidget(self.btn_remove)
 
-        self.btn_load_current = QPushButton("Nạp cookie hiện tại")
-        self.btn_load_current.setStyleSheet(self._secondary_button_style())
-        self.btn_load_current.clicked.connect(self._load_current_to_grid)
-        input_actions.addWidget(self.btn_load_current)
+        # Nút Xóa toàn bộ
+        self.btn_clear_grid = QPushButton("🗑️ Xóa toàn bộ")
+        self.btn_clear_grid.setStyleSheet(self._danger_button_style())
+        self.btn_clear_grid.clicked.connect(self._clear_grid)
+        top_bar.addWidget(self.btn_clear_grid)
 
-        self.btn_clear_input = QPushButton("Xóa ô nhập")
-        self.btn_clear_input.setStyleSheet(self._secondary_button_style())
-        self.btn_clear_input.clicked.connect(self.cookie_edit.clear)
-        input_actions.addWidget(self.btn_clear_input)
-        input_actions.addStretch()
-        left_layout.addLayout(input_actions)
+        table_layout.addLayout(top_bar)
 
-        content.addWidget(left_card, 5)
+        # ── Hàng 2: Dãy Thẻ Thống Kê (Stat Badges) ────────────────────
+        self.stats_bar = QHBoxLayout()
+        self.stats_bar.setSpacing(8)
 
-        right_card = self._make_card("Bảng Cookie", "Danh sách cookie hiện sẽ được dùng bởi app.")
-        right_layout = right_card.layout()
+        self.chip_total = QLabel("👥 Tổng: 0 tài khoản")
+        self.chip_total.setStyleSheet("padding: 5px 12px; background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 12px; font-weight: 700; color: #334155; font-size: 12px;")
+        self.stats_bar.addWidget(self.chip_total)
 
-        summary_row = QHBoxLayout()
-        summary_row.setSpacing(10)
-        self.summary_label = QLabel("")
-        self.summary_label.setStyleSheet("font-size: 12px; color: #334155; font-weight: 600;")
-        summary_row.addWidget(self.summary_label)
-        summary_row.addStretch()
-        right_layout.addLayout(summary_row)
+        self.chip_active = QLabel("🟢 0 Sẵn sàng")
+        self.chip_active.setStyleSheet("padding: 5px 12px; background: #ecfdf5; border: 1px solid #a7f3d0; border-radius: 12px; font-weight: 700; color: #047857; font-size: 12px;")
+        self.stats_bar.addWidget(self.chip_active)
 
+        self.chip_ultra = QLabel("⚡ 0 Ultra")
+        self.chip_ultra.setStyleSheet("padding: 5px 12px; background: #f5f3ff; border: 1px solid #ddd6fe; border-radius: 12px; font-weight: 700; color: #6d28d9; font-size: 12px;")
+        self.stats_bar.addWidget(self.chip_ultra)
+
+        self.chip_pro = QLabel("🔷 0 Pro")
+        self.chip_pro.setStyleSheet("padding: 5px 12px; background: #f0f9ff; border: 1px solid #bae6fd; border-radius: 12px; font-weight: 700; color: #0369a1; font-size: 12px;")
+        self.stats_bar.addWidget(self.chip_pro)
+
+        self.chip_credits = QLabel("💎 Tổng: 0 Credits")
+        self.chip_credits.setStyleSheet("padding: 5px 12px; background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 12px; font-weight: 700; color: #15803d; font-size: 12px;")
+        self.stats_bar.addWidget(self.chip_credits)
+
+        self.stats_bar.addStretch()
+        table_layout.addLayout(self.stats_bar)
+
+        # Bảng tài khoản (7 cột hiển thị rõ ràng, không bị che khuất)
         self.cookie_table = QTableWidget()
         self.cookie_table.setColumnCount(7)
-        self.cookie_table.setHorizontalHeaderLabels(["#", "Nhãn", "Cookie", "Đủ 3 key", "Số key", "Trạng thái", "Ghi chú"])
+        self.cookie_table.setHorizontalHeaderLabels([
+            "#",
+            "Gmail / Tên tài khoản",
+            "Gói (Plan)",
+            "Số Credits",
+            "Trạng thái",
+            "Nguồn",
+            "Ghi chú",
+        ])
         self.cookie_table.verticalHeader().setVisible(False)
         self.cookie_table.setAlternatingRowColors(True)
         self.cookie_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.cookie_table.setSelectionMode(QAbstractItemView.SingleSelection)
-        # Allow editing only the Label column (column 1)
-        # Use DoubleClicked to edit, but we'll handle column checking in the handler
-        self.cookie_table.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed)
         self.cookie_table.setShowGrid(False)
         self.cookie_table.setStyleSheet("""
             QTableWidget {
@@ -224,580 +389,387 @@ class CookieManagerDialog(QDialog):
                 border: 1px solid #dbe3ef;
                 border-radius: 12px;
                 color: #0f172a;
-                font-size: 12px;
+                font-size: 13px;
             }
             QHeaderView::section {
                 background: #e2e8f0;
-                color: #334155;
+                color: #1e293b;
                 border: none;
                 border-bottom: 1px solid #cbd5e1;
-                padding: 10px 8px;
+                padding: 10px 10px;
                 font-weight: 700;
+                font-size: 12px;
             }
         """)
-        self.cookie_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self.cookie_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.cookie_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
-        self.cookie_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        self.cookie_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
-        self.cookie_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
-        self.cookie_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeToContents)
-        
-        # Connect cellChanged to update labels when edited
-        self.cookie_table.cellChanged.connect(self._on_label_cell_changed)
-        
-        right_layout.addWidget(self.cookie_table, 1)
 
-        grid_actions = QHBoxLayout()
-        grid_actions.setSpacing(10)
-        self.btn_remove = QPushButton("Xóa dòng chọn")
-        self.btn_remove.setStyleSheet(self._secondary_button_style())
-        self.btn_remove.clicked.connect(self._remove_selected)
-        grid_actions.addWidget(self.btn_remove)
+        header_view = self.cookie_table.horizontalHeader()
+        header_view.setMinimumSectionSize(50)
+        header_view.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header_view.setSectionResizeMode(1, QHeaderView.Stretch)
+        header_view.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header_view.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        header_view.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        header_view.setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        header_view.setSectionResizeMode(6, QHeaderView.ResizeToContents)
 
-        self.btn_clear_grid = QPushButton("Xóa toàn bộ")
-        self.btn_clear_grid.setStyleSheet(self._danger_button_style())
-        self.btn_clear_grid.clicked.connect(self._clear_grid)
-        grid_actions.addWidget(self.btn_clear_grid)
-        grid_actions.addStretch()
-        right_layout.addLayout(grid_actions)
+        table_layout.addWidget(self.cookie_table, 1)
+        shell_layout.addWidget(table_card, 1)
 
-        content.addWidget(right_card, 6)
-
+        # ── Footer ──────────────────────────────────────────────────
         self.status_label = QLabel("")
-        self.status_label.setStyleSheet("font-size: 12px; color: #64748b;")
+        self.status_label.setStyleSheet("font-size: 12px; color: #475569; font-weight: 500;")
         shell_layout.addWidget(self.status_label)
 
         footer = QHBoxLayout()
+        footer.setSpacing(12)
         footer.addStretch()
 
-        btn_cancel = QPushButton("Hủy")
+        btn_cancel = QPushButton("Đóng")
         btn_cancel.setStyleSheet(self._secondary_button_style())
         btn_cancel.clicked.connect(self.reject)
         footer.addWidget(btn_cancel)
 
-        self.btn_save = QPushButton("Lưu Cookie")
-        self.btn_save.setStyleSheet(self._primary_button_style())
+        self.btn_save = QPushButton("💾 Lưu & Áp Dụng Tài Khoản")
+        self.btn_save.setStyleSheet("""
+            QPushButton {
+                background: #16a34a;
+                color: white;
+                font-weight: 700;
+                padding: 11px 26px;
+                border-radius: 8px;
+                font-size: 13px;
+            }
+            QPushButton:hover { background: #15803d; }
+        """)
         self.btn_save.clicked.connect(self._save_cookies)
         footer.addWidget(self.btn_save)
+
         shell_layout.addLayout(footer)
 
     def _setup_refresh_timer(self) -> None:
-        """Create one reusable timer so the dialog can refresh runtime cookie status safely."""
+        """Timer cập nhật trạng thái runtime."""
         self._refresh_timer = QTimer(self)
-        self._refresh_timer.setInterval(3000)
-        self._refresh_timer.timeout.connect(self._refresh_grid)
+        self._refresh_timer.setInterval(4000)
+        self._refresh_timer.timeout.connect(self._sync_runtime_status)
         self._refresh_timer.start()
 
-    def _make_card(self, title: str, subtitle: str) -> QFrame:
-        card = QFrame()
-        card.setStyleSheet("""
-            QFrame {
-                background: #ffffff;
-                border: 1px solid #e2e8f0;
-                border-radius: 16px;
-            }
-        """)
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(12)
-
-        title_label = QLabel(title)
-        title_label.setStyleSheet("font-size: 15px; font-weight: 700; color: #0f172a;")
-        layout.addWidget(title_label)
-
-        subtitle_label = QLabel(subtitle)
-        subtitle_label.setWordWrap(True)
-        subtitle_label.setStyleSheet("font-size: 12px; color: #64748b;")
-        layout.addWidget(subtitle_label)
-        return card
-
-    def _primary_button_style(self) -> str:
-        return (
-            "QPushButton { background: #1976D2; color: white; font-weight: 700; padding: 10px 16px; border-radius: 8px; }"
-            "QPushButton:hover { background: #1565C0; }"
-        )
+    def _sync_runtime_status(self) -> None:
+        """Cập nhật trạng thái runtime nhẹ nhàng."""
+        self._refresh_grid(soft_update=True)
 
     def _secondary_button_style(self) -> str:
         return (
             "QPushButton { background: #ffffff; color: #334155; border: 1px solid #cbd5e1; "
-            "font-weight: 600; padding: 10px 16px; border-radius: 8px; }"
+            "font-weight: 600; padding: 9px 15px; border-radius: 8px; font-size: 12px; }"
             "QPushButton:hover { background: #f8fafc; }"
         )
 
     def _danger_button_style(self) -> str:
         return (
             "QPushButton { background: #fff1f2; color: #be123c; border: 1px solid #fecdd3; "
-            "font-weight: 700; padding: 10px 16px; border-radius: 8px; }"
+            "font-weight: 700; padding: 9px 15px; border-radius: 8px; font-size: 12px; }"
             "QPushButton:hover { background: #ffe4e6; }"
         )
 
-    def _summarize_cookie(self, cookie_str: str, cookie_index: int = -1) -> Tuple[str, bool, int, str, str, str]:
-        """Summarize cookie: returns (preview, has_all_keys, key_count, status, label, runtime_status)
-        
-        Args:
-            cookie_str: The cookie string
-            cookie_index: Index of cookie in parent_app.cookies_list for runtime status lookup
-        
-        Returns:
-            Tuple of (preview, has_all_keys, key_count, validation_status, label, runtime_status)
-            runtime_status can be: "active", "expired", "blocked", "error", "unknown"
-        """
-        try:
-            parsed = self.parent_app._parse_cookie_string(cookie_str)  # type: ignore[attr-defined]
-        except Exception:
-            parsed = None
-
-        if parsed is None:
-            try:
-                from complete_flow import _parse_cookie_string
-                parsed = _parse_cookie_string(cookie_str)
-            except Exception:
-                parsed = {}
-
-        if not parsed:
-            return cookie_str[:120], False, 0, "Parse thất bại", "", "error"
-
-        names = list(parsed.keys())
-        missing = [name for name in self.REQUIRED_COOKIE_NAMES if name not in parsed]
-        preview = "; ".join(names[:3]) if names else cookie_str[:120]
-        
-        # Determine validation status based on missing keys
-        if missing:
-            validation_status = "Thiếu " + ", ".join(missing[:2]) + ("..." if len(missing) > 2 else "")
-        else:
-            validation_status = "Hợp lệ"
-        
-        # ✅ Only show runtime status for cookies that are still exactly the
-        # same as the currently saved cookie at the same index. Newly added or
-        # edited cookies inside the dialog should stay "unknown" until saved and
-        # actually used by the app.
-        runtime_status = "unknown"
-        if cookie_index >= 0 and hasattr(self.parent_app, '_init_cookie_status'):
-            try:
-                self.parent_app._init_cookie_status()
-                current_cookies = list(getattr(self.parent_app, 'cookies_list', []) or [])
-                same_cookie_as_saved = (
-                    cookie_index < len(current_cookies)
-                    and self._get_cookie_hash(current_cookies[cookie_index]) == self._get_cookie_hash(cookie_str)
-                )
-
-                if same_cookie_as_saved:
-                    if (hasattr(self.parent_app, 'cookie_expired') and
-                        cookie_index < len(self.parent_app.cookie_expired) and
-                        self.parent_app.cookie_expired[cookie_index]):
-                        runtime_status = "expired"
-                    elif (hasattr(self.parent_app, 'cookie_errors') and
-                          cookie_index < len(self.parent_app.cookie_errors) and
-                          self.parent_app.cookie_errors[cookie_index]):
-                        error_msg = self.parent_app.cookie_errors[cookie_index] or ""
-                        if "403" in error_msg:
-                            runtime_status = "blocked"
-                        else:
-                            runtime_status = "error"
-                    elif (hasattr(self.parent_app, 'cookie_status') and
-                          cookie_index < len(self.parent_app.cookie_status) and
-                          self.parent_app.cookie_status[cookie_index]):
-                        runtime_status = "active"
-            except Exception:
-                pass
-        
-        return preview, not missing, len(parsed), validation_status, "", runtime_status
-
     def _get_cookie_hash(self, cookie_str: str) -> str:
-        """Generate a hash from cookie string to detect duplicates"""
+        """Tạo hash SHA256 nhận diện cookie trùng lặp."""
         import hashlib
         normalized = cookie_str.strip()
-        return hashlib.sha256(normalized.encode('utf-8')).hexdigest()
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
-    def _get_runtime_status_display(self, runtime_status: str) -> Tuple[str, str, str]:
-        """Get display text, color, and icon for runtime status.
-        
-        Returns:
-            (display_text, color_hex, icon)
-        """
-        if runtime_status == "active":
-            return ("🟢 Hoạt động", "#16A34A", "🟢")
-        elif runtime_status == "expired":
-            return ("🔴 Hết hạn", "#DC2626", "🔴")
-        elif runtime_status == "blocked":
-            return ("🟠 Bị chặn (403)", "#F59E0B", "🟠")
-        elif runtime_status == "error":
-            return ("🔴 Lỗi", "#DC2626", "🔴")
-        else:
-            return ("⚪ Chưa kiểm tra", "#6B7280", "⚪")
-
-    def _refresh_grid(self) -> None:
+    # ── Refresh Grid ────────────────────────────────────────────────
+    def _refresh_grid(self, soft_update: bool = False) -> None:
         self.cookie_table.blockSignals(True)
+        selected_row = self.cookie_table.currentRow()
+
         self.cookie_table.setRowCount(0)
+        total_accounts = len(self.accounts)
+        active_count = 0
+        ultra_count = 0
+        pro_count = 0
+        total_credits = 0
 
-        hash_first_row = {}
-        duplicate_rows = set()
+        for idx, acc in enumerate(self.accounts, 1):
+            email = acc.get("email") or f"Profile #{idx}"
+            tier = acc.get("tier") or "TIER_2"
+            raw_plan = acc.get("plan")
+            plan = format_plan_name(raw_plan or tier)
+            acc["plan"] = plan
+            credits = acc.get("credits")
+            status = acc.get("status") or "🟢 Live (Extension)"
+            source = acc.get("source") or "🌐 Chrome Profile"
+            note = acc.get("note") or ""
 
-        for idx, block in enumerate(self.cookie_blocks, 1):
-            if isinstance(block, tuple):
-                cookie_str, label = block
-            else:
-                cookie_str = block
-                label = ""
-            
-            # Pass cookie_index to get runtime status
-            preview, ok, key_count, validation_status, _, runtime_status = self._summarize_cookie(cookie_str, idx - 1)
-            
-            cookie_hash = self._get_cookie_hash(cookie_str)
-            first_row = hash_first_row.get(cookie_hash)
-            is_duplicate = first_row is not None
-            if first_row is None:
-                hash_first_row[cookie_hash] = idx
-            else:
-                duplicate_rows.add(first_row)
-                duplicate_rows.add(idx)
-            
+            if "Live" in status or "Hoạt động" in status or "Sẵn sàng" in status:
+                active_count += 1
+            if "Ultra" in plan:
+                ultra_count += 1
+            elif "Pro" in plan:
+                pro_count += 1
+            if isinstance(credits, (int, float)):
+                total_credits += int(credits)
+
             row = self.cookie_table.rowCount()
             self.cookie_table.insertRow(row)
 
-            # Column 0: Index
-            idx_item = QTableWidgetItem(str(idx))
-            idx_item.setTextAlignment(Qt.AlignCenter)
-            idx_item.setData(Qt.UserRole, block)
-            self.cookie_table.setItem(row, 0, idx_item)
-            
-            # Column 1: Label (editable)
-            label_item = QTableWidgetItem(label)
-            label_item.setTextAlignment(Qt.AlignCenter)
-            self.cookie_table.setItem(row, 1, label_item)
-            
-            # Column 2: Cookie preview
-            self.cookie_table.setItem(row, 2, QTableWidgetItem(preview))
+            # Cột 0: STT
+            c0 = QTableWidgetItem(str(idx))
+            c0.setTextAlignment(Qt.AlignCenter)
+            c0.setData(Qt.UserRole, acc)
+            self.cookie_table.setItem(row, 0, c0)
 
-            # Column 3: Has all 3 keys
-            key_status_item = QTableWidgetItem("OK" if ok else "Thiếu")
-            key_status_item.setTextAlignment(Qt.AlignCenter)
-            key_status_item.setForeground(QColor("#16A34A") if ok else QColor("#DC2626"))
-            self.cookie_table.setItem(row, 3, key_status_item)
+            # Cột 1: Gmail / Tên tài khoản
+            c1 = QTableWidgetItem(email)
+            c1.setFont(QFont("SF Pro Text", 12, QFont.Bold))
+            c1.setForeground(QColor("#0f172a"))
+            self.cookie_table.setItem(row, 1, c1)
 
-            # Column 4: Key count
-            count_item = QTableWidgetItem(str(key_count))
-            count_item.setTextAlignment(Qt.AlignCenter)
-            self.cookie_table.setItem(row, 4, count_item)
-            
-            # Column 5: Runtime Status (with color)
-            status_display, status_color, status_icon = self._get_runtime_status_display(runtime_status)
-            
-            # If duplicate, show duplicate warning instead
-            if is_duplicate:
-                status_display = "⚠️ Trùng lặp"
-                status_color = "#F59E0B"
-            
-            status_col_item = QTableWidgetItem(status_display)
-            status_col_item.setTextAlignment(Qt.AlignCenter)
-            status_col_item.setForeground(QColor(status_color))
-            self.cookie_table.setItem(row, 5, status_col_item)
-            
-            # Column 6: Notes
-            if is_duplicate:
-                note = f"Trùng với dòng #{first_row}"
-            elif runtime_status == "expired":
-                note = "⏰ Cookie hết hạn - Cần lấy cookie mới"
-            elif runtime_status == "blocked":
-                note = "🟠 Cookie bị chặn (403) - Cần VPN/Proxy hoặc cookie mới"
-            elif runtime_status == "error":
-                note = "⚠️ Cookie có lỗi - Kiểm tra log để biết chi tiết"
+            # Cột 2: Gói (Plan)
+            c2 = QTableWidgetItem(plan)
+            c2.setTextAlignment(Qt.AlignCenter)
+            if "Ultra" in plan:
+                c2.setForeground(QColor("#7c3aed"))
+                c2.setFont(QFont("SF Pro Text", 12, QFont.Bold))
+            elif "Pro" in plan:
+                c2.setForeground(QColor("#0284c7"))
+                c2.setFont(QFont("SF Pro Text", 12, QFont.Bold))
             else:
-                note = validation_status if validation_status.startswith("Thiếu") or validation_status == "Parse thất bại" else ""
-            
-            note_item = QTableWidgetItem(note)
-            note_item.setTextAlignment(Qt.AlignCenter)
-            if runtime_status in ("expired", "blocked", "error"):
-                note_item.setForeground(QColor("#DC2626"))
-            self.cookie_table.setItem(row, 6, note_item)
+                c2.setForeground(QColor("#64748b"))
+                c2.setFont(QFont("SF Pro Text", 11))
+            self.cookie_table.setItem(row, 2, c2)
 
-        total = len(self.cookie_blocks)
-        duplicates = len(duplicate_rows)
+            # Cột 3: Số Credits
+            cred_str = f"{credits:,}" if isinstance(credits, (int, float)) else "--"
+            c3 = QTableWidgetItem(cred_str)
+            c3.setTextAlignment(Qt.AlignCenter)
+            c3.setForeground(QColor("#16a34a"))
+            c3.setFont(QFont("SF Pro Text", 13, QFont.Bold))
+            self.cookie_table.setItem(row, 3, c3)
 
-        # Count runtime status based on the rows currently displayed in the dialog.
-        active_count = 0
-        expired_count = 0
-        blocked_count = 0
+            # Cột 4: Trạng thái
+            c4 = QTableWidgetItem(status)
+            c4.setTextAlignment(Qt.AlignCenter)
+            if "Live" in status or "Hoạt động" in status:
+                c4.setForeground(QColor("#16a34a"))
+            elif "Hết hạn" in status or "Lỗi" in status:
+                c4.setForeground(QColor("#dc2626"))
+            elif "Bị chặn" in status:
+                c4.setForeground(QColor("#f59e0b"))
+            else:
+                c4.setForeground(QColor("#64748b"))
+            self.cookie_table.setItem(row, 4, c4)
 
-        for row in range(self.cookie_table.rowCount()):
-            status_item = self.cookie_table.item(row, 5)
-            if not status_item:
-                continue
-            status_text = status_item.text()
-            if "Hoạt động" in status_text:
-                active_count += 1
-            elif "Bị chặn" in status_text:
-                blocked_count += 1
-            elif "Hết hạn" in status_text or status_text == "🔴 Lỗi":
-                expired_count += 1
-        
-        # Build summary text
-        summary_parts = [f"Tổng {total} cookie"]
-        if active_count > 0:
-            summary_parts.append(f"🟢 {active_count} active")
-        if expired_count > 0:
-            summary_parts.append(f"🔴 {expired_count} hết hạn")
-        if blocked_count > 0:
-            summary_parts.append(f"🟠 {blocked_count} bị chặn")
-        if duplicates > 0:
-            summary_parts.append(f"⚠️ {duplicates} trùng")
-        
-        self.summary_label.setText(" | ".join(summary_parts))
-        self.status_label.setText("Sẵn sàng lưu." if total else "Chưa có cookie nào trong bảng.")
+            # Cột 5: Nguồn
+            c5 = QTableWidgetItem(source)
+            c5.setTextAlignment(Qt.AlignCenter)
+            c5.setForeground(QColor("#0284c7"))
+            self.cookie_table.setItem(row, 5, c5)
+
+            # Cột 6: Ghi chú
+            c6 = QTableWidgetItem(note)
+            c6.setForeground(QColor("#64748b"))
+            self.cookie_table.setItem(row, 6, c6)
+
+        # Khôi phục dòng chọn
+        if 0 <= selected_row < self.cookie_table.rowCount():
+            self.cookie_table.selectRow(selected_row)
+
+        # Cập nhật các thẻ thống kê
+        if hasattr(self, "chip_total"):
+            self.chip_total.setText(f"👥 Tổng: {total_accounts} tài khoản")
+            self.chip_active.setText(f"🟢 {active_count} Sẵn sàng")
+            self.chip_ultra.setText(f"⚡ {ultra_count} Ultra")
+            self.chip_pro.setText(f"🔷 {pro_count} Pro")
+            self.chip_credits.setText(f"💎 Tổng: {total_credits:,} Credits")
+        if not soft_update:
+            self.status_label.setText(f"Đã tải {total_accounts} tài khoản Chrome Profile. Sẵn sàng tạo video.")
+
         self.cookie_table.blockSignals(False)
-
-    def _add_from_input(self) -> None:
-        try:
-            new_blocks = self.parent_app._split_pasted_cookie_blocks(self.cookie_edit.toPlainText())
-            if not new_blocks:
-                raise ValueError("Không có cookie nào trong ô nhập.")
-            
-            # Get label from input (if provided)
-            label = self.label_edit.text().strip() if hasattr(self, 'label_edit') else ""
-            
-            # Check for duplicates and validate
-            existing_hashes = set()
-            for block in self.cookie_blocks:
-                if isinstance(block, tuple):
-                    existing_hashes.add(self._get_cookie_hash(block[0]))
-                else:
-                    existing_hashes.add(self._get_cookie_hash(block))
-            
-            added_count = 0
-            duplicate_count = 0
-            
-            for block in new_blocks:
-                # Check if valid
-                preview, ok, _count, status = self._summarize_cookie(block)[:4]
-                if not ok:
-                    raise ValueError(f"Cookie không hợp lệ: {preview} ({status})")
-                
-                # Check for duplicate
-                cookie_hash = self._get_cookie_hash(block)
-                if cookie_hash in existing_hashes:
-                    duplicate_count += 1
-                    continue
-                
-                # Add as tuple (cookie_str, label)
-                self.cookie_blocks.append((block, label))
-                existing_hashes.add(cookie_hash)
-                added_count += 1
-            
-            self.cookie_edit.clear()
-            if hasattr(self, 'label_edit'):
-                self.label_edit.clear()
-            
-            # Show feedback
-            if duplicate_count > 0:
-                self.status_label.setText(f"Đã thêm {added_count} cookie, bỏ qua {duplicate_count} cookie trùng lặp.")
-            else:
-                self.status_label.setText(f"Đã thêm {added_count} cookie.")
-            
-            self._refresh_grid()
-        except Exception as e:
-            self.status_label.setText(str(e))
-            QMessageBox.warning(self, "Cookie không hợp lệ", str(e))
-
-    def _load_current_to_grid(self) -> None:
-        # Load existing cookies with labels preserved by row index.
-        self.cookie_blocks = []
-        current_cookies = list(getattr(self.parent_app, 'cookies_list', []) or [])
-        current_labels = list(getattr(self.parent_app, 'cookie_labels', []) or [])
-        for idx, cookie_str in enumerate(current_cookies):
-            label = current_labels[idx] if idx < len(current_labels) else ""
-            self.cookie_blocks.append((cookie_str, label))
-        self._refresh_grid()
+        self._sync_cookie_blocks()
 
     def _remove_selected(self) -> None:
         row = self.cookie_table.currentRow()
-        if row < 0 or row >= len(self.cookie_blocks):
+        if row < 0 or row >= len(self.accounts):
             return
-        self.cookie_blocks.pop(row)
+        removed = self.accounts.pop(row)
         self._refresh_grid()
-        # Immediately persist changes to parent app
-        self._save_to_parent_immediately()
+        self.status_label.setText(f"Đã xóa dòng: {removed.get('email', '')}")
 
     def _clear_grid(self) -> None:
-        self.cookie_blocks = []
-        self._refresh_grid()
-        # Immediately persist changes to parent app
-        self._save_to_parent_immediately()
+        if not self.accounts:
+            return
+        reply = QMessageBox.question(
+            self,
+            "Xác nhận",
+            "Bạn có chắc chắn muốn xóa toàn bộ danh sách tài khoản?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply == QMessageBox.Yes:
+            self.accounts = []
+            self._refresh_grid()
+            self.status_label.setText("Đã xóa sạch bảng tài khoản.")
 
-    def _save_to_parent_immediately(self) -> None:
-        """Immediately save current cookie_blocks to parent app without showing dialog popup."""
+    # ── Quét Chrome Extension Profiles (127.0.0.1:3003/accounts) ──
+    def _scan_extension_profiles(self) -> None:
+        """Kết nối Bridge Server cổng 3003 để quét tất cả Profile Chrome đang mở."""
+        self.status_label.setText("⏳ Đang quét Chrome Profiles qua Bridge Server...")
+        QApplication.processEvents()
+
         try:
-            cookie_list = []
-            labels_list = []
-            for block in self.cookie_blocks:
-                if isinstance(block, tuple):
-                    cookie_list.append(block[0])
-                    labels_list.append(block[1])
-                else:
-                    cookie_list.append(block)
-                    labels_list.append("")
+            import urllib.request
+            url = "http://127.0.0.1:3003/accounts"
+            req = urllib.request.Request(url, headers={"User-Agent": "VeoFlowManager/1.0"})
+            with urllib.request.urlopen(req, timeout=3.0) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"HTTP status {resp.status}")
+                data = json.loads(resp.read().decode("utf-8"))
 
-            if not cookie_list:
-                # All cookies deleted - clear parent app and runtime status too.
-                self.parent_app.cookies_list = []
-                self.parent_app.cookie_labels = []
-                self.parent_app.cookie_value = ""
-                self.parent_app.cookie_status = []
-                self.parent_app.cookie_errors = []
-                self.parent_app.cookie_expired = []
-                self.parent_app.cookie_task_mapping = {}
-                self.parent_app.task_cookie_mapping = {}
-                self.parent_app._save_local_cookies()
-            else:
-                # Apply updated cookie list
-                self.parent_app._apply_cookie_blocks(cookie_list)
-                # Update labels
-                if hasattr(self.parent_app, 'cookie_labels'):
-                    self.parent_app.cookie_labels = labels_list
-                self.parent_app._save_local_cookies()
+            if not data.get("ok"):
+                raise RuntimeError("Server phản hồi không hợp lệ.")
 
-            self.parent_app.log(f"🍪 Đã cập nhật {len(cookie_list)} cookie (auto-save từ Cookie Manager)")
-        except Exception as e:
-            self.parent_app.log(f"⚠️ Auto-save thất bại: {e}")
-
-    def _update_label_from_grid(self, row: int, column: int):
-        """Update label when user edits the label cell"""
-        if column == 1:  # Label column
-            item = self.cookie_table.item(row, column)
-            if item and row < len(self.cookie_blocks):
-                new_label = item.text()
-                cookie_str = self.cookie_blocks[row][0] if isinstance(self.cookie_blocks[row], tuple) else self.cookie_blocks[row]
-                self.cookie_blocks[row] = (cookie_str, new_label)
-
-    def _save_cookies(self) -> None:
-        try:
-            # Update any edited labels from the grid
-            for row in range(self.cookie_table.rowCount()):
-                label_item = self.cookie_table.item(row, 1)
-                if label_item and row < len(self.cookie_blocks):
-                    cookie_str = self.cookie_blocks[row][0] if isinstance(self.cookie_blocks[row], tuple) else self.cookie_blocks[row]
-                    self.cookie_blocks[row] = (cookie_str, label_item.text())
-
-            # Handle any pending cookies in input
-            if not self.cookie_blocks:
-                pending = self.parent_app._split_pasted_cookie_blocks(self.cookie_edit.toPlainText())
-                if pending:
-                    label = self.label_edit.text().strip() if hasattr(self, 'label_edit') else ""
-                    for block in pending:
-                        self.cookie_blocks.append((block, label))
-
-            # Extract just the cookie strings (without labels) for saving
-            cookie_list = []
-            labels_list = []
-            for block in self.cookie_blocks:
-                if isinstance(block, tuple):
-                    cookie_list.append(block[0])
-                    labels_list.append(block[1])
-                else:
-                    cookie_list.append(block)
-                    labels_list.append("")
-
-            if not cookie_list:
-                self.status_label.setText("⚠️ Không có cookie nào để lưu!")
-                QMessageBox.warning(self, "Chưa có cookie", "Vui lòng thêm ít nhất 1 cookie trước khi lưu.")
+            ext_accounts = data.get("accounts", [])
+            if not ext_accounts:
+                self.status_label.setText("⚠️ Chưa phát hiện Profile Chrome nào đang kết nối tới Bridge.")
                 return
 
-            # Block saving cookies that are already known as expired/blocked/error.
-            invalid_rows = []
-            current_cookies = list(getattr(self.parent_app, 'cookies_list', []) or [])
-            current_hash_to_rows = {}
-            for idx, current_cookie in enumerate(current_cookies):
-                try:
-                    cookie_hash = self._get_cookie_hash(current_cookie)
-                except Exception:
-                    continue
-                current_hash_to_rows.setdefault(cookie_hash, []).append(idx)
+            synced_count = 0
+            for ext in ext_accounts:
+                cid = ext.get("client_id") or ""
+                email = ext.get("email") or f"Profile ({cid})"
+                credits = ext.get("credits")
+                tier = ext.get("tier") or "TIER_2"
+                plan = format_plan_name(ext.get("plan") or tier)
+                cookie = ext.get("cookie") or ""
+                access_token = ext.get("access_token") or ""
+                source = ext.get("source") or f"🌐 Chrome Profile ({cid})"
+                status = ext.get("status") or "🟢 Live (Extension)"
 
-            cookie_expired = list(getattr(self.parent_app, 'cookie_expired', []) or [])
-            cookie_errors = list(getattr(self.parent_app, 'cookie_errors', []) or [])
+                # Nếu chưa có chuỗi cookie, tạo token định danh tương thích
+                if not cookie:
+                    cookie = f"__Secure-next-auth.session-token=ext_{cid}; client_id={cid}; email={email}"
 
-            for row_idx, cookie_str in enumerate(cookie_list):
-                try:
-                    cookie_hash = self._get_cookie_hash(cookie_str)
-                except Exception:
-                    continue
-
-                matched_rows = current_hash_to_rows.get(cookie_hash, [])
-                row_invalid = False
-                for matched_idx in matched_rows:
-                    is_expired = matched_idx < len(cookie_expired) and bool(cookie_expired[matched_idx])
-                    has_error = matched_idx < len(cookie_errors) and bool(cookie_errors[matched_idx])
-                    if is_expired or has_error:
-                        row_invalid = True
+                # Tìm xem tài khoản đã tồn tại trong danh sách chưa
+                matched = False
+                for existing in self.accounts:
+                    if (existing.get("email") and existing["email"].lower() == email.lower()) or \
+                       (cid and existing.get("client_id") == cid):
+                        existing["credits"] = credits
+                        existing["plan"] = plan
+                        existing["tier"] = tier
+                        existing["status"] = status
+                        existing["source"] = source
+                        existing["cookie"] = cookie
+                        existing["client_id"] = cid
+                        if access_token:
+                            existing["access_token"] = access_token
+                        matched = True
+                        synced_count += 1
                         break
 
-                if row_invalid:
-                    invalid_rows.append(f"Dòng {row_idx + 1}")
+                if not matched:
+                    self.accounts.append({
+                        "email": email,
+                        "plan": plan,
+                        "credits": credits,
+                        "tier": tier,
+                        "status": status,
+                        "source": source,
+                        "note": f"Đồng bộ từ {cid}",
+                        "cookie": cookie,
+                        "client_id": cid,
+                        "access_token": access_token,
+                    })
+                    synced_count += 1
 
-            if invalid_rows:
-                invalid_text = ", ".join(invalid_rows)
-                self.status_label.setText("❌ Danh sách còn cookie đã hết hạn hoặc bị chặn")
-                QMessageBox.warning(
-                    self,
-                    "Cookie chưa hợp lệ",
-                    f"Không thể lưu vì danh sách vẫn còn cookie đã hết hạn hoặc bị chặn: {invalid_text}.\n\nVui lòng thay cookie mới rồi lưu lại."
-                )
+            self._refresh_grid()
+            ultra_cnt = sum(1 for a in self.accounts if "Ultra" in a.get("plan", ""))
+            pro_cnt = sum(1 for a in self.accounts if "Pro" in a.get("plan", ""))
+            self.status_label.setText(
+                f"✅ Đã đồng bộ thành công {len(ext_accounts)} Profile Chrome "
+                f"({ultra_cnt} Ultra, {pro_cnt} Pro) - Sẵn sàng tạo video với cân bằng tải luân phiên."
+            )
+
+        except Exception as e:
+            err_str = str(e)
+            if "Connection refused" in err_str or "Errno 61" in err_str:
+                self.status_label.setText("ℹ️ Đang chờ Bridge Server cổng 3003 kết nối với Chrome Extension (Mở Flow trên Chrome để tự nhận diện).")
+            else:
+                self.status_label.setText(f"⚠️ Thông báo Bridge: {err_str}")
+
+    # ── Lưu & Áp Dụng ──────────────────────────────────────────────
+    def _save_cookies(self) -> None:
+        """Lưu toàn bộ danh sách tài khoản và đồng bộ vào app."""
+        try:
+            cookie_list = []
+            labels_list = []
+
+            for acc in self.accounts:
+                ck = acc.get("cookie", "").strip()
+                if not ck:
+                    cid = acc.get("client_id", "ext")
+                    em = acc.get("email", "")
+                    ck = f"__Secure-next-auth.session-token=ext_{cid}; client_id={cid}; email={em}"
+                    acc["cookie"] = ck
+                cookie_list.append(ck)
+                labels_list.append(acc.get("email", ""))
+
+            if not cookie_list:
+                self.status_label.setText("⚠️ Chưa có tài khoản nào được đồng bộ!")
+                QMessageBox.warning(self, "Chưa có tài khoản", "Vui lòng mở ít nhất 1 Profile Chrome có tiện ích để quét tài khoản.")
                 return
 
-            # Save cookies
+            # Áp dụng danh sách cookies vào parent_app
             count = self.parent_app._apply_cookie_blocks(cookie_list)
 
-            # Save labels if parent supports it
-            if hasattr(self.parent_app, 'cookie_labels'):
+            # Cập nhật labels và metadata
+            if hasattr(self.parent_app, "cookie_labels"):
                 self.parent_app.cookie_labels = labels_list
+            self.parent_app.account_metadata = self.accounts
 
-            # Also save labels to local file
-            self._save_cookie_labels(labels_list)
+            # Lưu vào file .cookies_temp.json
+            self._persist_accounts_metadata(cookie_list, labels_list)
 
-            self.status_label.setText(f"✅ Đã lưu {count} cookie!")
-            self.parent_app.log(f"🍪 Đã cập nhật {count} cookie từ cookie manager")
-            QMessageBox.information(self, "Đã lưu", f"Đã lưu {count} cookie.")
+            self.status_label.setText(f"✅ Đã lưu thành công {count} tài khoản!")
+            self.parent_app.log(f"👤 [AccountManager] Đã cập nhật {count} tài khoản Google Flow (Ultra/Pro).")
+            QMessageBox.information(
+                self,
+                "Đã lưu thành công",
+                f"Đã lưu thành công {count} tài khoản Google Flow.\n"
+                "Hệ thống đã sẵn sàng tạo video với cơ chế cân bằng tải tự động."
+            )
             self.accept()
+
         except Exception as e:
             error_msg = str(e)
             self.status_label.setText(f"❌ Lỗi: {error_msg}")
-            QMessageBox.warning(self, "Không thể lưu", f"Không thể lưu cookie.\n\n{error_msg}")
+            QMessageBox.warning(self, "Không thể lưu", f"Không thể lưu tài khoản.\n\n{error_msg}")
 
-    def _on_label_cell_changed(self, row: int, column: int) -> None:
-        """Handle when user edits the label column"""
-        if column == 1:  # Label column (index 1)
-            item = self.cookie_table.item(row, column)
-            if item and row < len(self.cookie_blocks):
-                new_label = item.text()
-                # Update cookie_blocks with new label
-                if isinstance(self.cookie_blocks[row], tuple):
-                    cookie_str = self.cookie_blocks[row][0]
-                else:
-                    cookie_str = self.cookie_blocks[row]
-                self.cookie_blocks[row] = (cookie_str, new_label)
-
-    def _save_cookie_labels(self, labels: List[str]) -> None:
-        """Save cookie labels to local file"""
+    def _persist_accounts_metadata(self, cookie_list: List[str], labels_list: List[str]) -> None:
+        """Lưu metadata tài khoản vào file local để không bị mất khi mở lại app."""
         try:
             cookie_file = self.parent_app._get_local_cookies_file_path()
-            import os
+            data = {}
             if os.path.exists(cookie_file):
-                with open(cookie_file, 'r', encoding='utf-8') as f:
+                with open(cookie_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
-            else:
-                data = {}
 
-            data['cookie_labels'] = labels
+            data["cookies_list"] = cookie_list
+            data["cookie_labels"] = labels_list
+            data["account_metadata"] = self.accounts
 
-            with open(cookie_file, 'w', encoding='utf-8') as f:
+            with open(cookie_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
         except Exception as e:
-            print(f"⚠️ Không lưu được cookie labels: {e}")
+            print(f"⚠️ Không thể lưu account_metadata: {e}")
 
     def closeEvent(self, event):
-        if hasattr(self, '_refresh_timer') and self._refresh_timer:
+        if hasattr(self, "_refresh_timer") and self._refresh_timer:
             self._refresh_timer.stop()
         super().closeEvent(event)
+
+
+# Alias tương thích ngược hoàn toàn cho toàn bộ project
+CookieManagerDialog = AccountManagerDialog
 
 
 

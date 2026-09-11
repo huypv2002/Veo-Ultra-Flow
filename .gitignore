@@ -13,3 +13,16 @@ _updater.sh
 downloaded_videos/
 cookies_dialog.json
 .login_temp
+.cookies_temp.json
+cookie.txt
+captcha_trigger.txt
+test_*.mp4
+test_*.jpg
+test_*.png
+extension/_metadata/
+.playwright-mcp/
+.commandcode/
+complete_flow.py.bak_codex
+_external_cloakbrowser/
+_external_flow2api/
+_tmp_*
