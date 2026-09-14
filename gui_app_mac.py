@@ -5967,29 +5967,25 @@ class GoogleLabsFlowQt6(QMainWindow, FlowTabMixin, VideoTabMixin):
                 return
 
         # ✅ Check all cookies live status before starting
-        # Avoid checking if no cookies parsed
         if hasattr(self, 'parsed_accounts') and self.parsed_accounts:
-            dead_cookies_info = self.check_all_cookies_live_status()
-            if dead_cookies_info:
-                # Show dialog and block
-                res = self.show_cookie_issue_dialog(dead_cookies_info)
-                
-                # If Cancel (0) or Fix (1), stop current start process.
-                # If Fix (1), user opened dialog, they need to close and click Start again after fixing.
-                # If Deleted (2), parsed_accounts is clean, we CAN proceed potentially, 
-                # but safer to ask user to click Start again to confirm "Clean Start".
-                if res != 2:
-                    self.log("🛑 Đã hủy bắt đầu do lỗi cookie.")
-                    return
-                else:
-                    # Case 2: Deleted
-                    # Check if any accounts left
-                    if not self.parsed_accounts:
-                        QMessageBox.warning(self, "Cảnh báo", "Không còn tài khoản nào khả dụng sau khi xóa lỗi!")
+            # Dưới local: nếu chạy mã nguồn, bỏ qua bước chặn check cookie trước khi bắt đầu
+            if getattr(sys, "frozen", False):
+                dead_cookies_info = self.check_all_cookies_live_status()
+                if dead_cookies_info:
+                    # Show dialog and block
+                    res = self.show_cookie_issue_dialog(dead_cookies_info)
+                    if res != 2:
+                        self.log("🛑 Đã hủy bắt đầu do lỗi cookie.")
                         return
-                    
-                    self.log("🔄 Đã xóa cookie lỗi. Tiếp tục xử lý với các tài khoản còn lại...")
-                    # Continue execution below...
+                    else:
+                        # Case 2: Deleted
+                        # Check if any accounts left
+                        if not self.parsed_accounts:
+                            QMessageBox.warning(self, "Cảnh báo", "Không còn tài khoản nào khả dụng sau khi xóa lỗi!")
+                            return
+                        self.log("🔄 Đã xóa cookie lỗi. Tiếp tục xử lý với các tài khoản còn lại...")
+            else:
+                self.log("ℹ️ [LOCAL] Chạy mã nguồn dưới local: bỏ qua chặn kiểm tra cookie trước khi chạy.")
         
         self.log("🚀 Bắt đầu xử lý...")
         if hasattr(self, '_popup_shown_flags'):
@@ -29790,6 +29786,9 @@ Requirements:
 
     def _check_for_update(self):
         """Kiểm tra cập nhật từ GitHub Releases (QThread)."""
+        if not getattr(sys, "frozen", False):
+            print("ℹ️ [LOCAL] Đang chạy mã nguồn dưới local, bỏ qua kiểm tra cập nhật GitHub.")
+            return
         self._update_checker = UpdateChecker()
         self._update_checker.result.connect(self._on_update_check_finished)
         self._update_checker.start()

@@ -3871,14 +3871,40 @@ class FlowTabMixin:
                 headers = client._aisandbox_headers()
                 headers = {k: v for k, v in headers.items() if k.lower() != "content-type"}
 
-            with client.session.get(url, headers=headers, timeout=120, stream=True) as resp:
-                resp.raise_for_status()
-                target_path.parent.mkdir(parents=True, exist_ok=True)
-                with open(target_path, "wb") as f:
-                    for chunk in resp.iter_content(chunk_size=8192):
-                        if chunk:
-                            f.write(chunk)
-            return target_path.exists() and target_path.stat().st_size > 0
+            download_ok = False
+            try:
+                with client.session.get(url, headers=headers, timeout=120, stream=True) as resp:
+                    resp.raise_for_status()
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(target_path, "wb") as f:
+                        for chunk in resp.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+                if target_path.exists() and target_path.stat().st_size > 0:
+                    download_ok = True
+            except Exception as direct_err:
+                # Fallback tải qua Extension Bridge /bg-fetch
+                try:
+                    import requests as req_lib, base64 as b64_lib
+                    bridge_url = getattr(client, "captcha_bridge_url", None) or "http://127.0.0.1:3003"
+                    r = req_lib.post(f"{bridge_url}/bg-fetch", json={"url": url, "timeout": 30}, timeout=35)
+                    res = r.json()
+                    b64_data = res.get("base64")
+                    if not b64_data and isinstance(res.get("data"), dict):
+                        b64_data = res["data"].get("base64")
+                    if b64_data:
+                        img_bytes = b64_lib.b64decode(b64_data)
+                        target_path.parent.mkdir(parents=True, exist_ok=True)
+                        with open(target_path, "wb") as f:
+                            f.write(img_bytes)
+                        if target_path.exists() and target_path.stat().st_size > 0:
+                            download_ok = True
+                except Exception:
+                    pass
+                if not download_ok:
+                    raise direct_err
+
+            return download_ok
         except Exception as e:
             self.log(f"⚠️ Không tải được ảnh từ signedUri: {str(e)[:120]}")
             return False

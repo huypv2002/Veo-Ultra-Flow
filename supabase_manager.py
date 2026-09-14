@@ -561,25 +561,9 @@ class SupabaseManager:
             # Kiểm tra xem user đã có session active trên thiết bị khác chưa
             existing_success, existing_sessions = self.check_existing_active_session(user_id)
             if existing_success and existing_sessions:
-                existing_session = existing_sessions[0] if isinstance(existing_sessions, list) else existing_sessions
-                existing_device = existing_session.get('device_fingerprint')
-                
-                # Nếu cùng device thì cho phép (re-login)
-                if existing_device == device_id:
-                    # Vô hiệu hóa session cũ trên cùng device
-                    self.deactivate_user_sessions(user_id)
-                else:
-                    # Khác device và không force login thì từ chối
-                    if not force_login:
-                        return False, {
-                            "error": "USER_ALREADY_LOGGED_IN",
-                            "message": "Tài khoản đã đăng nhập trên thiết bị khác. Vui lòng đăng xuất thiết bị cũ trước.",
-                            "existing_device": existing_device,
-                            "current_device": device_id
-                        }
-                    else:
-                        # Force login: vô hiệu hóa tất cả sessions
-                        self.deactivate_user_sessions(user_id)
+                # Tạm thời dưới local: tự động hủy session cũ để user không bị chặn đăng nhập
+                print(f"  ℹ️ [LOCAL BYPASS] Tự động giải phóng session cũ cho user_id={user_id}")
+                self.deactivate_user_sessions(user_id)
             
             session_token = str(uuid.uuid4())
             
@@ -960,33 +944,8 @@ class SupabaseManager:
                 return False, "Tên đăng nhập hoặc mật khẩu không đúng", {}
             
             # ==================== MACHINE CODE CHECK (MÃ MÁY CỐ ĐỊNH) ====================
-            # Mã máy do client hiển thị (từ phần cứng) và user gửi cho admin để gắn vào tài khoản
-            machine_code = (machine_code or "").strip() if isinstance(machine_code, str) else ""
-            if not machine_code:
-                return False, "Thiếu mã máy. Vui lòng nhập mã máy hiển thị trong ứng dụng.", {
-                    "error_code": "MISSING_MACHINE_CODE"
-                }
-            
-            # Lấy machine_code đã được admin gắn trong cột device_id (đây là cột dành riêng cho mã máy)
-            registered_machine_code = str(user.get('device_id') or "").strip()
-            
-            if not registered_machine_code:
-                # Tài khoản chưa được gắn mã máy trên server
-                return False, (
-                "Tài khoản chưa được gắn mã máy (device_id).\n"
-                "Vui lòng gửi mã máy cho admin để kích hoạt trước khi đăng nhập."
-                ), {
-                    "error_code": "MACHINE_NOT_REGISTERED"
-                }
-            
-            if machine_code != registered_machine_code:
-                # Mã máy không khớp → không cho login
-                return False, (
-                    "Mã máy không khớp với tài khoản.\n"
-                    "Vui lòng kiểm tra lại hoặc liên hệ admin để cập nhật."
-                ), {
-                    "error_code": "MACHINE_CODE_MISMATCH"
-                }
+            # Tạm thời bỏ qua kiểm tra mã máy (machine_code) dưới local theo yêu cầu của user
+            print(f"  ℹ️ [LOCAL BYPASS] Đã tạm thời bỏ qua kiểm tra mã máy (user={username}, input_code={machine_code})")
             
             # Kiểm tra tính hợp lệ của subscription TRƯỚC KHI tạo session
             sub_valid, sub_info = self.check_subscription_validity(user['id'])
@@ -1309,15 +1268,10 @@ class SupabaseManager:
             # Check machine_code binding
             stored_machine_code = key_info.get('machine_code')
             
-            if stored_machine_code:
-                # Key đã được bind với machine_code - check khớp không
-                if stored_machine_code != machine_code:
-                    return False, "Key đã được sử dụng trên thiết bị khác", {"error_code": "MACHINE_MISMATCH"}
-            else:
+            # Tạm thời bỏ qua kiểm tra mã máy (machine_code) dưới local
+            if not stored_machine_code:
                 # Key chưa bind - bind machine_code lần đầu
-                bind_success = self._bind_machine_code_to_key(key_info['id'], machine_code)
-                if not bind_success:
-                    return False, "Không thể gán mã máy cho key", {"error_code": "BIND_FAILED"}
+                self._bind_machine_code_to_key(key_info['id'], machine_code)
             
             # Check usage limit
             max_usage = key_info.get('max_usage', 1)

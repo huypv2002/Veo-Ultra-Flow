@@ -7597,29 +7597,54 @@ class LabsFlowClient:
 
         # ── 1. Ưu tiên sinh ảnh qua Google Flow batchexecute RPC (ogiZ0b) ──
         try:
+            all_prompts = []
+            for req in requests_payload:
+                if isinstance(req, dict):
+                    p = (
+                        req.get("prompt")
+                        or req.get("textInput", {}).get("prompt")
+                        or ""
+                    )
+                    if not p and isinstance(req.get("structuredPrompt", {}).get("parts"), list):
+                        parts = req["structuredPrompt"]["parts"]
+                        if parts and isinstance(parts[0], dict):
+                            p = parts[0].get("text", "")
+                    if not p and isinstance(req.get("textInput", {}).get("structuredPrompt", {}).get("parts"), list):
+                        parts = req["textInput"]["structuredPrompt"]["parts"]
+                        if parts and isinstance(parts[0], dict):
+                            p = parts[0].get("text", "")
+                    if p:
+                        all_prompts.append(p)
+
             first_req = requests_payload[0] if requests_payload else {}
-            prompt_str = ""
-            if isinstance(first_req, dict):
-                prompt_str = (
-                    first_req.get("prompt")
-                    or first_req.get("textInput", {}).get("prompt")
-                    or ""
-                )
-                if not prompt_str and isinstance(first_req.get("textInput", {}).get("structuredPrompt", {}).get("parts"), list):
-                    parts = first_req["textInput"]["structuredPrompt"]["parts"]
-                    if parts and isinstance(parts[0], dict):
-                        prompt_str = parts[0].get("text", "")
+            prompt_str = all_prompts[0] if all_prompts else ""
             
-            aspect_str = (first_req.get("aspectRatio") if isinstance(first_req, dict) else None) or "IMAGE_ASPECT_RATIO_LANDSCAPE"
+            aspect_str = (
+                first_req.get("imageAspectRatio")
+                or first_req.get("aspectRatio")
+                or "IMAGE_ASPECT_RATIO_LANDSCAPE"
+            ) if isinstance(first_req, dict) else "IMAGE_ASPECT_RATIO_LANDSCAPE"
+
             count = len(requests_payload)
 
+            ref_media_ids = []
+            if isinstance(first_req, dict) and isinstance(first_req.get("imageInputs"), list):
+                for inp in first_req["imageInputs"]:
+                    if isinstance(inp, dict) and inp.get("name"):
+                        ref_media_ids.append(inp["name"])
+
+            req_seed = first_req.get("seed") if isinstance(first_req, dict) else None
+
             if prompt_str:
-                print(f"  🎨 [batchexecute] Sinh {count} ảnh qua RPC ogiZ0b...")
+                print(f"  🎨 [batchexecute] Sinh {count} ảnh qua RPC ogiZ0b (aspect={aspect_str})...")
                 img_freq = image_request(
                     prompt=prompt_str,
                     project_id=project,
                     count=count,
                     aspect=aspect_str,
+                    seed=req_seed,
+                    prompts=all_prompts if len(all_prompts) > 1 else None,
+                    ref_media_ids=ref_media_ids or None,
                 )
                 img_res = self.batch_rpc(RPC_GEN_IMAGE, img_freq, captcha_action=CAPTCHA_IMAGE, timeout=90)
                 if img_res.get("ok"):
