@@ -897,6 +897,11 @@ def bg_fetch_endpoint():
     if not url:
         return jsonify({"ok": False, "error": "Missing url parameter"}), 400
     result = state.execute_bg_fetch(url=url, as_base64=as_base64, client_id=client_id, email=email, timeout=timeout)
+    if result.get("ok") and isinstance(result.get("data"), dict):
+        if "base64" in result["data"]:
+            result["base64"] = result["data"]["base64"]
+        if "size" in result["data"]:
+            result["size"] = result["data"]["size"]
     http_code = 200 if result.get("ok") else 502
     return jsonify(result), http_code
 

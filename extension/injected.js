@@ -22,19 +22,48 @@
         }
         if (typeof window.grecaptcha?.execute === 'function') return resolve();
 
-        // Inject script fallback if not present after 1.5s
-        if (!scriptInjected && Date.now() - start > 1500) {
+        // Inject script fallback if not present after 1s
+        if (!scriptInjected && Date.now() - start > 1000) {
           scriptInjected = true;
           try {
+            let policy = null;
+            if (window.trustedTypes) {
+              try {
+                policy = window.trustedTypes.createPolicy('default', {
+                  createScriptURL: (s) => s,
+                  createScript: (s) => s,
+                  createHTML: (s) => s,
+                });
+              } catch (e1) {
+                try {
+                  policy = window.trustedTypes.createPolicy('veo3_inj_' + Date.now(), {
+                    createScriptURL: (s) => s,
+                    createScript: (s) => s,
+                    createHTML: (s) => s,
+                  });
+                } catch (e2) {}
+              }
+            }
+
             if (!document.querySelector('script[src*="recaptcha/enterprise.js"]')) {
+              const rawUrl = `https://www.google.com/recaptcha/enterprise.js?render=${SITE_KEY}`;
+              const scriptUrl = policy ? policy.createScriptURL(rawUrl) : rawUrl;
               const s = document.createElement('script');
-              s.src = `https://www.google.com/recaptcha/enterprise.js?render=${SITE_KEY}`;
+              s.src = scriptUrl;
+              const nonceEl = document.querySelector('script[nonce]');
+              const nonce = nonceEl ? (nonceEl.nonce || nonceEl.getAttribute('nonce')) : '';
+              if (nonce) {
+                s.setAttribute('nonce', nonce);
+                s.nonce = nonce;
+              }
               s.async = true;
               s.defer = true;
               (document.head || document.documentElement).appendChild(s);
-              console.log('[Veo3 Bridge] Injected reCAPTCHA Enterprise fallback script');
+              console.log('[Veo3 Bridge] Injected reCAPTCHA Enterprise fallback script with nonce/trustedTypes');
             }
-          } catch (e) {}
+          } catch (e) {
+            console.error('[Veo3 Bridge] Injected script error:', e);
+          }
         }
 
         if (Date.now() - start > timeout) {

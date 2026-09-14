@@ -246,17 +246,46 @@ async function solveCaptcha(requestId, pageAction = "VIDEO_GENERATION") {
                 });
               }
               if (typeof window.grecaptcha?.execute === "function") return resolve();
-              if (!injected && Date.now() - start > 1500) {
+              if (!injected && Date.now() - start > 1000) {
                 injected = true;
                 try {
+                  let policy = null;
+                  if (window.trustedTypes) {
+                    try {
+                      policy = window.trustedTypes.createPolicy("default", {
+                        createScriptURL: (s) => s,
+                        createScript: (s) => s,
+                        createHTML: (s) => s,
+                      });
+                    } catch (e1) {
+                      try {
+                        policy = window.trustedTypes.createPolicy("veo3_captcha_" + Date.now(), {
+                          createScriptURL: (s) => s,
+                          createScript: (s) => s,
+                          createHTML: (s) => s,
+                        });
+                      } catch (e2) {}
+                    }
+                  }
+
                   if (!document.querySelector('script[src*="recaptcha/enterprise.js"]')) {
+                    const rawUrl = `https://www.google.com/recaptcha/enterprise.js?render=${siteKey}`;
+                    const scriptUrl = policy ? policy.createScriptURL(rawUrl) : rawUrl;
                     const s = document.createElement("script");
-                    s.src = `https://www.google.com/recaptcha/enterprise.js?render=${siteKey}`;
+                    s.src = scriptUrl;
+                    const nonceEl = document.querySelector("script[nonce]");
+                    const nonce = nonceEl ? (nonceEl.nonce || nonceEl.getAttribute("nonce")) : "";
+                    if (nonce) {
+                      s.setAttribute("nonce", nonce);
+                      s.nonce = nonce;
+                    }
                     s.async = true;
                     s.defer = true;
                     (document.head || document.documentElement).appendChild(s);
                   }
-                } catch (e) {}
+                } catch (e) {
+                  console.error("[Veo3 Bridge] Script injection error:", e);
+                }
               }
               if (Date.now() - start > timeout) return reject(new Error("grecaptcha timeout"));
               setTimeout(check, 250);
@@ -304,6 +333,65 @@ async function runBatchRpc(cmd) {
     world: "MAIN",
     args: [cmd.rpcid, freq, MAX_RPC_TEXT],
     func: async (rpcid, freqStr, maxText) => {
+      if (rpcid === "debug_inspect") {
+        let ttResult = "none";
+        let scriptError = null;
+
+        // 1. Create trustedTypes policy if needed
+        let policy = null;
+        if (window.trustedTypes) {
+          try {
+            policy = window.trustedTypes.createPolicy("default", {
+              createScriptURL: (s) => s,
+              createScript: (s) => s,
+              createHTML: (s) => s,
+            });
+            ttResult = "created_default";
+          } catch (e1) {
+            try {
+              policy = window.trustedTypes.createPolicy("veo3_recaptcha_" + Date.now(), {
+                createScriptURL: (s) => s,
+                createScript: (s) => s,
+                createHTML: (s) => s,
+              });
+              ttResult = "created_named";
+            } catch (e2) {
+              ttResult = "failed: " + e2.message;
+            }
+          }
+        }
+
+        // 2. Try injecting script with nonce and trusted URL
+        try {
+          const rawUrl = "https://www.google.com/recaptcha/enterprise.js?render=6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV";
+          const scriptUrl = policy ? policy.createScriptURL(rawUrl) : rawUrl;
+          const s = document.createElement("script");
+          s.src = scriptUrl;
+          const nonceEl = document.querySelector("script[nonce]");
+          const nonce = nonceEl ? (nonceEl.nonce || nonceEl.getAttribute("nonce")) : "";
+          if (nonce) {
+            s.setAttribute("nonce", nonce);
+            s.nonce = nonce;
+          }
+          s.async = true;
+          (document.head || document.documentElement).appendChild(s);
+          scriptError = "injected_ok";
+        } catch (e) {
+          scriptError = e.message;
+        }
+
+        return {
+          status: 200,
+          text: JSON.stringify({
+            url: window.location.href,
+            tt_result: ttResult,
+            script_result: scriptError,
+            has_grecaptcha: typeof window.grecaptcha !== "undefined",
+            has_enterprise: typeof window.grecaptcha?.enterprise !== "undefined",
+          }),
+        };
+      }
+
       // Direct in-tab inspection of video elements and network entries
       if (rpcid === "query_page_videos") {
         const videos = Array.from(document.querySelectorAll("video")).map((v) => ({

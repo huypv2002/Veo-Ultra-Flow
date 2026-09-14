@@ -21,5 +21,26 @@
       "urlFilter": "flow-content.google",
       "resourceTypes": ["xmlhttprequest"]
     }
+  },
+  {
+    "id": 2,
+    "priority": 1,
+    "action": {
+      "type": "modifyHeaders",
+      "responseHeaders": [
+        {
+          "header": "content-security-policy",
+          "operation": "remove"
+        },
+        {
+          "header": "content-security-policy-report-only",
+          "operation": "remove"
+        }
+      ]
+    },
+    "condition": {
+      "urlFilter": "||flow.google.com",
+      "resourceTypes": ["main_frame", "sub_frame"]
+    }
   }
 ]

@@ -41,6 +41,7 @@ def main():
         r = requests.get(f"{bridge_url}/accounts", timeout=5)
         r.raise_for_status()
         accounts = r.json().get("accounts", [])
+        initial_credits = {}
         print(f"  ✓ Bridge Server online! Số tài khoản Extension đã kết nối: {len(accounts)}")
         for acc in accounts:
             email = acc.get("email")
@@ -49,6 +50,7 @@ def main():
             cid = acc.get("client_id")
             has_token = bool(acc.get("access_token"))
             has_cookie = bool(acc.get("cookie"))
+            initial_credits[email] = credits
             print(f"    - {email} ({plan}) | Credits: {credits} | Client: {cid} | Auth: token={has_token}, cookie={has_cookie}")
     except Exception as e:
         print(f"  ❌ Lỗi kết nối Bridge Server: {e}")
@@ -135,11 +137,10 @@ def main():
             email = acc.get("email")
             plan = acc.get("plan")
             credits = acc.get("credits")
-            print(f"  ✓ {email} ({plan}): Số credits còn lại: {credits}")
-            if "Ultra" in plan:
-                assert credits == 11, f"Cảnh báo: Credits tài khoản Ultra thay đổi! ({credits} != 11)"
-            elif "Pro" in plan:
-                assert credits == 1020, f"Cảnh báo: Credits tài khoản Pro thay đổi! ({credits} != 1020)"
+            init_cred = initial_credits.get(email)
+            print(f"  ✓ {email} ({plan}): Số credits ban đầu: {init_cred} -> Còn lại: {credits}")
+            if init_cred is not None:
+                assert credits == init_cred, f"Cảnh báo: Credits tài khoản {email} thay đổi! ({credits} != {init_cred})"
         print("  🎉 XÁC THỰC THÀNH CÔNG: KHÔNG HỀ MẤT BẤT KỲ CREDIT NÀO (0 CREDITS SPENT)!")
     except Exception as e:
         print(f"  ❌ Lỗi xác thực credits: {e}")
